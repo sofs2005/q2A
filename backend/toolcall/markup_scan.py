@@ -39,10 +39,10 @@ _FULLWIDTH_TABLE = str.maketrans({
     '／': '/',   # ／ FULLWIDTH SOLIDUS
     '∕': '/',   # ∕ DIVISION SLASH
     '＝': '=',   # ＝ FULLWIDTH EQUALS SIGN
-    '“': '"',   # " LEFT DOUBLE QUOTATION MARK
-    '”': '"',   # " RIGHT DOUBLE QUOTATION MARK
-    '‘': "'",   # ' LEFT SINGLE QUOTATION MARK
-    '’': "'",   # ' RIGHT SINGLE QUOTATION MARK
+    '“': '"',   # “ LEFT DOUBLE QUOTATION MARK
+    '”': '"',   # ” RIGHT DOUBLE QUOTATION MARK
+    '‘': "'",   # ‘ LEFT SINGLE QUOTATION MARK
+    '’': "'",   # ’ RIGHT SINGLE QUOTATION MARK
     '！': '|',   # ！ FULLWIDTH EXCLAMATION MARK
     '、': '|',   # 、 IDEOGRAPHIC COMMA
     '␂': '|',   # ␂ SYMBOL FOR START OF TEXT
@@ -69,82 +69,167 @@ _CANONICAL: dict[str, str] = {
     'parameter': 'parameter',
 }
 
-# All prefixes of known tag names (used for partial-start detection).
 _TAG_NAMES = ['tool_calls', 'tool-calls', 'toolcalls', 'invoke', 'parameter']
+
+# All prefixes of known tag names (used for partial-start detection).
 _TAG_PREFIXES: set[str] = set()
 for _name in _TAG_NAMES:
     for _i in range(1, len(_name) + 1):
         _TAG_PREFIXES.add(_name[:_i])
 
-# Regex to find a partial DSML tag at the *end* of the text.
-_partial_pattern = (
-    r'<\|DSML\|('
-    + '|'.join(re.escape(p) for p in sorted(_TAG_PREFIXES, key=len, reverse=True))
-    + r')$'
-)
-_PARTIAL_RE = re.compile(_partial_pattern, re.IGNORECASE)
 
-# Regex that matches the *prefix* of a DSML tool tag (up to the tag name).
+# ---------------------------------------------------------------------------
+# Tag prefix regex — matches both DSML (<|DSML|...>) and plain XML (<...>)
+# forms for the recognised tool tag names.
+# ---------------------------------------------------------------------------
+
 _DSML_PREFIX_RE = re.compile(
-    r'<(/?)\|DSML\|(tool[_\-]?calls|toolcalls|invoke|parameter)\b',
+    r'<(/?)(?:\|(?:DSML)?\|)?(tool[_\-]?calls|toolcalls|invoke|parameter)\b',
     re.IGNORECASE,
 )
+
+
+# ---------------------------------------------------------------------------
+# Partial-start detection (streaming hold)
+# ---------------------------------------------------------------------------
+
+def _build_partial_re() -> re.Pattern:
+    """Build the regex for partial tag start detection at end-of-string.
+
+    Must match any suffix of the text that could plausibly be the
+    beginning of a tool markup tag when more content arrives.
+    """
+    parts: list[str] = []
+
+    # Bare prefixes — no tag name yet
+    bare = [
+        '<',            # could become <tool_calls>, <invoke>, <param...
+        '</',           # could become </tool_calls>, </invoke>...
+        '<|',           # DSML pipe separator start
+        '</|',          # closing DSML pipe
+        '<|D',          # partial DSML keyword
+        '<|DS',
+        '<|DSM',
+        '<|DSML',
+        '<|DSML|',      # DSML separator complete, no tag name yet
+        '</|DSML|',
+    ]
+    for b in bare:
+        parts.append(re.escape(b))
+
+    # DSML form: <|DSML| + tag name prefix  /  </|DSML| + tag name prefix
+    for p in sorted(_TAG_PREFIXES, key=len, reverse=True):
+        parts.append(re.escape('<|DSML|' + p))
+        parts.append(re.escape('</|DSML|' + p))
+
+    # Plain XML form: < + tag name prefix  /  </ + tag name prefix
+    for p in sorted(_TAG_PREFIXES, key=len, reverse=True):
+        parts.append(re.escape('<' + p))
+        parts.append(re.escape('</' + p))
+
+    # Sort by length descending so that longer matches take priority
+    # when two alternatives start at the same position.
+    parts.sort(key=len, reverse=True)
+
+    return re.compile(r'(?:' + '|'.join(parts) + r')$', re.IGNORECASE)
+
+
+_PARTIAL_RE = _build_partial_re()
 
 
 # ---------------------------------------------------------------------------
 # Ignored-region detection
 # ---------------------------------------------------------------------------
 
+_FENCE_OPEN_RE = re.compile(r'(?m)^[ \t]*(```+|~~~+)[^\n]*\n')
+_FENCE_CLOSE_TEMPLATE = r'(?m)^[ \t]*{fence}[ \t]*(?:\n|$)'
+
+
+def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge overlapping or adjacent spans."""
+    if not spans:
+        return []
+
+    spans.sort()
+    merged = [spans[0]]
+    for start, end in spans[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _find_fenced_code_spans(text: str) -> list[tuple[int, int]]:
+    """Return markdown fenced-code spans, including unclosed fences to EOF."""
+    spans: list[tuple[int, int]] = []
+    pos = 0
+
+    while True:
+        opener = _FENCE_OPEN_RE.search(text, pos)
+        if opener is None:
+            break
+
+        fence = opener.group(1)
+        close_re = re.compile(_FENCE_CLOSE_TEMPLATE.format(fence=re.escape(fence)))
+        closer = close_re.search(text, opener.end())
+        if closer is None:
+            spans.append((opener.start(), len(text)))
+            break
+
+        spans.append((opener.start(), closer.end()))
+        pos = closer.end()
+
+    return spans
+
+
+def _find_inline_code_spans(text: str) -> list[tuple[int, int]]:
+    """Return single-line inline code spans for one or two backticks."""
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    length = len(text)
+
+    while pos < length:
+        if text.startswith('``', pos):
+            end = text.find('``', pos + 2)
+            if end != -1 and '\n' not in text[pos:end + 2]:
+                spans.append((pos, end + 2))
+                pos = end + 2
+                continue
+        elif text[pos] == '`':
+            end = text.find('`', pos + 1)
+            if end != -1 and '\n' not in text[pos:end + 1]:
+                spans.append((pos, end + 1))
+                pos = end + 1
+                continue
+        pos += 1
+
+    return spans
+
+
 def _find_ignored_spans(text: str) -> list[tuple[int, int]]:
     """Return sorted, merged list of (start, end) spans that should be ignored.
 
     Ignored regions include:
-    - Markdown fenced code blocks (``` ... ```)
-    - CDATA sections (<![CDATA[ ... ]]>)
+    - Markdown fenced code blocks (``` and ~~~)
+    - Unclosed fenced code blocks (extend to EOF)
+    - CDATA sections (<![CDATA[...]]>)
     - XML comments (<!-- ... -->)
     - XML processing instructions (<? ... ?>)
-    - Markdown inline code spans (`...`)
+    - Markdown inline code spans using one or two backticks
     """
-    spans: list[tuple[int, int]] = []
+    spans = _find_fenced_code_spans(text)
 
-    # Markdown fenced code blocks
-    for m in re.finditer(r'(?m)^[ \t]*```[^\n]*\n[\s\S]*?\n[ \t]*```', text):
-        spans.append((m.start(), m.end()))
-
-    # CDATA sections
     for m in re.finditer(r'<!\[CDATA\[[\s\S]*?\]\]>', text):
         spans.append((m.start(), m.end()))
-
-    # XML comments
     for m in re.finditer(r'<!--[\s\S]*?-->', text):
         spans.append((m.start(), m.end()))
-
-    # Processing instructions
     for m in re.finditer(r'<\?[\s\S]*?\?>', text):
         spans.append((m.start(), m.end()))
+    spans.extend(_find_inline_code_spans(text))
 
-    # Inline code spans
-    for m in re.finditer(r'`[^`\n]+`', text):
-        spans.append((m.start(), m.end()))
-
-    # Sort and merge overlapping spans
-    spans.sort()
-    merged: list[tuple[int, int]] = []
-    for s, e in spans:
-        if merged and s < merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-        else:
-            merged.append((s, e))
-
-    return merged
-
-
-def _in_ignored(pos: int, ignored: list[tuple[int, int]]) -> bool:
-    """Return True if *pos* falls inside any ignored span."""
-    for s, e in ignored:
-        if s <= pos < e:
-            return True
-    return False
+    return _merge_spans(spans)
 
 
 def _skip_ignored(pos: int, ignored: list[tuple[int, int]]) -> int:
@@ -160,12 +245,11 @@ def _skip_ignored(pos: int, ignored: list[tuple[int, int]]) -> int:
 # ---------------------------------------------------------------------------
 
 def _parse_tag(text: str, pos: int) -> Optional[ToolMarkupTag]:
-    """Try to parse a DSML tool tag starting at *pos* in the original text.
+    """Try to parse a DSML/XML tool tag starting at *pos* in the original text.
 
     Returns a ``ToolMarkupTag`` on success, or ``None`` if no valid tag
     starts at that position.
     """
-    # Check the folded prefix — look at up to 200 chars ahead.
     remaining = _fold(text[pos:pos + 200])
     m = _DSML_PREFIX_RE.match(remaining)
     if not m:
@@ -209,33 +293,45 @@ def _parse_tag(text: str, pos: int) -> Optional[ToolMarkupTag]:
 
 
 # ---------------------------------------------------------------------------
+# Internal helper — find tag reusing pre-computed ignored spans
+# ---------------------------------------------------------------------------
+
+def _find_tag_outside_ignored_with_spans(
+    text: str,
+    start: int,
+    ignored: list[tuple[int, int]],
+) -> Optional[ToolMarkupTag]:
+    """Same algorithm as ``find_tool_markup_tag_outside_ignored`` but
+    accepts an externally-computed *ignored* span list so that callers
+    can reuse it across multiple invocations.
+    """
+    pos = start
+    while pos < len(text):
+        pos = _skip_ignored(pos, ignored)
+        if pos >= len(text):
+            break
+        tag = _parse_tag(text, pos)
+        if tag is not None:
+            return tag
+        pos += 1
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def find_tool_markup_tag_outside_ignored(
     text: str, start: int = 0,
 ) -> Optional[ToolMarkupTag]:
-    """Find the first DSML tool markup tag in *text* starting from *start*,
-    skipping any content inside markdown fences, inline code, CDATA,
-    XML comments, and processing instructions.
+    """Find the first DSML/XML tool markup tag in *text* starting from *start*,
+    skipping any content inside ignored regions (markdown fences, inline code,
+    CDATA, XML comments, and processing instructions).
 
     Returns ``None`` when no tag is found.
     """
     ignored = _find_ignored_spans(text)
-    pos = start
-
-    while pos < len(text):
-        pos = _skip_ignored(pos, ignored)
-        if pos >= len(text):
-            break
-
-        tag = _parse_tag(text, pos)
-        if tag is not None:
-            return tag
-
-        pos += 1
-
-    return None
+    return _find_tag_outside_ignored_with_spans(text, start, ignored)
 
 
 def find_matching_tool_markup_close(
@@ -253,9 +349,10 @@ def find_matching_tool_markup_close(
     target = open_tag.name
     depth = 1
     pos = open_tag.end
+    ignored = _find_ignored_spans(text)  # computed once, reused in loop
 
     while pos < len(text):
-        tag = find_tool_markup_tag_outside_ignored(text, pos)
+        tag = _find_tag_outside_ignored_with_spans(text, pos, ignored)
         if tag is None:
             break
 
@@ -273,7 +370,7 @@ def find_matching_tool_markup_close(
 
 
 def contains_tool_markup_syntax_outside_ignored(text: str) -> bool:
-    """Return ``True`` if *text* contains any DSML tool markup syntax
+    """Return ``True`` if *text* contains any DSML/XML tool markup syntax
     outside of ignored regions (fenced code, inline code, CDATA,
     comments, PIs).
     """
@@ -281,15 +378,23 @@ def contains_tool_markup_syntax_outside_ignored(text: str) -> bool:
 
 
 def find_partial_tool_markup_start(text: str) -> int:
-    """Return the index in *text* where a partial DSML tool tag starts,
-    or -1 if no partial tag is found.
+    """Return the index in *text* where a partial tool tag starts,
+    or -1 if no partial tag is found (or if the partial tag falls
+    inside an ignored region such as a fenced code block or inline
+    code span).
 
-    A partial tag is an opening ``<``, the DSML separator, and a prefix
-    of a recognised tag name (e.g. ``<|DSML|tool``).  This is used by
-    the streaming sieve to decide whether to hold trailing text.
+    A partial tag is any plausible prefix of a recognised tool tag,
+    including plain XML forms (``<tool_ca``), DSML forms
+    (``<|DSML|too``), and bare angle brackets at end-of-stream.
     """
     folded = _fold(text)
     m = _PARTIAL_RE.search(folded)
-    if m:
-        return m.start()
-    return -1
+    if not m:
+        return -1
+    pos = m.start()
+    # Guard: if the partial start sits inside an ignored region
+    # (e.g. a code example trailing hold), treat it as not found.
+    ignored = _find_ignored_spans(text)
+    if _skip_ignored(pos, ignored) != pos:
+        return -1
+    return pos
