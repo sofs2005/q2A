@@ -69,72 +69,110 @@ _CANONICAL: dict[str, str] = {
     'parameter': 'parameter',
 }
 
-_TAG_NAMES = ['tool_calls', 'tool-calls', 'toolcalls', 'invoke', 'parameter']
-
-# All prefixes of known tag names (used for partial-start detection).
-_TAG_PREFIXES: set[str] = set()
-for _name in _TAG_NAMES:
-    for _i in range(1, len(_name) + 1):
-        _TAG_PREFIXES.add(_name[:_i])
-
-
-# ---------------------------------------------------------------------------
-# Tag prefix regex — matches both DSML (<|DSML|...>) and plain XML (<...>)
-# forms for the recognised tool tag names.
-# ---------------------------------------------------------------------------
-
-_DSML_PREFIX_RE = re.compile(
-    r'<(/?)(?:\|(?:DSML)?\|)?(tool[_\-]?calls|toolcalls|invoke|parameter)\b',
-    re.IGNORECASE,
+_CANONICAL_SUFFIXES: tuple[tuple[str, str], ...] = (
+    ('toolcalls', 'tool_calls'),
+    ('invoke', 'invoke'),
+    ('parameter', 'parameter'),
 )
+
+_DSML_NAME_PREFIX = '|DSML|'
+_DSML_NAME_PREFIXES = tuple(
+    _DSML_NAME_PREFIX[:i] for i in range(1, len(_DSML_NAME_PREFIX) + 1)
+)
+
+
+# ---------------------------------------------------------------------------
+# Tag-name matching helpers
+# ---------------------------------------------------------------------------
+
+def _compact_name(value: str) -> str:
+    """Lowercase *value* and remove non-alphanumeric characters."""
+    return ''.join(ch for ch in value.lower() if ch.isalnum())
+
+
+def _canonicalize_tag_name(raw_name: str) -> Optional[str]:
+    """Map a raw tag name to its canonical DSML form when recognised."""
+    token = raw_name.strip()
+    if not token:
+        return None
+
+    direct = _CANONICAL.get(token.lower())
+    if direct is not None:
+        return direct
+
+    compact = _compact_name(token)
+    for suffix, canonical in _CANONICAL_SUFFIXES:
+        if compact.endswith(suffix):
+            return canonical
+    return None
+
+
+def _count_alnum_groups(value: str) -> int:
+    """Count contiguous alphanumeric groups in *value*."""
+    count = 0
+    in_group = False
+    for ch in value:
+        if ch.isalnum():
+            if not in_group:
+                count += 1
+                in_group = True
+        else:
+            in_group = False
+    return count
+
+
+def _has_partial_canonical_suffix(raw_name: str) -> bool:
+    """Return True when *raw_name* could still grow into a tool tag name."""
+    token = raw_name.strip()
+    if not token:
+        return False
+
+    starts = {0}
+    for i in range(1, len(token)):
+        current = token[i]
+        previous = token[i - 1]
+        if not current.isalnum() or current.isspace():
+            continue
+        if not previous.isalnum() or (current.isupper() and previous.islower()):
+            starts.add(i)
+
+    for start in sorted(starts):
+        if start > 0 and _count_alnum_groups(token[:start]) > 1:
+            continue
+
+        compact = _compact_name(token[start:])
+        if not compact:
+            continue
+
+        for suffix, _canonical in _CANONICAL_SUFFIXES:
+            if suffix.startswith(compact):
+                return True
+    return False
+
+
+def _extract_tag_name(inside: str) -> tuple[Optional[str], Optional[str]]:
+    """Extract the raw tag name and its canonical form from tag contents."""
+    for end in range(len(inside), 0, -1):
+        candidate = inside[:end].rstrip()
+        if not candidate:
+            continue
+
+        canonical = _canonicalize_tag_name(candidate)
+        if canonical is None:
+            continue
+
+        remainder = inside[len(candidate):]
+        if remainder and not (remainder[0].isspace() or remainder[0] == '/'):
+            continue
+
+        return candidate, canonical
+
+    return None, None
 
 
 # ---------------------------------------------------------------------------
 # Partial-start detection (streaming hold)
 # ---------------------------------------------------------------------------
-
-def _build_partial_re() -> re.Pattern:
-    """Build the regex for partial tag start detection at end-of-string.
-
-    Must match any suffix of the text that could plausibly be the
-    beginning of a tool markup tag when more content arrives.
-    """
-    parts: list[str] = []
-
-    # Bare prefixes — no tag name yet
-    bare = [
-        '<',            # could become <tool_calls>, <invoke>, <param...
-        '</',           # could become </tool_calls>, </invoke>...
-        '<|',           # DSML pipe separator start
-        '</|',          # closing DSML pipe
-        '<|D',          # partial DSML keyword
-        '<|DS',
-        '<|DSM',
-        '<|DSML',
-        '<|DSML|',      # DSML separator complete, no tag name yet
-        '</|DSML|',
-    ]
-    for b in bare:
-        parts.append(re.escape(b))
-
-    # DSML form: <|DSML| + tag name prefix  /  </|DSML| + tag name prefix
-    for p in sorted(_TAG_PREFIXES, key=len, reverse=True):
-        parts.append(re.escape('<|DSML|' + p))
-        parts.append(re.escape('</|DSML|' + p))
-
-    # Plain XML form: < + tag name prefix  /  </ + tag name prefix
-    for p in sorted(_TAG_PREFIXES, key=len, reverse=True):
-        parts.append(re.escape('<' + p))
-        parts.append(re.escape('</' + p))
-
-    # Sort by length descending so that longer matches take priority
-    # when two alternatives start at the same position.
-    parts.sort(key=len, reverse=True)
-
-    return re.compile(r'(?:' + '|'.join(parts) + r')$', re.IGNORECASE)
-
-
-_PARTIAL_RE = _build_partial_re()
 
 
 # ---------------------------------------------------------------------------
@@ -250,25 +288,30 @@ def _parse_tag(text: str, pos: int) -> Optional[ToolMarkupTag]:
     Returns a ``ToolMarkupTag`` on success, or ``None`` if no valid tag
     starts at that position.
     """
-    remaining = _fold(text[pos:pos + 200])
-    m = _DSML_PREFIX_RE.match(remaining)
-    if not m:
+    if pos >= len(text) or _fold(text[pos]) != '<':
         return None
 
-    is_closing = bool(m.group(1))
-    raw_name = m.group(2)
-    canonical = _CANONICAL.get(raw_name.lower(), raw_name.lower())
+    idx = pos + 1
+    is_closing = False
+    if idx < len(text) and _fold(text[idx]) == '/':
+        is_closing = True
+        idx += 1
 
-    # Now find the closing ``>`` in the original text, skipping over
-    # quoted attribute values so that ``>`` inside a value is not
-    # mistaken for the tag terminator.
-    prefix_len = len(m.group(0))
-    idx = pos + prefix_len
+    name_start = idx
+    if _fold(text[idx:idx + len(_DSML_NAME_PREFIX)]) == _DSML_NAME_PREFIX:
+        name_start += len(_DSML_NAME_PREFIX)
+    elif idx < len(text) and _fold(text[idx]) == '|':
+        return None
+
+    # Find the closing ``>`` in the original text, skipping over quoted
+    # attribute values so that ``>`` inside a value is not mistaken for
+    # the tag terminator.
+    scan = name_start
     in_quote = False
     quote_char = ''
 
-    while idx < len(text):
-        ch = text[idx]
+    while scan < len(text):
+        ch = text[scan]
         folded_ch = _fold(ch)
 
         if in_quote:
@@ -278,15 +321,19 @@ def _parse_tag(text: str, pos: int) -> Optional[ToolMarkupTag]:
             in_quote = True
             quote_char = folded_ch
         elif folded_ch == '>':
+            inside = text[name_start:scan]
+            raw_name, canonical = _extract_tag_name(inside)
+            if raw_name is None or canonical is None:
+                return None
             return ToolMarkupTag(
                 name=canonical,
                 start=pos,
-                end=idx + 1,
+                end=scan + 1,
                 closing=is_closing,
                 raw_name=raw_name,
             )
 
-        idx += 1
+        scan += 1
 
     # No closing ``>`` found — tag is incomplete.
     return None
@@ -377,6 +424,33 @@ def contains_tool_markup_syntax_outside_ignored(text: str) -> bool:
     return find_tool_markup_tag_outside_ignored(text, 0) is not None
 
 
+def _is_partial_tag_candidate(fragment: str) -> bool:
+    """Return True when *fragment* is a plausible partial tool tag start."""
+    folded = _fold(fragment)
+    if not folded.startswith('<'):
+        return False
+
+    rest = folded[1:]
+    if rest == '':
+        return True
+
+    if rest.startswith('/'):
+        rest = rest[1:]
+        if rest == '':
+            return True
+
+    if rest.startswith('|'):
+        if any(prefix.startswith(rest) for prefix in _DSML_NAME_PREFIXES):
+            return True
+        if not rest.startswith(_DSML_NAME_PREFIX):
+            return False
+        rest = rest[len(_DSML_NAME_PREFIX):]
+        if rest == '':
+            return True
+
+    return _has_partial_canonical_suffix(rest)
+
+
 def find_partial_tool_markup_start(text: str) -> int:
     """Return the index in *text* where a partial tool tag starts,
     or -1 if no partial tag is found (or if the partial tag falls
@@ -387,14 +461,14 @@ def find_partial_tool_markup_start(text: str) -> int:
     including plain XML forms (``<tool_ca``), DSML forms
     (``<|DSML|too``), and bare angle brackets at end-of-stream.
     """
-    folded = _fold(text)
-    m = _PARTIAL_RE.search(folded)
-    if not m:
-        return -1
-    pos = m.start()
-    # Guard: if the partial start sits inside an ignored region
-    # (e.g. a code example trailing hold), treat it as not found.
     ignored = _find_ignored_spans(text)
-    if _skip_ignored(pos, ignored) != pos:
-        return -1
-    return pos
+
+    for pos in range(len(text) - 1, -1, -1):
+        if _fold(text[pos]) != '<':
+            continue
+        if _skip_ignored(pos, ignored) != pos:
+            continue
+        if _is_partial_tag_candidate(text[pos:]):
+            return pos
+
+    return -1

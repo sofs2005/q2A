@@ -95,6 +95,35 @@ class DSMLMarkupScannerTests(unittest.TestCase):
         self.assertEqual(tag.name, "parameter")
         self.assertFalse(tag.closing)
 
+    def test_prefixed_tool_calls_variants_are_normalised(self) -> None:
+        cases = [
+            '<abc|tool_calls>',
+            '</abc|tool_calls>',
+            '<vendor_tool_calls>',
+            '<DSmartToolCalls>',
+        ]
+
+        expected_closing = [False, True, False, False]
+        for text, closing in zip(cases, expected_closing):
+            with self.subTest(text=text):
+                tag = find_tool_markup_tag_outside_ignored(text)
+                self.assertIsNotNone(tag)
+                self.assertEqual(tag.name, 'tool_calls')
+                self.assertEqual(tag.closing, closing)
+
+    def test_prefixed_invoke_and_parameter_are_normalised(self) -> None:
+        invoke_tag = find_tool_markup_tag_outside_ignored('<vendor-invoke name="Read">')
+        self.assertIsNotNone(invoke_tag)
+        self.assertEqual(invoke_tag.name, 'invoke')
+        self.assertFalse(invoke_tag.closing)
+
+        parameter_tag = find_tool_markup_tag_outside_ignored(
+            '<agent - parameter name="file_path">'
+        )
+        self.assertIsNotNone(parameter_tag)
+        self.assertEqual(parameter_tag.name, 'parameter')
+        self.assertFalse(parameter_tag.closing)
+
     def test_plain_xml_closing_invoke(self) -> None:
         """</invoke> is recognised."""
         tag = find_tool_markup_tag_outside_ignored("</invoke>")
@@ -178,6 +207,20 @@ class DSMLMarkupScannerTests(unittest.TestCase):
         """Partial detection works when the prefix is preceded by other text."""
         self.assertEqual(find_partial_tool_markup_start("prefix <|DSML|too"), 7)
         self.assertEqual(find_partial_tool_markup_start("abc <invoke"), 4)
+
+    def test_partial_prefixed_tag_names_are_held(self) -> None:
+        cases = {
+            '<abc|tool': 0,
+            '</abc|tool': 0,
+            '<vendor_inv': 0,
+            '<DSmartTool': 0,
+            '<agent - param': 0,
+            'prefix <abc|tool': 7,
+        }
+
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(find_partial_tool_markup_start(text), expected)
 
     def test_partial_non_tool_prefix_ignored(self) -> None:
         """'<div' is not a tool tag prefix — returns -1."""
