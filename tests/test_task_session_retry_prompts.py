@@ -103,7 +103,7 @@ class TaskSessionRetryPromptTests(unittest.IsolatedAsyncioTestCase):
             await self._plan_hashes_for_payload(changed_payload),
         )
 
-    async def test_plan_enables_persistent_session_for_tool_requests(self) -> None:
+    async def test_plan_uses_fresh_upstream_chat_for_tool_requests(self) -> None:
         request = self._tool_request()
         app = self._app_with_session_record(None)
 
@@ -114,22 +114,16 @@ class TaskSessionRetryPromptTests(unittest.IsolatedAsyncioTestCase):
             surface="openai",
         )
 
-        self.assertTrue(plan.enabled)
+        self.assertFalse(plan.enabled)
         self.assertFalse(plan.reuse_chat)
-        self.assertEqual(plan.reason, "new_session")
+        self.assertEqual(plan.reason, "upstream_session_reuse_disabled")
         self.assertEqual(plan.prompt, request.prompt)
+        app.state.session_affinity.get.assert_not_awaited()
 
-    async def test_plan_reuses_existing_tool_session_chat(self) -> None:
+    async def test_plan_does_not_reuse_existing_tool_session_chat(self) -> None:
         request = self._tool_request()
-        first_app = self._app_with_session_record(None)
-        first_plan = await plan_persistent_session_turn(
-            app=first_app,
-            request=request,
-            payload={"messages": [{"role": "user", "content": "inspect file"}]},
-            surface="openai",
-        )
         record = SimpleNamespace(
-            message_hashes=first_plan.current_hashes,
+            message_hashes=["existing_hash"],
             chat_id="chat_1",
             account_email="bot@example.com",
         )
@@ -148,11 +142,12 @@ class TaskSessionRetryPromptTests(unittest.IsolatedAsyncioTestCase):
             surface="openai",
         )
 
-        self.assertTrue(plan.enabled)
-        self.assertTrue(plan.reuse_chat)
-        self.assertEqual(plan.existing_chat_id, "chat_1")
-        self.assertIn("=== SAME TASK SESSION CONTINUATION ===", plan.prompt)
-        self.assertIn("Human: summarize it", plan.prompt)
+        self.assertFalse(plan.enabled)
+        self.assertFalse(plan.reuse_chat)
+        self.assertIsNone(plan.existing_chat_id)
+        self.assertEqual(plan.reason, "upstream_session_reuse_disabled")
+        self.assertEqual(plan.prompt, request.prompt)
+        reuse_app.state.session_affinity.get.assert_not_awaited()
 
     def test_search_no_results_prompt_is_generic(self) -> None:
         request = StandardRequest(

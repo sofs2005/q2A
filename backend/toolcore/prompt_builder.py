@@ -166,7 +166,12 @@ def build_prompt_with_tools(
     tool_choice_mode: str = "auto",
     required_tool_name: str | None = None,
 ) -> str:
-    max_chars = 24000 if (tools and client_profile == QWEN_CODE_OPENAI_PROFILE) else (18000 if tools else 120000)
+    if tools and client_profile == QWEN_CODE_OPENAI_PROFILE:
+        max_chars = 24000
+    elif tools and client_profile == CLAUDE_CODE_OPENAI_PROFILE:
+        max_chars = 18000
+    else:
+        max_chars = 120000
     sys_part = f"<system>\n{system_prompt[:2000]}\n</system>" if system_prompt else ""
     tools_part = ""
     if tools:
@@ -198,7 +203,7 @@ def build_prompt_with_tools(
     needs_review_markers = ("需求回显", "已了解规则", "等待用户输入", "待执行任务", "待确认事项", "[需求回显]", "**需求回显**")
     msg_count = 0
     max_history_msgs = (
-        16 if client_profile == QWEN_CODE_OPENAI_PROFILE else (12 if client_profile == CLAUDE_CODE_OPENAI_PROFILE else 24)
+        16 if client_profile == QWEN_CODE_OPENAI_PROFILE else (12 if client_profile == CLAUDE_CODE_OPENAI_PROFILE else 200)
     ) if tools else 200
     for msg in reversed(messages):
         if msg_count >= max_history_msgs:

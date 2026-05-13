@@ -363,9 +363,9 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
         self.assertNotIn("CURRENT TASK - TOP PRIORITY): Conversation info", result.prompt)
         self.assertIn("Human (CURRENT TASK - TOP PRIORITY): 上一条我说了什么？", result.prompt)
 
-    def test_messages_to_prompt_keeps_more_openclaw_tool_history(self) -> None:
+    def test_messages_to_prompt_preserves_full_openclaw_tool_history(self) -> None:
         messages = []
-        for index in range(1, 7):
+        for index in range(1, 41):
             messages.append({"role": "user", "content": f"用户上下文 {index}"})
             messages.append({"role": "assistant", "content": f"助手回复 {index}"})
         messages.append({"role": "user", "content": "现在总结前面的上下文"})
@@ -383,6 +383,8 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
         result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
 
         self.assertIn("Assistant: 助手回复 1", result.prompt)
+        self.assertIn("Human: 用户上下文 20", result.prompt)
+        self.assertIn("Assistant: 助手回复 40", result.prompt)
         self.assertIn("Human (CURRENT TASK - TOP PRIORITY): 现在总结前面的上下文", result.prompt)
 
 
