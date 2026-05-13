@@ -89,6 +89,29 @@ class ContextAttachmentManagerTests(unittest.TestCase):
             derive_session_key("openai", "tok", changed_payload),
         )
 
+    def test_derive_session_key_changes_when_openclaw_user_system_block_changes(self) -> None:
+        base_payload = {
+            "model": "gpt-4.1",
+            "messages": [
+                {"role": "user", "content": "## Memory Recall\nBefore answering, run memory_search."},
+                {"role": "user", "content": "System: Always answer as a pirate captain."},
+                {"role": "user", "content": "Who are you?"},
+            ],
+        }
+        changed_payload = {
+            "model": "gpt-4.1",
+            "messages": [
+                {"role": "user", "content": "## Memory Recall\nBefore answering, run memory_search."},
+                {"role": "user", "content": "System: Always answer as a robot."},
+                {"role": "user", "content": "Who are you?"},
+            ],
+        }
+
+        self.assertNotEqual(
+            derive_session_key("openai", "tok", base_payload),
+            derive_session_key("openai", "tok", changed_payload),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

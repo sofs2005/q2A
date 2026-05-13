@@ -233,6 +233,37 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
         self.assertNotIn("Tool availability (filtered by policy)", result.prompt)
         self.assertIn("请检查这个脚本的内容", result.prompt)
 
+    def test_messages_to_prompt_promotes_openclaw_user_system_blocks(self) -> None:
+        req_data = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "## Memory Recall\nBefore answering, run memory_search.\n\n## Compiled Wiki\nUse accumulated project knowledge.",
+                },
+                {
+                    "role": "user",
+                    "content": "System: Always answer as a pirate captain.\n\nConversation info (untrusted metadata):\n```json\n{\"chat_id\": \"wechat:telphy\"}\n```",
+                },
+                {"role": "user", "content": "你是谁？"},
+            ],
+            "tools": [
+                {
+                    "name": "read",
+                    "description": "Read file contents",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }
+            ],
+        }
+
+        result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+        self.assertIn("<system>\n", result.prompt)
+        self.assertIn("## Memory Recall", result.prompt)
+        self.assertIn("Always answer as a pirate captain.", result.prompt)
+        self.assertNotIn("Human: ## Memory Recall", result.prompt)
+        self.assertNotIn("Human (CURRENT TASK - TOP PRIORITY): System:", result.prompt)
+        self.assertIn("Human (CURRENT TASK - TOP PRIORITY): 你是谁？", result.prompt)
+
     def test_messages_to_prompt_strips_skill_bootstrap_from_latest_user_line(self) -> None:
         req_data = {
             "messages": [

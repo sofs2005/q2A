@@ -64,6 +64,27 @@ class TaskSessionRetryPromptTests(unittest.IsolatedAsyncioTestCase):
             await self._plan_hashes_for_payload(changed_payload),
         )
 
+    async def test_plan_hashes_change_when_openclaw_user_system_block_changes(self) -> None:
+        base_payload = {
+            "messages": [
+                {"role": "user", "content": "## Memory Recall\nBefore answering, run memory_search."},
+                {"role": "user", "content": "System: Always answer as a pirate captain."},
+                {"role": "user", "content": "Who are you?"},
+            ],
+        }
+        changed_payload = {
+            "messages": [
+                {"role": "user", "content": "## Memory Recall\nBefore answering, run memory_search."},
+                {"role": "user", "content": "System: Always answer as a robot."},
+                {"role": "user", "content": "Who are you?"},
+            ],
+        }
+
+        self.assertNotEqual(
+            await self._plan_hashes_for_payload(base_payload),
+            await self._plan_hashes_for_payload(changed_payload),
+        )
+
     def test_search_no_results_prompt_is_generic(self) -> None:
         request = StandardRequest(
             prompt="Human: do task\n\nAssistant:",

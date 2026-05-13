@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, StandardRequest
+from backend.services.client_profiles import OPENCLAW_OPENAI_PROFILE, is_openclaw_user_system_text
 from backend.toolcore.prompt_builder import _extract_text, _extract_user_text_only, _render_history_tool_call
 
 log = logging.getLogger("qwen2api.task_session")
@@ -78,6 +79,18 @@ def log_session_plan_reuse_cancelled(*, request: StandardRequest, planned_chat_i
     )
 
 
+def _raw_text_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") in {"text", "input_text", "output_text"}
+        )
+    return ""
+
+
 def _assistant_tool_call_markup(message: dict[str, Any], client_profile: str) -> str:
     tc_parts: list[str] = []
     for tc in message.get("tool_calls", []) or []:
@@ -96,6 +109,11 @@ def render_session_message(message: dict[str, Any], *, client_profile: str, tool
     role = message.get("role", "")
     if role not in ("user", "assistant", "system", "developer", "tool"):
         return ""
+
+    if role == "user" and client_profile == OPENCLAW_OPENAI_PROFILE:
+        raw_text = _raw_text_content(message.get("content", ""))
+        if is_openclaw_user_system_text(raw_text):
+            return f"System: {raw_text}"
 
     if role == "tool":
         tool_content = message.get("content", "") or ""

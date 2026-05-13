@@ -13,6 +13,7 @@ OPENCLAW_STARTUP_PATTERNS = (
     "If runtime-provided startup context is included for this first turn",
 )
 OPENCLAW_UNTRUSTED_METADATA_PREFIX = "Sender (untrusted metadata):"
+OPENCLAW_USER_SYSTEM_PREFIXES = ("## Memory Recall", "## Compiled Wiki", "System:")
 OPENCODE_SYSTEM_PREFIX = "you are opencode"
 AGENT_RUNTIME_SYSTEM_MARKERS = (
     "you are a personal assistant running inside",
@@ -176,10 +177,17 @@ def is_qwen_code_openai_request(headers: Mapping[str, Any] | Any, req_data: dict
     return has_qwen_code_header_hint(headers)
 
 
+def is_openclaw_user_system_text(text: str) -> bool:
+    cleaned = str(text or "").strip()
+    return any(cleaned.startswith(prefix) for prefix in OPENCLAW_USER_SYSTEM_PREFIXES)
+
+
 def sanitize_openclaw_user_text(text: str) -> str:
     cleaned = text.strip()
     if not cleaned:
         return cleaned
+    if is_openclaw_user_system_text(cleaned):
+        return ""
     if any(marker in cleaned for marker in OPENCLAW_STARTUP_PATTERNS):
         return ""
     if cleaned.startswith(OPENCLAW_UNTRUSTED_METADATA_PREFIX):
@@ -245,7 +253,6 @@ def _extract_system_text(content: Any) -> str:
 
 
 def extract_system_prompt(req_data: dict[str, Any], *, client_profile: str = OPENCLAW_OPENAI_PROFILE) -> str:
-    del client_profile
     system_parts: list[str] = []
     for field_name in ("system", "developer", "instructions"):
         system_text = _extract_system_text(req_data.get(field_name, ""))
@@ -253,10 +260,11 @@ def extract_system_prompt(req_data: dict[str, Any], *, client_profile: str = OPE
             system_parts.append(system_text)
 
     for msg in req_data.get("messages", []) or []:
-        if msg.get("role") not in {"system", "developer"}:
-            continue
+        role = msg.get("role")
         system_text = _extract_system_text(msg.get("content", ""))
-        if system_text:
+        if role in {"system", "developer"} and system_text:
+            system_parts.append(system_text)
+        elif client_profile == OPENCLAW_OPENAI_PROFILE and role == "user" and is_openclaw_user_system_text(system_text):
             system_parts.append(system_text)
     return "\n\n".join(system_parts)
 
