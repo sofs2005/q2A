@@ -177,16 +177,30 @@ def is_qwen_code_openai_request(headers: Mapping[str, Any] | Any, req_data: dict
     return has_qwen_code_header_hint(headers)
 
 
-def is_openclaw_user_system_text(text: str) -> bool:
+def openclaw_user_system_text(text: str) -> str:
     cleaned = str(text or "").strip()
-    return any(cleaned.startswith(prefix) for prefix in OPENCLAW_USER_SYSTEM_PREFIXES)
+    if not cleaned:
+        return ""
+    if any(cleaned.startswith(prefix) for prefix in OPENCLAW_USER_SYSTEM_PREFIXES):
+        return cleaned
+    if is_agent_runtime_prose(cleaned, "user"):
+        user_tail = re.sub(r"(?is)^.*?tool availability \(filtered by policy\):.*?(?:\n\n|$)", "", cleaned).strip()
+        user_tail = re.sub(r"(?is)^you are a personal assistant running inside .*?(?:\n\n|$)", "", user_tail).strip()
+        if user_tail and cleaned.endswith(user_tail):
+            return cleaned[: -len(user_tail)].rstrip()
+        return cleaned
+    return ""
+
+
+def is_openclaw_user_system_text(text: str) -> bool:
+    return bool(openclaw_user_system_text(text))
 
 
 def sanitize_openclaw_user_text(text: str) -> str:
     cleaned = text.strip()
     if not cleaned:
         return cleaned
-    if is_openclaw_user_system_text(cleaned):
+    if any(cleaned.startswith(prefix) for prefix in OPENCLAW_USER_SYSTEM_PREFIXES):
         return ""
     if any(marker in cleaned for marker in OPENCLAW_STARTUP_PATTERNS):
         return ""
@@ -264,8 +278,10 @@ def extract_system_prompt(req_data: dict[str, Any], *, client_profile: str = OPE
         system_text = _extract_system_text(msg.get("content", ""))
         if role in {"system", "developer"} and system_text:
             system_parts.append(system_text)
-        elif client_profile == OPENCLAW_OPENAI_PROFILE and role == "user" and is_openclaw_user_system_text(system_text):
-            system_parts.append(system_text)
+        elif client_profile == OPENCLAW_OPENAI_PROFILE and role == "user":
+            user_system_text = openclaw_user_system_text(system_text)
+            if user_system_text:
+                system_parts.append(user_system_text)
     return "\n\n".join(system_parts)
 
 

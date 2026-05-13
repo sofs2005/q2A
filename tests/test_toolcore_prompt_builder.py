@@ -229,20 +229,26 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
 
         result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
 
-        self.assertNotIn("running inside OpenClaw", result.prompt)
-        self.assertNotIn("Tool availability (filtered by policy)", result.prompt)
+        self.assertIn("<system>\n", result.prompt)
+        self.assertIn("running inside OpenClaw", result.prompt)
+        self.assertIn("Tool availability (filtered by policy)", result.prompt)
         self.assertIn("请检查这个脚本的内容", result.prompt)
+        self.assertIn("Human (CURRENT TASK - TOP PRIORITY): 请检查这个脚本的内容", result.prompt)
 
     def test_messages_to_prompt_promotes_openclaw_user_system_blocks(self) -> None:
         req_data = {
             "messages": [
                 {
                     "role": "user",
+                    "content": "You are a personal assistant running inside OpenClaw.\n## Tooling\nTool availability (filtered by policy): read, write.\n\nAlways answer as a pirate captain.",
+                },
+                {
+                    "role": "user",
                     "content": "## Memory Recall\nBefore answering, run memory_search.\n\n## Compiled Wiki\nUse accumulated project knowledge.",
                 },
                 {
                     "role": "user",
-                    "content": "System: Always answer as a pirate captain.\n\nConversation info (untrusted metadata):\n```json\n{\"chat_id\": \"wechat:telphy\"}\n```",
+                    "content": "System: Never claim to be a robot.\n\nConversation info (untrusted metadata):\n```json\n{\"chat_id\": \"wechat:telphy\"}\n```",
                 },
                 {"role": "user", "content": "你是谁？"},
             ],
@@ -258,10 +264,15 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
         result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
 
         self.assertIn("<system>\n", result.prompt)
+        self.assertIn("running inside OpenClaw", result.prompt)
+        self.assertIn("Tool availability (filtered by policy)", result.prompt)
         self.assertIn("## Memory Recall", result.prompt)
         self.assertIn("Always answer as a pirate captain.", result.prompt)
+        self.assertIn("Never claim to be a robot.", result.prompt)
+        self.assertNotIn("Human: You are a personal assistant running inside OpenClaw", result.prompt)
         self.assertNotIn("Human: ## Memory Recall", result.prompt)
         self.assertNotIn("Human (CURRENT TASK - TOP PRIORITY): System:", result.prompt)
+        self.assertNotIn("\nHuman: \n", result.prompt)
         self.assertIn("Human (CURRENT TASK - TOP PRIORITY): 你是谁？", result.prompt)
 
     def test_messages_to_prompt_strips_skill_bootstrap_from_latest_user_line(self) -> None:

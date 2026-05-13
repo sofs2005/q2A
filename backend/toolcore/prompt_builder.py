@@ -247,6 +247,9 @@ def build_prompt_with_tools(
                 tc_parts.append(_render_history_tool_call(name, args, client_profile))
             text = "\n".join(tc_parts)
 
+        if not str(text or "").strip():
+            continue
+
         if tools and role == "assistant" and any(marker in text for marker in needs_review_markers):
             log.debug(f"[Prompt] 跳过需求回显式 assistant 消息 ({len(text)}字)")
             msg_count += 1
