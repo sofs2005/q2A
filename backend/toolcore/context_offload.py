@@ -8,7 +8,7 @@ from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE
 
 SYSTEM_CONTEXT_FILE_PREFIX = "qwen2api_context"
 SYSTEM_CONTEXT_PROMPT_NOTE = (
-    "System context files named qwen2api_context*.txt/.md/.json/.log may be attached. "
+    "Generated system context files may be attached with opaque filenames. "
     "Use them as supporting context. User-uploaded files are separate user inputs and should also be respected."
 )
 

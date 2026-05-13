@@ -181,8 +181,9 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["context_mode"], "file")
         self.assertEqual(len(result["upstream_files"]), 1)
         uploaded_filename = result["upstream_files"][0]["filename"]
-        self.assertRegex(uploaded_filename, r"^qwen2api_context_\d+_[0-9a-f]{8}\.txt$")
-        self.assertNotEqual(uploaded_filename, "qwen2api_context.txt")
+        self.assertRegex(uploaded_filename, r"^[0-9a-f]{32}\.txt$")
+        self.assertNotIn("qwen2api", uploaded_filename)
+        self.assertNotIn("context", uploaded_filename)
         self.assertEqual(len(uploaded), 1)
         self.assertEqual(len(saved_texts), 1)
         self.assertIn("Always answer as a pirate captain.", saved_texts[0])

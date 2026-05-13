@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -81,8 +80,7 @@ def _context_messages_for_payload(payload: dict[str, Any]) -> list[dict[str, Any
 
 
 def _generated_context_filename(ext: str) -> str:
-    suffix = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
-    return f"{SYSTEM_CONTEXT_FILE_PREFIX}_{suffix}.{ext}"
+    return f"{uuid.uuid4().hex}.{ext}"
 
 
 async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: str, auth_token: str, client_profile: str, existing_attachments=None) -> dict[str, Any]:
