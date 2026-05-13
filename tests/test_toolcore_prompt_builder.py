@@ -108,6 +108,23 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
         self.assertIn("=== MANDATORY TOOL CALL INSTRUCTIONS ===", result.prompt)
         self.assertIn("Human (CURRENT TASK - TOP PRIORITY): Find the target file and explain it", result.prompt)
 
+    def test_messages_to_prompt_preserves_long_openclaw_system_tail(self) -> None:
+        req_data = {
+            "system": "You are a personal assistant running inside OpenClaw.\n" + "tool guidance line\n" * 180 + "Always answer as a pirate captain.",
+            "messages": [{"role": "user", "content": "Who are you?"}],
+            "tools": [
+                {
+                    "name": "read",
+                    "description": "Read file contents",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }
+            ],
+        }
+
+        result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+        self.assertIn("Always answer as a pirate captain.", result.prompt)
+
     def test_messages_to_prompt_preserves_claude_code_system_prose_with_tools(self) -> None:
         req_data = {
             "system": "You are Claude Code, Anthropic's official CLI for Claude.\nTool availability (filtered by policy): Read, Bash.",

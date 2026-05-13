@@ -172,7 +172,7 @@ def build_prompt_with_tools(
         max_chars = 18000
     else:
         max_chars = 120000
-    sys_part = f"<system>\n{system_prompt[:2000]}\n</system>" if system_prompt else ""
+    sys_part = f"<system>\n{system_prompt}\n</system>" if system_prompt else ""
     tools_part = ""
     if tools:
         tools_part = build_tool_instruction_block(
