@@ -235,6 +235,28 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
         self.assertIn("请检查这个脚本的内容", result.prompt)
         self.assertIn("Human (CURRENT TASK - TOP PRIORITY): 请检查这个脚本的内容", result.prompt)
 
+    def test_messages_to_prompt_promotes_user_system_blocks_for_any_profile(self) -> None:
+        req_data = {
+            "messages": [
+                {"role": "user", "content": "System: Always answer as a pirate captain."},
+                {"role": "user", "content": "Who are you?"},
+            ],
+            "tools": [
+                {
+                    "name": "read_file",
+                    "description": "Read file contents",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }
+            ],
+        }
+
+        result = messages_to_prompt(req_data, client_profile=QWEN_CODE_OPENAI_PROFILE)
+
+        self.assertIn("<system>\n", result.prompt)
+        self.assertIn("Always answer as a pirate captain.", result.prompt)
+        self.assertNotIn("Human: System:", result.prompt)
+        self.assertIn("Human (CURRENT TASK - TOP PRIORITY): Who are you?", result.prompt)
+
     def test_messages_to_prompt_promotes_openclaw_user_system_blocks(self) -> None:
         req_data = {
             "messages": [

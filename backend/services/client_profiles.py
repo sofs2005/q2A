@@ -13,7 +13,7 @@ OPENCLAW_STARTUP_PATTERNS = (
     "If runtime-provided startup context is included for this first turn",
 )
 OPENCLAW_UNTRUSTED_METADATA_PREFIX = "Sender (untrusted metadata):"
-OPENCLAW_USER_SYSTEM_PREFIXES = ("## Memory Recall", "## Compiled Wiki", "System:")
+USER_ROLE_SYSTEM_PREFIXES = ("## Memory Recall", "## Compiled Wiki", "System:")
 OPENCODE_SYSTEM_PREFIX = "you are opencode"
 AGENT_RUNTIME_SYSTEM_MARKERS = (
     "you are a personal assistant running inside",
@@ -177,11 +177,11 @@ def is_qwen_code_openai_request(headers: Mapping[str, Any] | Any, req_data: dict
     return has_qwen_code_header_hint(headers)
 
 
-def openclaw_user_system_text(text: str) -> str:
+def user_role_system_text(text: str) -> str:
     cleaned = str(text or "").strip()
     if not cleaned:
         return ""
-    if any(cleaned.startswith(prefix) for prefix in OPENCLAW_USER_SYSTEM_PREFIXES):
+    if any(cleaned.startswith(prefix) for prefix in USER_ROLE_SYSTEM_PREFIXES):
         return cleaned
     if is_agent_runtime_prose(cleaned, "user"):
         user_tail = re.sub(r"(?is)^.*?tool availability \(filtered by policy\):.*?(?:\n\n|$)", "", cleaned).strip()
@@ -192,15 +192,15 @@ def openclaw_user_system_text(text: str) -> str:
     return ""
 
 
-def is_openclaw_user_system_text(text: str) -> bool:
-    return bool(openclaw_user_system_text(text))
+def is_user_role_system_text(text: str) -> bool:
+    return bool(user_role_system_text(text))
 
 
 def sanitize_openclaw_user_text(text: str) -> str:
     cleaned = text.strip()
     if not cleaned:
         return cleaned
-    if any(cleaned.startswith(prefix) for prefix in OPENCLAW_USER_SYSTEM_PREFIXES):
+    if any(cleaned.startswith(prefix) for prefix in USER_ROLE_SYSTEM_PREFIXES):
         return ""
     if any(marker in cleaned for marker in OPENCLAW_STARTUP_PATTERNS):
         return ""
@@ -278,8 +278,8 @@ def extract_system_prompt(req_data: dict[str, Any], *, client_profile: str = OPE
         system_text = _extract_system_text(msg.get("content", ""))
         if role in {"system", "developer"} and system_text:
             system_parts.append(system_text)
-        elif client_profile == OPENCLAW_OPENAI_PROFILE and role == "user":
-            user_system_text = openclaw_user_system_text(system_text)
+        elif role == "user":
+            user_system_text = user_role_system_text(system_text)
             if user_system_text:
                 system_parts.append(user_system_text)
     return "\n\n".join(system_parts)

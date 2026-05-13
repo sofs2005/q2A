@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.core.upstream_file_cache import UpstreamFileCacheEntry
-from backend.services.client_profiles import openclaw_user_system_text
+from backend.services.client_profiles import user_role_system_text
 from backend.toolcore.context_offload import SYSTEM_CONTEXT_FILE_PREFIX, SYSTEM_CONTEXT_PROMPT_NOTE
 
 
@@ -56,7 +56,7 @@ def derive_session_key(surface: str, auth_token: str, payload: dict[str, Any]) -
         user_system_text
         for message in messages
         if message.get("role") == "user"
-        for user_system_text in [openclaw_user_system_text(_text_from_content(message.get("content", "")))]
+        for user_system_text in [user_role_system_text(_text_from_content(message.get("content", "")))]
         if user_system_text
     )
     developer_text = "\n".join(part for part in developer_parts if part)

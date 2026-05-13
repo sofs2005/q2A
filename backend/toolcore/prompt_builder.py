@@ -13,6 +13,7 @@ from backend.services.client_profiles import (
     sanitize_runtime_prompt_text,
     looks_like_opencode_system_prompt,
     sanitize_openclaw_user_text,
+    user_role_system_text,
 )
 from backend.toolcore.prompt_contract import (
     build_tool_instruction_block,
@@ -59,15 +60,24 @@ def _sanitize_openclaw_user_text(text: str) -> str:
     return sanitize_openclaw_user_text(text)
 
 
+def _strip_user_role_system_text(text: str) -> str:
+    cleaned = str(text or "").strip()
+    system_text = user_role_system_text(cleaned)
+    if system_text and cleaned.startswith(system_text):
+        return cleaned[len(system_text):].strip()
+    return cleaned
+
+
 def _extract_user_text_only(content, client_profile: str = OPENCLAW_OPENAI_PROFILE) -> str:
     if isinstance(content, str):
-        return _sanitize_openclaw_user_text(content) if client_profile == OPENCLAW_OPENAI_PROFILE else content
+        text = _strip_user_role_system_text(content)
+        return _sanitize_openclaw_user_text(text) if client_profile == OPENCLAW_OPENAI_PROFILE else text
     if isinstance(content, list):
         text_blocks = []
         for part in content:
             if not isinstance(part, dict) or part.get("type", "") != "text":
                 continue
-            block_text = part.get("text", "")
+            block_text = _strip_user_role_system_text(part.get("text", ""))
             if client_profile == OPENCLAW_OPENAI_PROFILE:
                 block_text = _sanitize_openclaw_user_text(block_text)
             if block_text:
@@ -233,6 +243,8 @@ def build_prompt_with_tools(
                 user_tool_mode=(bool(tools) and role == "user" and _is_heavy_tool_profile(client_profile)),
                 client_profile=client_profile,
             )
+            if role == "user":
+                text = _strip_user_role_system_text(text)
 
         if role == "assistant" and not text and msg.get("tool_calls"):
             tc_parts = []

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, StandardRequest
-from backend.services.client_profiles import OPENCLAW_OPENAI_PROFILE, openclaw_user_system_text
+from backend.services.client_profiles import user_role_system_text
 from backend.toolcore.prompt_builder import _extract_text, _extract_user_text_only, _render_history_tool_call
 
 log = logging.getLogger("qwen2api.task_session")
@@ -110,8 +110,8 @@ def render_session_message(message: dict[str, Any], *, client_profile: str, tool
     if role not in ("user", "assistant", "system", "developer", "tool"):
         return ""
 
-    if role == "user" and client_profile == OPENCLAW_OPENAI_PROFILE:
-        user_system_text = openclaw_user_system_text(_raw_text_content(message.get("content", "")))
+    if role == "user":
+        user_system_text = user_role_system_text(_raw_text_content(message.get("content", "")))
         if user_system_text:
             return f"System: {user_system_text}"
 
