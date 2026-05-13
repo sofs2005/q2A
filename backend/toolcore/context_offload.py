@@ -89,9 +89,8 @@ class ContextOffloader:
         latest_user = user_messages[-1] if user_messages else {"role": "user", "content": ""}
         latest_user_text = self._extract_text(latest_user)
 
-        older_messages = messages[:-1] if messages else []
         serialized_parts: list[str] = []
-        for idx, msg in enumerate(older_messages, 1):
+        for idx, msg in enumerate(messages or [], 1):
             role = msg.get("role", "unknown")
             text = self._extract_text(msg)
             if not text.strip():

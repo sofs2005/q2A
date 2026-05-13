@@ -46,6 +46,17 @@ class ToolCoreContextOffloadTests(unittest.TestCase):
         self.assertIn("latest task", plan.inline_messages[0]["content"])
         self.assertIn(SYSTEM_CONTEXT_PROMPT_NOTE, plan.inline_messages[0]["content"])
 
+    def test_plan_history_file_contains_latest_user_message(self) -> None:
+        messages = [
+            {"role": "assistant", "content": "A" * 120},
+            {"role": "user", "content": "latest task"},
+        ]
+
+        plan = self.offloader.plan(messages, tools=[], client_profile="openclaw_openai")
+
+        self.assertIn("Message 2 [user]", plan.generated_files[0].text)
+        self.assertIn("latest task", plan.generated_files[0].text)
+
 
 if __name__ == "__main__":
     unittest.main()

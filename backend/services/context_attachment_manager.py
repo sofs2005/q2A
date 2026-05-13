@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +70,21 @@ def derive_session_key(surface: str, auth_token: str, payload: dict[str, Any]) -
     return hashlib.sha256(basis.encode("utf-8", errors="ignore")).hexdigest()[:24]
 
 
+def _context_messages_for_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    context_messages: list[dict[str, Any]] = []
+    for field_name, role in (("system", "system"), ("developer", "developer"), ("instructions", "system")):
+        text = _text_from_content(payload.get(field_name, ""))
+        if text.strip():
+            context_messages.append({"role": role, "content": text})
+    context_messages.extend(payload.get("messages", []) or [])
+    return context_messages
+
+
+def _generated_context_filename(ext: str) -> str:
+    suffix = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    return f"{SYSTEM_CONTEXT_FILE_PREFIX}_{suffix}.{ext}"
+
+
 async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: str, auth_token: str, client_profile: str, existing_attachments=None) -> dict[str, Any]:
     context_offloader = app.state.context_offloader
     account_pool = app.state.account_pool
@@ -79,9 +96,10 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
     session_key = derive_session_key(surface, auth_token, payload)
     tools = payload.get("tools", []) or []
     messages = payload.get("messages", []) or []
+    context_messages = _context_messages_for_payload(payload)
     manual_attachments = list(existing_attachments or [])
-    plan = context_offloader.plan(messages, tools=tools, client_profile=client_profile)
-    use_generated_context_files = bool(plan.generated_files) and not bool(tools)
+    plan = context_offloader.plan(context_messages, tools=tools, client_profile=client_profile)
+    use_generated_context_files = bool(plan.generated_files)
     if not use_generated_context_files and not manual_attachments:
         return {
             "payload": payload,
@@ -168,9 +186,8 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
             await file_store.delete_path(attachment.local_path)
 
         if use_generated_context_files:
-            for index, generated in enumerate(plan.generated_files, 1):
-                fixed_base = f"{SYSTEM_CONTEXT_FILE_PREFIX}_{index}" if len(plan.generated_files) > 1 else SYSTEM_CONTEXT_FILE_PREFIX
-                filename = f"{fixed_base}.{generated.ext}"
+            for generated in plan.generated_files:
+                filename = _generated_context_filename(generated.ext)
                 local_meta = await file_store.save_text(filename, generated.text, generated.content_type, purpose="context")
                 cache_entry = await cache.get(session_key, acc.email, local_meta["sha256"], generated.ext)
                 if cache_entry is not None:
