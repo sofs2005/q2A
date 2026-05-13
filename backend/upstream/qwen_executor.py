@@ -33,7 +33,13 @@ class QwenExecutor:
         }
 
         if getattr(self.engine, "_request_json", None) is not None:
-            r = await request_fn("POST", "/api/v2/chats/new", token, body, timeout=30.0)
+            r = await request_fn(
+                "POST",
+                "/api/v2/chats/new",
+                token,
+                body,
+                timeout=settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS,
+            )
         else:
             r = await request_fn("POST", "/api/v2/chats/new", token, body)
         body_text = r.get("body", "")

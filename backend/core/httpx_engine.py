@@ -9,6 +9,8 @@ import json
 import logging
 from curl_cffi.requests import AsyncSession
 
+from backend.core.config import settings
+
 log = logging.getLogger("qwen2api.httpx_engine")
 
 BASE_URL = "https://chat.qwen.ai"
@@ -48,7 +50,10 @@ async def _get_global_session() -> AsyncSession:
         if _global_session is not None:
             return _global_session
 
-        _global_session = AsyncSession(impersonate=_IMPERSONATE, timeout=30)
+        _global_session = AsyncSession(
+            impersonate=_IMPERSONATE,
+            timeout=settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS,
+        )
         log.info("[HttpxEngine] ✅ 全局连接池已初始化")
         return _global_session
 

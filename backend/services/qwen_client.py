@@ -5,6 +5,7 @@ from typing import AsyncIterator
 import httpx
 
 from backend.core.account_pool import AccountPool
+from backend.core.config import settings
 from backend.services.auth_resolver import BASE_URL, AuthResolver
 from backend.upstream.payload_builder import build_chat_payload
 from backend.upstream.qwen_executor import QwenExecutor
@@ -32,8 +33,18 @@ class QwenClient:
             "Content-Type": "application/json",
         }
 
-    async def _request_json(self, method: str, path: str, token: str, body: dict | None = None, timeout: float = 30.0) -> dict:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as hc:
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        token: str,
+        body: dict | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        request_timeout = (
+            timeout if timeout is not None else settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS
+        )
+        async with httpx.AsyncClient(timeout=request_timeout, follow_redirects=True) as hc:
             resp = await hc.request(
                 method,
                 f"{BASE_URL}{path}",
@@ -114,12 +125,13 @@ class QwenClient:
             yield event
 
     async def stream_chat_once(self, token: str, chat_id: str, payload: dict) -> AsyncIterator[dict]:
-        # 降低read timeout，避免模型卡住时长时间等待
-        # connect: 连接超时30秒
-        # read: 读取超时120秒（2分钟内没有新数据就超时）
-        # write: 写入超时30秒
-        # pool: 连接池超时30秒
-        timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
+        # 流式读取允许更长的模型思考/首 token 等待时间
+        timeout = httpx.Timeout(
+            connect=30.0,
+            read=settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS,
+            write=30.0,
+            pool=30.0,
+        )
         async with httpx.AsyncClient(timeout=timeout) as hc:
             async with hc.stream(
                 "POST",
