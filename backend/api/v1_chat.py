@@ -53,6 +53,27 @@ def _short_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 
+def _summarize_tool_blocks(tool_blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    details = []
+    for block in tool_blocks:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        input_data = block.get("input") if isinstance(block.get("input"), dict) else {}
+        try:
+            input_json = json.dumps(input_data, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            input_json = str(input_data)
+        details.append(
+            {
+                "id": block.get("id"),
+                "name": block.get("name"),
+                "input_keys": sorted(str(key) for key in input_data.keys()),
+                "input_chars": len(input_json),
+            }
+        )
+    return details
+
+
 def _text_from_message_content(content: Any) -> str:
     if isinstance(content, list):
         return "\n".join(
@@ -562,6 +583,7 @@ async def chat_completions(request: Request):
                                 )
                                 final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else (execution.state.finish_reason or "stop")
                                 tool_names = [block.get("name") for block in directive.tool_blocks if block.get("type") == "tool_use"]
+                                tool_details = _summarize_tool_blocks(directive.tool_blocks)
                                 _record_repeated_tool_guard(
                                     session_key=standard_request.session_key or session_key,
                                     diagnostics=guard_diagnostics,
@@ -569,7 +591,7 @@ async def chat_completions(request: Request):
                                     finish_reason=final_finish_reason,
                                 )
                                 log.info(
-                                    "[OAI] stream_final req_id=%s completion_id=%s chat_id=%s prompt_hash=%s finish_reason=%s stop_reason=%s tool_names=%s answer_chars=%s staged_chunks=%s",
+                                    "[OAI] stream_final req_id=%s completion_id=%s chat_id=%s prompt_hash=%s finish_reason=%s stop_reason=%s tool_names=%s tool_details=%s answer_chars=%s staged_chunks=%s",
                                     req_id,
                                     completion_id,
                                     execution.chat_id,
@@ -577,6 +599,7 @@ async def chat_completions(request: Request):
                                     final_finish_reason,
                                     directive.stop_reason,
                                     tool_names,
+                                    tool_details,
                                     len(execution.state.answer_text or ""),
                                     len(staged_chunks),
                                 )
@@ -634,6 +657,7 @@ async def chat_completions(request: Request):
                                 )
                                 final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else (execution.state.finish_reason or "stop")
                                 tool_names = [block.get("name") for block in directive.tool_blocks if block.get("type") == "tool_use"]
+                                tool_details = _summarize_tool_blocks(directive.tool_blocks)
                                 _record_repeated_tool_guard(
                                     session_key=standard_request.session_key or session_key,
                                     diagnostics=guard_diagnostics,
@@ -641,7 +665,7 @@ async def chat_completions(request: Request):
                                     finish_reason=final_finish_reason,
                                 )
                                 log.info(
-                                    "[OAI] stream_final req_id=%s completion_id=%s chat_id=%s prompt_hash=%s finish_reason=%s stop_reason=%s tool_names=%s answer_chars=%s staged_chunks=%s",
+                                    "[OAI] stream_final req_id=%s completion_id=%s chat_id=%s prompt_hash=%s finish_reason=%s stop_reason=%s tool_names=%s tool_details=%s answer_chars=%s staged_chunks=%s",
                                     req_id,
                                     completion_id,
                                     execution.chat_id,
@@ -649,6 +673,7 @@ async def chat_completions(request: Request):
                                     final_finish_reason,
                                     directive.stop_reason,
                                     tool_names,
+                                    tool_details,
                                     len(execution.state.answer_text or ""),
                                     len(translator.pending_chunks),
                                 )
@@ -738,6 +763,7 @@ async def chat_completions(request: Request):
                     assistant_message=assistant_message,
                 )
                 tool_names = [block.get("name") for block in directive.tool_blocks if block.get("type") == "tool_use"]
+                tool_details = _summarize_tool_blocks(directive.tool_blocks)
                 final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else (execution.state.finish_reason or "stop")
                 _record_repeated_tool_guard(
                     session_key=standard_request.session_key or session_key,
@@ -746,7 +772,7 @@ async def chat_completions(request: Request):
                     finish_reason=final_finish_reason,
                 )
                 log.info(
-                    "[OAI] json_final req_id=%s completion_id=%s chat_id=%s prompt_hash=%s finish_reason=%s stop_reason=%s tool_names=%s answer_chars=%s",
+                    "[OAI] json_final req_id=%s completion_id=%s chat_id=%s prompt_hash=%s finish_reason=%s stop_reason=%s tool_names=%s tool_details=%s answer_chars=%s",
                     req_id,
                     completion_id,
                     execution.chat_id,
@@ -754,6 +780,7 @@ async def chat_completions(request: Request):
                     final_finish_reason,
                     directive.stop_reason,
                     tool_names,
+                    tool_details,
                     len(execution.state.answer_text or ""),
                 )
 
