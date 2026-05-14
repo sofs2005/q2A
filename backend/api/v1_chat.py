@@ -174,6 +174,67 @@ def _openai_stream_chunk(*, completion_id: str, created: int, model_name: str, c
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _log_openai_stream_sse_chunk(*, req_id: str, completion_id: str, prompt_hash: str, chunk: str) -> None:
+    if not isinstance(chunk, str) or not chunk.startswith("data: "):
+        return
+    data = chunk[6:].strip()
+    if not data or data == "[DONE]":
+        log.info(
+            "[OAI] stream_sse_chunk req_id=%s completion_id=%s prompt_hash=%s done=%s",
+            req_id,
+            completion_id,
+            prompt_hash,
+            data == "[DONE]",
+        )
+        return
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        log.info(
+            "[OAI] stream_sse_chunk req_id=%s completion_id=%s prompt_hash=%s parse_error=True bytes=%s",
+            req_id,
+            completion_id,
+            prompt_hash,
+            len(chunk.encode("utf-8", errors="ignore")),
+        )
+        return
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    if not isinstance(choices, list) or not choices:
+        log.info(
+            "[OAI] stream_sse_chunk req_id=%s completion_id=%s prompt_hash=%s choices=%s has_usage=%s",
+            req_id,
+            completion_id,
+            prompt_hash,
+            len(choices or []),
+            isinstance(payload, dict) and payload.get("usage") is not None,
+        )
+        return
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    delta = choice.get("delta") if isinstance(choice, dict) else {}
+    delta = delta if isinstance(delta, dict) else {}
+    tool_calls = delta.get("tool_calls")
+    tool_names = []
+    if isinstance(tool_calls, list):
+        for tool_call in tool_calls:
+            function = tool_call.get("function") if isinstance(tool_call, dict) else None
+            if isinstance(function, dict) and function.get("name"):
+                tool_names.append(function.get("name"))
+    log.info(
+        "[OAI] stream_sse_chunk req_id=%s completion_id=%s prompt_hash=%s choices=%s role=%s has_content=%s content_chars=%s has_tool_calls=%s tool_names=%s finish_reason=%s",
+        req_id,
+        completion_id,
+        prompt_hash,
+        len(choices),
+        delta.get("role"),
+        "content" in delta,
+        len(str(delta.get("content") or "")),
+        bool(tool_calls),
+        tool_names,
+        choice.get("finish_reason"),
+    )
+
+
+
 def _openai_text_stream_chunks(*, completion_id: str, created: int, model_name: str, content: str, prompt: str):
     yield _openai_stream_chunk(
         completion_id=completion_id,
@@ -582,6 +643,12 @@ async def chat_completions(request: Request):
                         chunk = await queue.get()
                         if chunk is None:
                             break
+                        _log_openai_stream_sse_chunk(
+                            req_id=req_id,
+                            completion_id=completion_id,
+                            prompt_hash=diagnostics["prompt_hash"],
+                            chunk=chunk,
+                        )
                         yield chunk
                 finally:
                     if not producer_task.done():

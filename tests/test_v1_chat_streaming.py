@@ -128,7 +128,7 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
             on_delta = kwargs["on_delta"]
             await on_delta({"phase": "answer"}, "chunk-1", None)
             return types.SimpleNamespace(
-                execution=types.SimpleNamespace(state=types.SimpleNamespace(finish_reason="stop")),
+                execution=types.SimpleNamespace(chat_id="chat_1", state=types.SimpleNamespace(finish_reason="stop", answer_text="")),
                 directive=None,
                 usage={"prompt_tokens": 2, "completion_tokens": 5, "total_tokens": 7},
             )
@@ -141,7 +141,7 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
              patch.object(v1_chat, "plan_persistent_session_turn", AsyncMock(return_value=types.SimpleNamespace(enabled=False))), \
              patch.object(v1_chat, "OpenAIStreamTranslator", _FakeTranslator), \
              patch.object(v1_chat, "run_retryable_completion_bridge", new=fake_bridge), \
-             patch.object(v1_chat, "build_tool_directive", return_value=types.SimpleNamespace(stop_reason="end_turn")), \
+             patch.object(v1_chat, "build_tool_directive", return_value=types.SimpleNamespace(stop_reason="end_turn", tool_blocks=[])), \
              patch.object(v1_chat, "build_openai_assistant_history_message", return_value={"role": "assistant", "content": "done"}), \
              patch.object(v1_chat, "persist_session_turn", AsyncMock()), \
              patch.object(v1_chat, "clear_invalidated_session_chat", AsyncMock()), \
@@ -188,7 +188,7 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
             await on_delta({"phase": "answer"}, "##TOOL_C", None)
             await on_delta({"phase": "answer"}, 'ALL##\n{"name": "Read", "input": {"file_path": "README.md"}}\n##END_CALL##', None)
             return types.SimpleNamespace(
-                execution=types.SimpleNamespace(state=types.SimpleNamespace(finish_reason="stop")),
+                execution=types.SimpleNamespace(chat_id="chat_1", state=types.SimpleNamespace(finish_reason="stop", answer_text="")),
                 directive=directive,
             )
 
@@ -247,12 +247,13 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
             )
             await on_delta({"phase": "tool_call"}, None, normalized_calls)
             return types.SimpleNamespace(
-                execution=types.SimpleNamespace(state=types.SimpleNamespace(finish_reason="tool_calls", answer_text="", reasoning_text="", tool_calls=[{"id": "call_1", "name": "exec", "input": {"command": "echo hi"}}])),
+                execution=types.SimpleNamespace(chat_id="chat_1", state=types.SimpleNamespace(finish_reason="tool_calls", answer_text="", reasoning_text="", tool_calls=[{"id": "call_1", "name": "exec", "input": {"command": "echo hi"}}])),
                 directive=directive,
             )
 
         chunks = []
-        with patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
+        with self.assertLogs("qwen2api.chat", level="INFO") as captured_logs, \
+             patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
              patch.object(v1_chat, "derive_session_key", return_value="session"), \
              patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value={"payload": request._payload, "upstream_files": [], "session_key": "session", "context_mode": "inline", "bound_account_email": None, "bound_account": None})), \
              patch.object(v1_chat, "_build_standard_request", return_value=standard_request), \
@@ -270,8 +271,12 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
                 chunks.append(chunk)
 
         joined = "".join(chunks)
+        log_output = "\n".join(captured_logs.output)
         self.assertIn('"name": "exec"', joined)
         self.assertNotIn('"name": "Bash"', joined)
+        self.assertIn("[OAI] stream_sse_chunk", log_output)
+        self.assertIn("has_tool_calls=True", log_output)
+        self.assertIn("finish_reason=tool_calls", log_output)
 
     async def test_streaming_retry_does_not_leak_failed_attempt_text(self) -> None:
         app = types.SimpleNamespace(
@@ -309,7 +314,7 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
             await on_attempt_start(1, "prompt")
             await on_delta({"phase": "tool_call"}, None, [{"id": "call_1", "name": "exec", "input": {"command": "echo hi"}}])
             return types.SimpleNamespace(
-                execution=types.SimpleNamespace(state=types.SimpleNamespace(finish_reason="tool_calls", answer_text="", reasoning_text="", tool_calls=[{"id": "call_1", "name": "exec", "input": {"command": "echo hi"}}])),
+                execution=types.SimpleNamespace(chat_id="chat_1", state=types.SimpleNamespace(finish_reason="tool_calls", answer_text="", reasoning_text="", tool_calls=[{"id": "call_1", "name": "exec", "input": {"command": "echo hi"}}])),
                 directive=directive,
             )
 
