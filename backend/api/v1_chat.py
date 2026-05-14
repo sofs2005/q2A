@@ -251,6 +251,28 @@ def _log_openai_stream_sse_chunk(*, req_id: str, completion_id: str, prompt_hash
 
 
 
+def _is_openai_content_delta_chunk(chunk: str) -> bool:
+    if not isinstance(chunk, str) or not chunk.startswith("data: "):
+        return False
+    data = chunk[6:].strip()
+    if not data or data == "[DONE]":
+        return False
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        return False
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    if not isinstance(choices, list) or not choices:
+        return False
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    delta = choice.get("delta") if isinstance(choice, dict) else {}
+    return isinstance(delta, dict) and "content" in delta
+
+
+def _filter_staged_chunks_for_tool_calls(chunks: list[str]) -> list[str]:
+    return [chunk for chunk in chunks if not _is_openai_content_delta_chunk(chunk)]
+
+
 def _openai_text_stream_chunks(*, completion_id: str, created: int, model_name: str, content: str, prompt: str):
     yield _openai_stream_chunk(
         completion_id=completion_id,
@@ -558,7 +580,8 @@ async def chat_completions(request: Request):
                                     len(execution.state.answer_text or ""),
                                     len(staged_chunks),
                                 )
-                                for chunk in staged_chunks:
+                                output_staged_chunks = _filter_staged_chunks_for_tool_calls(staged_chunks) if final_finish_reason == "tool_calls" else staged_chunks
+                                for chunk in output_staged_chunks:
                                     await queue.put(chunk)
                                 if translator is not None:
                                     for chunk in translator.finalize(final_finish_reason, usage=_stream_usage(result, prompt)):
