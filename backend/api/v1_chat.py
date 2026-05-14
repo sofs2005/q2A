@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import json
@@ -45,6 +46,52 @@ def _stream_usage(result, prompt: str) -> dict[str, int]:
 
 def _detect_openai_client_profile(request: Request, req_data: dict) -> str:
     return detect_openai_client_profile(request.headers, req_data)
+
+
+def _short_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _text_from_message_content(content: Any) -> str:
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") in {"text", "input_text", "output_text"}
+        )
+    return str(content or "")
+
+
+def _build_openai_request_diagnostics(req_data: dict[str, Any], *, prompt: str) -> dict[str, Any]:
+    messages = [message for message in (req_data.get("messages", []) or []) if isinstance(message, dict)]
+    role_counts: dict[str, int] = {}
+    assistant_tool_call_count = 0
+    tool_result_count = 0
+    latest_user_text = ""
+    for message in messages:
+        role = str(message.get("role") or "unknown")
+        role_counts[role] = role_counts.get(role, 0) + 1
+        if role == "assistant" and isinstance(message.get("tool_calls"), list):
+            assistant_tool_call_count += len(message.get("tool_calls") or [])
+        if role == "tool" or any(
+            isinstance(part, dict) and part.get("type") == "tool_result"
+            for part in (message.get("content") if isinstance(message.get("content"), list) else [])
+        ):
+            tool_result_count += 1
+        if role == "user":
+            text = _text_from_message_content(message.get("content", "")).strip()
+            if text:
+                latest_user_text = text
+    return {
+        "message_count": len(messages),
+        "role_counts": dict(sorted(role_counts.items())),
+        "assistant_tool_call_count": assistant_tool_call_count,
+        "tool_result_count": tool_result_count,
+        "has_assistant_tool_calls": assistant_tool_call_count > 0,
+        "has_tool_results": tool_result_count > 0,
+        "latest_user_hash": _short_hash(latest_user_text) if latest_user_text else "",
+        "prompt_hash": _short_hash(prompt),
+    }
 
 
 def _build_standard_request(req_data: dict, *, client_profile: str) -> StandardRequest:
@@ -123,8 +170,11 @@ async def chat_completions(request: Request):
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
+    req_id = new_request_id()
+    diagnostics = _build_openai_request_diagnostics(req_data, prompt=prompt)
+    client_host = request.client.host if request.client else "-"
 
-    with request_context(req_id=new_request_id(), surface="openai", requested_model=model_name, resolved_model=qwen_model):
+    with request_context(req_id=req_id, surface="openai", requested_model=model_name, resolved_model=qwen_model):
         log.info(
             "[OAI] model=%s stream=%s tool_enabled=%s profile=%s tools=%s prompt_len=%s prompt_tail=%r",
             qwen_model,
@@ -134,6 +184,21 @@ async def chat_completions(request: Request):
             [t.get('name') for t in tools],
             len(prompt),
             prompt[-500:],
+        )
+        log.info(
+            "[OAI] request_diag req_id=%s client=%s session=%s prompt_hash=%s messages=%s roles=%s assistant_tool_calls=%s tool_results=%s latest_user_hash=%s context_mode=%s upstream_files=%s completion_id=%s",
+            req_id,
+            client_host,
+            standard_request.session_key,
+            diagnostics["prompt_hash"],
+            diagnostics["message_count"],
+            diagnostics["role_counts"],
+            diagnostics["assistant_tool_call_count"],
+            diagnostics["tool_result_count"],
+            diagnostics["latest_user_hash"],
+            standard_request.context_mode,
+            len(standard_request.upstream_files or []),
+            completion_id,
         )
 
         if standard_request.stream:
@@ -205,6 +270,19 @@ async def chat_completions(request: Request):
                                     assistant_message=assistant_message,
                                 )
                                 final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else (execution.state.finish_reason or "stop")
+                                tool_names = [block.get("name") for block in directive.tool_blocks if block.get("type") == "tool_use"]
+                                log.info(
+                                    "[OAI] stream_final req_id=%s completion_id=%s chat_id=%s prompt_hash=%s finish_reason=%s stop_reason=%s tool_names=%s answer_chars=%s staged_chunks=%s",
+                                    req_id,
+                                    completion_id,
+                                    execution.chat_id,
+                                    diagnostics["prompt_hash"],
+                                    final_finish_reason,
+                                    directive.stop_reason,
+                                    tool_names,
+                                    len(execution.state.answer_text or ""),
+                                    len(staged_chunks),
+                                )
                                 for chunk in staged_chunks:
                                     await queue.put(chunk)
                                 if translator is not None:
@@ -257,15 +335,41 @@ async def chat_completions(request: Request):
                                     assistant_message=assistant_message,
                                 )
                                 final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else (execution.state.finish_reason or "stop")
+                                tool_names = [block.get("name") for block in directive.tool_blocks if block.get("type") == "tool_use"]
+                                log.info(
+                                    "[OAI] stream_final req_id=%s completion_id=%s chat_id=%s prompt_hash=%s finish_reason=%s stop_reason=%s tool_names=%s answer_chars=%s staged_chunks=%s",
+                                    req_id,
+                                    completion_id,
+                                    execution.chat_id,
+                                    diagnostics["prompt_hash"],
+                                    final_finish_reason,
+                                    directive.stop_reason,
+                                    tool_names,
+                                    len(execution.state.answer_text or ""),
+                                    len(translator.pending_chunks),
+                                )
                                 for chunk in translator.finalize(final_finish_reason, usage=_stream_usage(result, prompt)):
                                     await queue.put(chunk)
                         except HTTPException as he:
                             await clear_invalidated_session_chat(app=app, request=standard_request)
                             await queue.put(f"data: {json.dumps({'error': he.detail})}\n\n")
                         except Exception as e:
+                            log.exception(
+                                "[OAI] stream_error req_id=%s completion_id=%s prompt_hash=%s error=%s",
+                                req_id,
+                                completion_id,
+                                diagnostics["prompt_hash"],
+                                e,
+                            )
                             await clear_invalidated_session_chat(app=app, request=standard_request)
                             await queue.put(f"data: {json.dumps({'error': str(e)})}\n\n")
                         finally:
+                            log.info(
+                                "[OAI] stream_producer_done req_id=%s completion_id=%s prompt_hash=%s",
+                                req_id,
+                                completion_id,
+                                diagnostics["prompt_hash"],
+                            )
                             await queue.put(None)
 
                 producer_task = asyncio.create_task(producer())
@@ -277,6 +381,12 @@ async def chat_completions(request: Request):
                         yield chunk
                 finally:
                     if not producer_task.done():
+                        log.warning(
+                            "[OAI] stream_client_disconnect req_id=%s completion_id=%s prompt_hash=%s",
+                            req_id,
+                            completion_id,
+                            diagnostics["prompt_hash"],
+                        )
                         producer_task.cancel()
                         try:
                             await producer_task
@@ -316,6 +426,19 @@ async def chat_completions(request: Request):
                     surface="openai",
                     execution=execution,
                     assistant_message=assistant_message,
+                )
+                tool_names = [block.get("name") for block in directive.tool_blocks if block.get("type") == "tool_use"]
+                final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else (execution.state.finish_reason or "stop")
+                log.info(
+                    "[OAI] json_final req_id=%s completion_id=%s chat_id=%s prompt_hash=%s finish_reason=%s stop_reason=%s tool_names=%s answer_chars=%s",
+                    req_id,
+                    completion_id,
+                    execution.chat_id,
+                    diagnostics["prompt_hash"],
+                    final_finish_reason,
+                    directive.stop_reason,
+                    tool_names,
+                    len(execution.state.answer_text or ""),
                 )
 
                 return JSONResponse(build_openai_completion_payload(
