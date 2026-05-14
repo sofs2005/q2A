@@ -94,6 +94,128 @@ def _build_openai_request_diagnostics(req_data: dict[str, Any], *, prompt: str) 
     }
 
 
+class _RepeatedToolRequestGuard:
+    def __init__(self, *, ttl_seconds: float = 120.0, max_entries: int = 512, now: Callable[[], float] = time.monotonic):
+        self.ttl_seconds = ttl_seconds
+        self.max_entries = max_entries
+        self.now = now
+        self._entries: dict[tuple[str, str, str], tuple[float, list[str]]] = {}
+
+    def record_tool_response(self, *, session_key: str, prompt_hash: str, latest_user_hash: str, tool_names: list[str]) -> None:
+        names = [name for name in dict.fromkeys(tool_names) if name]
+        if not session_key or not prompt_hash or not latest_user_hash or not names:
+            return
+        self._prune()
+        self._entries[(session_key, prompt_hash, latest_user_hash)] = (self.now(), names)
+        if len(self._entries) > self.max_entries:
+            oldest_key = min(self._entries, key=lambda key: self._entries[key][0])
+            self._entries.pop(oldest_key, None)
+
+    def repeated_user_only_tool_request(self, session_key: str, diagnostics: dict[str, Any]) -> list[str] | None:
+        if diagnostics.get("has_assistant_tool_calls") or diagnostics.get("has_tool_results"):
+            return None
+        if diagnostics.get("message_count") != 1 or diagnostics.get("role_counts") != {"user": 1}:
+            return None
+        key = (session_key, str(diagnostics.get("prompt_hash") or ""), str(diagnostics.get("latest_user_hash") or ""))
+        if not all(key):
+            return None
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        recorded_at, tool_names = entry
+        if self.now() - recorded_at > self.ttl_seconds:
+            self._entries.pop(key, None)
+            return None
+        return list(tool_names)
+
+    def _prune(self) -> None:
+        cutoff = self.now() - self.ttl_seconds
+        expired = [key for key, (recorded_at, _tool_names) in self._entries.items() if recorded_at < cutoff]
+        for key in expired:
+            self._entries.pop(key, None)
+
+
+_repeated_tool_request_guard = _RepeatedToolRequestGuard()
+
+
+def _build_repeated_tool_request_notice(tool_names: list[str]) -> str:
+    names = ", ".join(tool_names) or "unknown"
+    return (
+        f"上一轮已经返回工具调用（{names}），但本轮仍是相同的原始用户请求，"
+        "没有携带 assistant tool_calls 或 tool 结果。为避免重复调用上游，请让客户端执行工具并续传工具结果后再继续。"
+    )
+
+
+def _build_openai_text_payload(*, completion_id: str, created: int, model_name: str, content: str, prompt: str) -> dict[str, Any]:
+    return {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": calculate_usage(prompt, content),
+    }
+
+
+def _openai_stream_chunk(*, completion_id: str, created: int, model_name: str, choices: list[dict[str, Any]], usage: dict[str, int] | None = None) -> str:
+    payload: dict[str, Any] = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_name,
+        "choices": choices,
+    }
+    if usage is not None:
+        payload["usage"] = usage
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _openai_text_stream_chunks(*, completion_id: str, created: int, model_name: str, content: str, prompt: str):
+    yield _openai_stream_chunk(
+        completion_id=completion_id,
+        created=created,
+        model_name=model_name,
+        choices=[{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+    )
+    yield _openai_stream_chunk(
+        completion_id=completion_id,
+        created=created,
+        model_name=model_name,
+        choices=[{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+    )
+    yield _openai_stream_chunk(
+        completion_id=completion_id,
+        created=created,
+        model_name=model_name,
+        choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    )
+    yield _openai_stream_chunk(
+        completion_id=completion_id,
+        created=created,
+        model_name=model_name,
+        choices=[],
+        usage=calculate_usage(prompt, content),
+    )
+    yield "data: [DONE]\n\n"
+
+
+def _record_repeated_tool_guard(*, session_key: str, diagnostics: dict[str, Any], tool_names: list[str], finish_reason: str) -> None:
+    if finish_reason != "tool_calls" or not tool_names:
+        return
+    _repeated_tool_request_guard.record_tool_response(
+        session_key=session_key,
+        prompt_hash=str(diagnostics.get("prompt_hash") or ""),
+        latest_user_hash=str(diagnostics.get("latest_user_hash") or ""),
+        tool_names=tool_names,
+    )
+
+
 def _build_standard_request(req_data: dict, *, client_profile: str) -> StandardRequest:
     standard_request = build_chat_standard_request(
         req_data,
@@ -200,6 +322,39 @@ async def chat_completions(request: Request):
             len(standard_request.upstream_files or []),
             completion_id,
         )
+        repeated_tool_names = _repeated_tool_request_guard.repeated_user_only_tool_request(
+            standard_request.session_key or session_key,
+            diagnostics,
+        )
+        if repeated_tool_names:
+            notice = _build_repeated_tool_request_notice(repeated_tool_names)
+            log.warning(
+                "[OAI] repeated_user_only_tool_request req_id=%s completion_id=%s session=%s prompt_hash=%s tool_names=%s",
+                req_id,
+                completion_id,
+                standard_request.session_key,
+                diagnostics["prompt_hash"],
+                repeated_tool_names,
+            )
+            if standard_request.stream:
+                return StreamingResponse(
+                    _openai_text_stream_chunks(
+                        completion_id=completion_id,
+                        created=created,
+                        model_name=model_name,
+                        content=notice,
+                        prompt=prompt,
+                    ),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
+            return JSONResponse(_build_openai_text_payload(
+                completion_id=completion_id,
+                created=created,
+                model_name=model_name,
+                content=notice,
+                prompt=prompt,
+            ))
 
         if standard_request.stream:
             async def generate():
@@ -271,6 +426,12 @@ async def chat_completions(request: Request):
                                 )
                                 final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else (execution.state.finish_reason or "stop")
                                 tool_names = [block.get("name") for block in directive.tool_blocks if block.get("type") == "tool_use"]
+                                _record_repeated_tool_guard(
+                                    session_key=standard_request.session_key or session_key,
+                                    diagnostics=diagnostics,
+                                    tool_names=tool_names,
+                                    finish_reason=final_finish_reason,
+                                )
                                 log.info(
                                     "[OAI] stream_final req_id=%s completion_id=%s chat_id=%s prompt_hash=%s finish_reason=%s stop_reason=%s tool_names=%s answer_chars=%s staged_chunks=%s",
                                     req_id,
@@ -336,6 +497,12 @@ async def chat_completions(request: Request):
                                 )
                                 final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else (execution.state.finish_reason or "stop")
                                 tool_names = [block.get("name") for block in directive.tool_blocks if block.get("type") == "tool_use"]
+                                _record_repeated_tool_guard(
+                                    session_key=standard_request.session_key or session_key,
+                                    diagnostics=diagnostics,
+                                    tool_names=tool_names,
+                                    finish_reason=final_finish_reason,
+                                )
                                 log.info(
                                     "[OAI] stream_final req_id=%s completion_id=%s chat_id=%s prompt_hash=%s finish_reason=%s stop_reason=%s tool_names=%s answer_chars=%s staged_chunks=%s",
                                     req_id,
@@ -429,6 +596,12 @@ async def chat_completions(request: Request):
                 )
                 tool_names = [block.get("name") for block in directive.tool_blocks if block.get("type") == "tool_use"]
                 final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else (execution.state.finish_reason or "stop")
+                _record_repeated_tool_guard(
+                    session_key=standard_request.session_key or session_key,
+                    diagnostics=diagnostics,
+                    tool_names=tool_names,
+                    finish_reason=final_finish_reason,
+                )
                 log.info(
                     "[OAI] json_final req_id=%s completion_id=%s chat_id=%s prompt_hash=%s finish_reason=%s stop_reason=%s tool_names=%s answer_chars=%s",
                     req_id,
