@@ -105,6 +105,8 @@ class OpenAIStreamTranslator:
 
     def emit_tool_calls(self, tool_calls: list[dict[str, Any]]) -> None:
         self._ensure_role_chunk()
+        if tool_calls and not self.tool_calls_emitted:
+            self._discard_pending_content_chunks()
         for tool_call in tool_calls:
             idx = self.emitted_tool_index
             self.emitted_tool_index += 1

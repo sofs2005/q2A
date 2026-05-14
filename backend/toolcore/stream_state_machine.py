@@ -62,7 +62,7 @@ class ToolStreamStateMachine:
                 continue
 
             text = event.get("text", "")
-            if final_tool_use and text and looks_like_tool_fragment(text):
+            if final_tool_use and text and (self._saw_tool_call or looks_like_tool_fragment(text)):
                 continue
             events.append(ToolStreamEvent(type="content", text=text))
         return events

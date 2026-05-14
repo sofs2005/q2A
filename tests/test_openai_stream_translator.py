@@ -48,6 +48,44 @@ class OpenAIStreamTranslatorTests(unittest.TestCase):
         self.assertEqual(usage_payload["choices"], [])
         self.assertEqual(usage_payload["usage"], usage)
 
+    def test_stream_tool_call_discards_preceding_content_chunks(self) -> None:
+        translator = OpenAIStreamTranslator(
+            completion_id="chatcmpl_tool",
+            created=1,
+            model_name="gpt-4.1",
+            client_profile="openclaw_openai",
+            allowed_tool_names=["execute_code"],
+        )
+
+        translator.on_delta({"phase": "answer"}, "temporary answer", None)
+        translator.on_delta(
+            {"phase": "tool_call"},
+            None,
+            [{"id": "call_1", "name": "execute_code", "input": {"code": "print(1)"}}],
+        )
+
+        chunks = translator.finalize("tool_calls")
+        payloads = [json.loads(chunk[6:].strip()) for chunk in chunks if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"]
+        content_text = "".join(
+            payload["choices"][0]["delta"].get("content", "")
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("content")
+        )
+        tool_call_chunks = [
+            payload
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("tool_calls")
+        ]
+        finish_reasons = [
+            payload["choices"][0].get("finish_reason")
+            for payload in payloads
+            if payload["choices"]
+        ]
+
+        self.assertEqual(content_text, "")
+        self.assertTrue(tool_call_chunks)
+        self.assertIn("tool_calls", finish_reasons)
+
     def test_finalize_drops_incomplete_tool_wrapper_text_when_valid_tool_call_exists(self) -> None:
         directive = type(
             "Directive",
