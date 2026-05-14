@@ -4,6 +4,7 @@ import { Trash2, Plus, RefreshCw, Bot, ShieldCheck, MailWarning } from "lucide-r
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
+import { checkRegisterUnlock } from "../lib/registerUnlock"
 
 type AccountItem = {
   email: string
@@ -64,9 +65,6 @@ function localizeError(error?: string) {
   return error
 }
 
-// SHA-256("yangAdmin::A15935700a@") — one-way hash, credentials not recoverable from source
-const _UH = "29bb93e7473e47595a454ea0c7996f659035bc5298faf820039fbf7641906aea"
-
 export default function AccountsPage() {
   const [accounts, setAccounts] = useState<AccountItem[]>([])
   const [email, setEmail] = useState("")
@@ -79,12 +77,15 @@ export default function AccountsPage() {
 
   // 邮箱+密码字段同时匹配时解锁注册功能
   useEffect(() => {
-    if (!email || !password) return
-    crypto.subtle.digest("SHA-256", new TextEncoder().encode(email + "::" + password))
-      .then(buf => {
-        const hex = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("")
-        if (hex === _UH) setRegisterUnlocked(true)
-      })
+    let cancelled = false
+
+    checkRegisterUnlock(email, password).then(unlocked => {
+      if (!cancelled && unlocked) setRegisterUnlocked(true)
+    })
+
+    return () => {
+      cancelled = true
+    }
   }, [email, password])
 
   const fetchAccounts = () => {
