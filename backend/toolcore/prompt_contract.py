@@ -160,9 +160,12 @@ def build_tool_instruction_block(
             "MANDATORY: do NOT call any tool on this turn. Respond with plain text only.",
         ])
 
+    native_error_example = names[0] if names else "TOOL_NAME"
     lines = [
         "=== MANDATORY TOOL CALL INSTRUCTIONS ===",
         "This gateway-injected block only defines how to serialize tool calls for the bridge.",
+        "These are gateway bridge tools, not upstream/native Qwen tools; do not invoke the platform's built-in tool system.",
+        f"If you need a tool, output the DSML text block directly; never answer with platform errors such as `Tool {native_error_example} does not exists.`",
         "Follow the client's system/developer instructions for persona, style, language, and normal response format.",
         f"You have access to these tools: {', '.join(names)}",
         "",

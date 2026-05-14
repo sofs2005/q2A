@@ -27,6 +27,17 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("<|DSML|tool_calls>", contract)
         self.assertNotIn("##TOOL_CALL##", contract)
 
+    def test_tool_contract_distinguishes_bridge_tools_from_native_qwen_tools(self) -> None:
+        contract = build_tool_instruction_block(
+            normalize_prompt_tools([{"name": "image_generate", "description": "Generate image", "parameters": {}}]),
+            OPENCLAW_OPENAI_PROFILE,
+        )
+
+        self.assertIn("gateway bridge tools", contract)
+        self.assertIn("not upstream/native Qwen tools", contract)
+        self.assertIn("never answer with platform errors such as", contract)
+        self.assertIn("Tool image_generate does not exists", contract)
+
     def test_none_tool_choice_suppresses_required_guidance(self) -> None:
         contract = build_tool_instruction_block(
             normalize_prompt_tools([{"name": "Read", "description": "Read file", "parameters": {}}]),

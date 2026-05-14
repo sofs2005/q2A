@@ -5,10 +5,15 @@ from unittest.mock import patch
 from backend.core import httpx_engine
 from backend.core.config import settings
 from backend.services.qwen_client import QwenClient
-from backend.upstream.qwen_executor import QwenExecutor
+from backend.upstream.qwen_executor import QwenExecutor, _has_textual_tool_contract_marker
 
 
 class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    def test_prompt_contract_marker_detection_accepts_dsml_and_legacy_formats(self) -> None:
+        self.assertTrue(_has_textual_tool_contract_marker("<|DSML|tool_calls></|DSML|tool_calls>"))
+        self.assertTrue(_has_textual_tool_contract_marker("##TOOL_CALL##\n{}\n##END_CALL##"))
+        self.assertFalse(_has_textual_tool_contract_marker("plain prompt"))
+
     async def asyncSetUp(self) -> None:
         self.original_request_timeout = getattr(
             settings,
