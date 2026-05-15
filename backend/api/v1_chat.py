@@ -63,6 +63,31 @@ def _text_from_message_content(content: Any) -> str:
     return str(content or "")
 
 
+def _raw_openai_tool_names(req_data: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for tool in req_data.get("tools", []) or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        function = function if isinstance(function, dict) else {}
+        name = tool.get("name") or function.get("name")
+        if name:
+            names.append(str(name))
+    return names
+
+
+def _tool_name_map_entries(standard_request: StandardRequest) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    catalog = standard_request.tool_catalog
+    for tool in standard_request.tools:
+        model_name = str(tool.get("name") or "")
+        canonical_name = catalog.get_canonical_name(model_name) if catalog is not None else None
+        canonical_name = canonical_name or model_name
+        client_name = catalog.get_client_name(canonical_name) if catalog is not None else model_name
+        entries.append({"model": model_name, "canonical": canonical_name, "client": client_name})
+    return entries
+
+
 def _build_openai_request_diagnostics(req_data: dict[str, Any], *, prompt: str) -> dict[str, Any]:
     messages = [message for message in (req_data.get("messages", []) or []) if isinstance(message, dict)]
     role_counts: dict[str, int] = {}
@@ -172,6 +197,104 @@ def _openai_stream_chunk(*, completion_id: str, created: int, model_name: str, c
     if usage is not None:
         payload["usage"] = usage
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _log_openai_tool_name_map(*, req_id: str, completion_id: str, req_data: dict[str, Any], standard_request: StandardRequest) -> None:
+    if not standard_request.tools:
+        return
+    log.info(
+        "[OAI] tool_name_map req_id=%s completion_id=%s client_tools=%s model_tools=%s entries=%s",
+        req_id,
+        completion_id,
+        _raw_openai_tool_names(req_data),
+        standard_request.tool_names,
+        _tool_name_map_entries(standard_request),
+    )
+
+
+def _truncate_log_value(value: str, *, limit: int = 500) -> str:
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}...[omitted {len(value) - limit} chars]"
+
+
+def _log_outbound_tool_call_diagnostics(
+    *,
+    req_id: str,
+    completion_id: str,
+    prompt_hash: str,
+    standard_request: StandardRequest,
+    chunks: list[str],
+) -> None:
+    calls: dict[int, dict[str, Any]] = {}
+    for chunk in chunks:
+        if not isinstance(chunk, str) or not chunk.startswith("data: "):
+            continue
+        data = chunk[6:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if not isinstance(choices, list) or not choices:
+            continue
+        delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+        delta = delta if isinstance(delta, dict) else {}
+        for tool_call in delta.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            index = tool_call.get("index")
+            if not isinstance(index, int):
+                continue
+            call = calls.setdefault(index, {"arguments_parts": []})
+            if tool_call.get("id"):
+                call["id"] = tool_call.get("id")
+            if tool_call.get("type"):
+                call["type"] = tool_call.get("type")
+            function = tool_call.get("function")
+            function = function if isinstance(function, dict) else {}
+            if function.get("name"):
+                call["name"] = function.get("name")
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                call["arguments_parts"].append(arguments)
+
+    catalog = standard_request.tool_catalog
+    for index, call in sorted(calls.items()):
+        name = str(call.get("name") or "")
+        canonical_name = catalog.get_canonical_name(name) if catalog is not None else None
+        canonical_name = canonical_name or name
+        client_name = catalog.get_client_name(canonical_name) if catalog is not None else name
+        model_name = catalog.get_model_name(canonical_name) if catalog is not None else name
+        arguments = "".join(call.get("arguments_parts") or [])
+        json_valid = False
+        input_keys: list[str] = []
+        try:
+            parsed_arguments = json.loads(arguments) if arguments else {}
+            json_valid = True
+            if isinstance(parsed_arguments, dict):
+                input_keys = sorted(str(key) for key in parsed_arguments.keys())
+        except json.JSONDecodeError:
+            pass
+        log.info(
+            "[OAI] outbound_tool_call req_id=%s completion_id=%s prompt_hash=%s index=%s id=%s type=%s name=%s canonical_name=%s model_name=%s client_name=%s arguments_len=%s arguments_json_valid=%s input_keys=%s arguments_preview=%r",
+            req_id,
+            completion_id,
+            prompt_hash,
+            index,
+            call.get("id"),
+            call.get("type"),
+            name,
+            canonical_name,
+            model_name,
+            client_name,
+            len(arguments),
+            json_valid,
+            input_keys,
+            _truncate_log_value(arguments),
+        )
 
 
 def _log_openai_stream_sse_chunk(*, req_id: str, completion_id: str, prompt_hash: str, chunk: str) -> None:
@@ -458,6 +581,12 @@ async def chat_completions(request: Request):
             len(standard_request.upstream_files or []),
             completion_id,
         )
+        _log_openai_tool_name_map(
+            req_id=req_id,
+            completion_id=completion_id,
+            req_data=req_data,
+            standard_request=standard_request,
+        )
         repeated_tool_names = _repeated_tool_request_guard.repeated_user_only_tool_request(
             standard_request.session_key or session_key,
             diagnostics,
@@ -582,6 +711,14 @@ async def chat_completions(request: Request):
                                     len(staged_chunks),
                                 )
                                 output_staged_chunks = _filter_staged_chunks_for_tool_calls(staged_chunks) if final_finish_reason == "tool_calls" else staged_chunks
+                                if final_finish_reason == "tool_calls":
+                                    _log_outbound_tool_call_diagnostics(
+                                        req_id=req_id,
+                                        completion_id=completion_id,
+                                        prompt_hash=diagnostics["prompt_hash"],
+                                        standard_request=standard_request,
+                                        chunks=output_staged_chunks,
+                                    )
                                 for chunk in output_staged_chunks:
                                     await queue.put(chunk)
                                 if translator is not None:

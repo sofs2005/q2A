@@ -352,6 +352,11 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("'type': 'function'", log_output)
         self.assertIn("'name': 'exec'", log_output)
         self.assertIn("'arguments_chars': 22", log_output)
+        self.assertIn("[OAI] tool_name_map", log_output)
+        self.assertIn("[OAI] outbound_tool_call", log_output)
+        self.assertIn("client_name=exec", log_output)
+        self.assertIn("arguments_json_valid=True", log_output)
+        self.assertIn("input_keys=['command']", log_output)
 
     async def test_streaming_retry_does_not_leak_failed_attempt_text(self) -> None:
         app = types.SimpleNamespace(
