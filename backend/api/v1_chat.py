@@ -307,6 +307,48 @@ def _truncate_log_value(value: str, *, limit: int = 500) -> str:
     return f"{value[:limit]}...[omitted {len(value) - limit} chars]"
 
 
+def _openai_include_usage_requested(req_data: dict[str, Any]) -> bool:
+    stream_options = req_data.get("stream_options")
+    return isinstance(stream_options, dict) and stream_options.get("include_usage") is True
+
+
+def _log_openai_stream_request_options(*, req_id: str, completion_id: str, req_data: dict[str, Any]) -> None:
+    stream_options = req_data.get("stream_options")
+    log.info(
+        "[OAI] stream_request_options req_id=%s completion_id=%s stream=%s stream_options_type=%s include_usage_requested=%s raw_stream_options=%r",
+        req_id,
+        completion_id,
+        req_data.get("stream"),
+        type(stream_options).__name__,
+        _openai_include_usage_requested(req_data),
+        stream_options if isinstance(stream_options, dict) else None,
+    )
+
+
+def _log_openai_stream_finalize_options(
+    *,
+    req_id: str,
+    completion_id: str,
+    prompt_hash: str,
+    req_data: dict[str, Any],
+    finish_reason: str,
+    usage: dict[str, int] | None,
+    answer_text: str,
+) -> None:
+    log.info(
+        "[OAI] stream_finalize_options req_id=%s completion_id=%s prompt_hash=%s finish_reason=%s include_usage_requested=%s usage_will_be_sent=%s usage=%s answer_chars=%s answer_preview=%r",
+        req_id,
+        completion_id,
+        prompt_hash,
+        finish_reason,
+        _openai_include_usage_requested(req_data),
+        usage is not None,
+        usage,
+        len(answer_text or ""),
+        _truncate_log_value(answer_text or "", limit=300),
+    )
+
+
 def _log_outbound_tool_call_diagnostics(
     *,
     req_id: str,
@@ -446,15 +488,17 @@ def _log_openai_stream_sse_chunk(*, req_id: str, completion_id: str, prompt_hash
                     "arguments_chars": len(arguments) if isinstance(arguments, str) else 0,
                 }
             )
+    content = str(delta.get("content") or "")
     log.info(
-        "[OAI] stream_sse_chunk req_id=%s completion_id=%s prompt_hash=%s choices=%s role=%s has_content=%s content_chars=%s has_tool_calls=%s tool_names=%s tool_details=%s finish_reason=%s",
+        "[OAI] stream_sse_chunk req_id=%s completion_id=%s prompt_hash=%s choices=%s role=%s has_content=%s content_chars=%s content_preview=%r has_tool_calls=%s tool_names=%s tool_details=%s finish_reason=%s",
         req_id,
         completion_id,
         prompt_hash,
         len(choices),
         delta.get("role"),
         "content" in delta,
-        len(str(delta.get("content") or "")),
+        len(content),
+        _truncate_log_value(content, limit=160),
         bool(tool_calls),
         tool_names,
         tool_details,
@@ -688,6 +732,11 @@ async def chat_completions(request: Request):
             prompt_hash=diagnostics["prompt_hash"],
             req_data=req_data,
         )
+        _log_openai_stream_request_options(
+            req_id=req_id,
+            completion_id=completion_id,
+            req_data=req_data,
+        )
         _log_openai_tool_name_map(
             req_id=req_id,
             completion_id=completion_id,
@@ -830,7 +879,17 @@ async def chat_completions(request: Request):
                                 for chunk in output_staged_chunks:
                                     await queue.put(chunk)
                                 if translator is not None:
-                                    for chunk in translator.finalize(final_finish_reason, usage=_stream_usage(result, prompt)):
+                                    usage = _stream_usage(result, prompt)
+                                    _log_openai_stream_finalize_options(
+                                        req_id=req_id,
+                                        completion_id=completion_id,
+                                        prompt_hash=diagnostics["prompt_hash"],
+                                        req_data=req_data,
+                                        finish_reason=final_finish_reason,
+                                        usage=usage,
+                                        answer_text=execution.state.answer_text or "",
+                                    )
+                                    for chunk in translator.finalize(final_finish_reason, usage=usage):
                                         await queue.put(chunk)
                             else:
                                 translator = OpenAIStreamTranslator(
@@ -899,7 +958,17 @@ async def chat_completions(request: Request):
                                     len(execution.state.answer_text or ""),
                                     len(translator.pending_chunks),
                                 )
-                                for chunk in translator.finalize(final_finish_reason, usage=_stream_usage(result, prompt)):
+                                usage = _stream_usage(result, prompt)
+                                _log_openai_stream_finalize_options(
+                                    req_id=req_id,
+                                    completion_id=completion_id,
+                                    prompt_hash=diagnostics["prompt_hash"],
+                                    req_data=req_data,
+                                    finish_reason=final_finish_reason,
+                                    usage=usage,
+                                    answer_text=execution.state.answer_text or "",
+                                )
+                                for chunk in translator.finalize(final_finish_reason, usage=usage):
                                     await queue.put(chunk)
                         except HTTPException as he:
                             await clear_invalidated_session_chat(app=app, request=standard_request)
