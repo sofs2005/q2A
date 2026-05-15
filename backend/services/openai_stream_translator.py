@@ -113,12 +113,6 @@ class OpenAIStreamTranslator:
             return name
         return self.tool_catalog.get_client_name(canonical)
 
-    @staticmethod
-    def _openai_tool_call_id(call_id: str) -> str:
-        if call_id.startswith("call_"):
-            return call_id
-        return f"call_{call_id}"
-
     def emit_tool_calls(self, tool_calls: list[dict[str, Any]]) -> None:
         self._ensure_role_chunk()
         if tool_calls and not self.tool_calls_emitted:
@@ -127,9 +121,8 @@ class OpenAIStreamTranslator:
             idx = self.emitted_tool_index
             self.emitted_tool_index += 1
             tool_name = self._client_tool_name(str(tool_call['name']))
-            tool_call_id = self._openai_tool_call_id(str(tool_call["id"]))
             self.pending_chunks.append(
-                f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': idx, 'id': tool_call_id, 'type': 'function', 'function': {'name': tool_name, 'arguments': ''}}]}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': idx, 'id': tool_call['id'], 'type': 'function', 'function': {'name': tool_name, 'arguments': ''}}]}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
             )
             arguments = json.dumps(tool_call['input'], ensure_ascii=False)
             for start in range(0, len(arguments), TOOL_ARGUMENT_CHUNK_SIZE):
