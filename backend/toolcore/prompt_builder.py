@@ -157,6 +157,32 @@ def _is_heavy_tool_profile(client_profile: str) -> bool:
     return client_profile in {CLAUDE_CODE_OPENAI_PROFILE, QWEN_CODE_OPENAI_PROFILE}
 
 
+def _has_tool_continuation_after_latest_user(messages: list, client_profile: str) -> bool:
+    latest_user_index = -1
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        if _extract_user_text_only(message.get("content", ""), client_profile=client_profile).strip():
+            latest_user_index = index
+            break
+    if latest_user_index < 0:
+        return False
+
+    for message in messages[latest_user_index + 1:]:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "") or "").lower()
+        if role in {"tool", "function"}:
+            return True
+        if role == "assistant" and isinstance(message.get("tool_calls"), list) and message.get("tool_calls"):
+            return True
+        content = message.get("content")
+        if isinstance(content, list) and any(isinstance(part, dict) and part.get("type") == "tool_result" for part in content):
+            return True
+    return False
+
+
 def build_prompt_with_tools(
     system_prompt: str,
     messages: list,
@@ -326,7 +352,7 @@ def build_prompt_with_tools(
                     log.debug(f"[Prompt] Restored original task context ({len(first_short)} chars)")
 
     latest_user_line = ""
-    if tools and messages:
+    if tools and messages and not _has_tool_continuation_after_latest_user(messages, client_profile):
         latest_user = next(
             (
                 message for message in reversed(messages)

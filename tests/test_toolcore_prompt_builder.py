@@ -86,6 +86,39 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
         self.assertIn("Human (CURRENT TASK - TOP PRIORITY): Now inspect README.md", result.prompt)
         self.assertTrue(result.prompt.endswith("Assistant:"))
 
+    def test_messages_to_prompt_does_not_repeat_current_task_after_tool_result(self) -> None:
+        req_data = {
+            "messages": [
+                {"role": "user", "content": "Read README.md and summarize it"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "Read", "arguments": '{"file_path": "README.md"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "README content"},
+            ],
+            "tools": [
+                {
+                    "name": "Read",
+                    "description": "Read file content",
+                    "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}},
+                }
+            ],
+        }
+
+        result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+        self.assertIn("[Tool Result] id=call_1\nREADME content\n[/Tool Result]", result.prompt)
+        self.assertNotIn("Human (CURRENT TASK - TOP PRIORITY): Read README.md and summarize it", result.prompt)
+        self.assertLess(result.prompt.index("Read README.md and summarize it"), result.prompt.index("[Tool Result] id=call_1"))
+        self.assertTrue(result.prompt.endswith("Assistant:"))
+
     def test_messages_to_prompt_preserves_openclaw_runtime_system_prose(self) -> None:
         req_data = {
             "system": "You are a personal assistant running inside OpenClaw.\n## Tooling\nTool availability (filtered by policy):\n- read: Read file contents\n- write: Create or overwrite files",
