@@ -292,7 +292,26 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
                 account_pool=types.SimpleNamespace(acquire_wait_preferred=AsyncMock(return_value=None)),
             )
         )
-        request = _FakeRequest(app, {"messages": [{"role": "user", "content": "hi"}], "stream": True})
+        payload = {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_prev",
+                            "type": "function",
+                            "function": {"name": "exec", "arguments": "{\"command\": \"echo hi\"}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_prev", "name": "exec", "content": "tool output ok"},
+                {"role": "user", "content": "continue"},
+            ],
+            "stream": True,
+        }
+        request = _FakeRequest(app, payload)
         standard_request = StandardRequest(
             prompt="hi",
             response_model="gpt-4.1",
@@ -353,6 +372,12 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("'name': 'exec'", log_output)
         self.assertIn("'arguments_chars': 22", log_output)
         self.assertIn("[OAI] tool_name_map", log_output)
+        self.assertIn("[OAI] inbound_tool_result", log_output)
+        self.assertIn("tool_call_id=call_prev", log_output)
+        self.assertIn("name=exec", log_output)
+        self.assertIn("content_chars=14", log_output)
+        self.assertIn("has_error_signal=False", log_output)
+        self.assertIn("content_preview='tool output ok'", log_output)
         self.assertIn("[OAI] outbound_tool_call", log_output)
         self.assertIn("client_name=exec", log_output)
         self.assertIn("arguments_json_valid=True", log_output)

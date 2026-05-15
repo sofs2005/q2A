@@ -120,6 +120,78 @@ def _build_openai_request_diagnostics(req_data: dict[str, Any], *, prompt: str) 
     }
 
 
+def _content_for_log(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                if "text" in part:
+                    parts.append(str(part.get("text") or ""))
+                elif "content" in part:
+                    parts.append(_content_for_log(part.get("content")))
+            elif part is not None:
+                parts.append(str(part))
+        return "\n".join(text for text in parts if text)
+    if isinstance(content, dict):
+        return json.dumps(content, ensure_ascii=False)
+    return str(content or "")
+
+
+def _has_error_signal(text: str) -> bool:
+    lowered = text.lower()
+    return any(signal in lowered for signal in ("error", "failed", "exception", "traceback", "错误", "失败"))
+
+
+def _has_image_signal(text: str) -> bool:
+    lowered = text.lower()
+    return any(signal in lowered for signal in ("data:image", "http://", "https://", ".png", ".jpg", ".jpeg", ".webp", "image", "图片"))
+
+
+def _log_inbound_tool_turn_diagnostics(*, req_id: str, completion_id: str, prompt_hash: str, req_data: dict[str, Any]) -> None:
+    messages = [message for message in (req_data.get("messages", []) or []) if isinstance(message, dict)]
+    for message_index, message in enumerate(messages):
+        role = str(message.get("role") or "")
+        if role == "assistant" and isinstance(message.get("tool_calls"), list):
+            for call_index, tool_call in enumerate(message.get("tool_calls") or []):
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                function = function if isinstance(function, dict) else {}
+                arguments = function.get("arguments")
+                log.info(
+                    "[OAI] inbound_assistant_tool_call req_id=%s completion_id=%s prompt_hash=%s message_index=%s call_index=%s id=%s type=%s name=%s arguments_chars=%s arguments_preview=%r",
+                    req_id,
+                    completion_id,
+                    prompt_hash,
+                    message_index,
+                    call_index,
+                    tool_call.get("id"),
+                    tool_call.get("type"),
+                    function.get("name"),
+                    len(arguments) if isinstance(arguments, str) else 0,
+                    _truncate_log_value(arguments) if isinstance(arguments, str) else "",
+                )
+        if role != "tool":
+            continue
+        content = _content_for_log(message.get("content"))
+        log.info(
+            "[OAI] inbound_tool_result req_id=%s completion_id=%s prompt_hash=%s message_index=%s tool_call_id=%s name=%s content_chars=%s empty=%s has_image_signal=%s has_error_signal=%s content_preview=%r",
+            req_id,
+            completion_id,
+            prompt_hash,
+            message_index,
+            message.get("tool_call_id"),
+            message.get("name"),
+            len(content),
+            not bool(content.strip()),
+            _has_image_signal(content),
+            _has_error_signal(content),
+            _truncate_log_value(content),
+        )
+
+
 class _RepeatedToolRequestGuard:
     def __init__(self, *, ttl_seconds: float = 120.0, max_entries: int = 512, now: Callable[[], float] = time.monotonic):
         self.ttl_seconds = ttl_seconds
@@ -580,6 +652,12 @@ async def chat_completions(request: Request):
             standard_request.context_mode,
             len(standard_request.upstream_files or []),
             completion_id,
+        )
+        _log_inbound_tool_turn_diagnostics(
+            req_id=req_id,
+            completion_id=completion_id,
+            prompt_hash=diagnostics["prompt_hash"],
+            req_data=req_data,
         )
         _log_openai_tool_name_map(
             req_id=req_id,
