@@ -1,7 +1,9 @@
 import unittest
+from types import SimpleNamespace
 
 from backend.services.client_profiles import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW_OPENAI_PROFILE, QWEN_CODE_OPENAI_PROFILE
 from backend.services.standard_request_builder import build_chat_standard_request
+from backend.toolcore.context_offload import ContextOffloader
 from backend.toolcore.prompt_builder import _extract_text, _extract_user_text_only, messages_to_prompt
 
 
@@ -402,6 +404,40 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
         self.assertNotIn("Human (CURRENT TASK - TOP PRIORITY): System:", result.prompt)
         self.assertNotIn("\nHuman: \n", result.prompt)
         self.assertIn("Human (CURRENT TASK - TOP PRIORITY): 你是谁？", result.prompt)
+
+    def test_messages_to_prompt_preserves_task_after_openclaw_user_system_blocks(self) -> None:
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "## Memory Recall\nRemember prior image requests.\n\n"
+                    "## Compiled Wiki\nUse accumulated project knowledge.\n\n"
+                    "请生成一张龙狼传真人版竖屏海报"
+                ),
+            }
+        ]
+        tools = [
+            {
+                "name": "image_generate",
+                "description": "Generate an image from a prompt.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"prompt": {"type": "string"}},
+                    "required": ["prompt"],
+                },
+            }
+        ]
+        offloader = ContextOffloader(SimpleNamespace(CONTEXT_INLINE_MAX_CHARS=1, CONTEXT_FORCE_FILE_MAX_CHARS=2))
+        plan = offloader.plan(messages, tools=tools, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+        result = messages_to_prompt(
+            {"messages": plan.inline_messages, "tools": tools},
+            client_profile=OPENCLAW_OPENAI_PROFILE,
+        )
+
+        self.assertIn("## Memory Recall", result.prompt)
+        self.assertIn("Human (CURRENT TASK - TOP PRIORITY):", result.prompt)
+        self.assertIn("请生成一张龙狼传真人版竖屏海报", result.prompt)
 
     def test_messages_to_prompt_strips_skill_bootstrap_from_latest_user_line(self) -> None:
         req_data = {
