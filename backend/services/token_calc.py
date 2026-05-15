@@ -54,9 +54,9 @@ def completion_text_for_usage(completion: str, tool_calls: list[dict[str, Any]] 
     return "\n".join(parts)
 
 
-def calculate_usage(prompt: str, completion: str, tool_calls: list[dict[str, Any]] | None = None) -> dict:
+def calculate_usage(prompt: str, completion: str, tool_calls: list[dict[str, Any]] | None = None, *, extra_prompt_tokens: int = 0) -> dict:
     """结算：精确扣费"""
-    prompt_tokens = count_tokens(prompt)
+    prompt_tokens = count_tokens(prompt) + max(0, int(extra_prompt_tokens or 0))
     completion_tokens = count_tokens(completion_text_for_usage(completion, tool_calls))
     total_tokens = prompt_tokens + completion_tokens
     return {

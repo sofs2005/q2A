@@ -20,6 +20,16 @@ class RuntimeUsageTests(unittest.TestCase):
 
         self.assertGreater(usage_delta, count_tokens(prompt))
 
+    def test_usage_delta_factory_includes_context_attachment_tokens(self) -> None:
+        prompt = "prompt"
+        answer_text = "answer"
+        execution = SimpleNamespace(state=SimpleNamespace(answer_text=answer_text))
+        attachment_tokens = 17
+
+        usage_delta = build_usage_delta_factory(prompt, extra_prompt_tokens=attachment_tokens)(execution)
+
+        self.assertEqual(usage_delta, count_tokens(prompt) + count_tokens(answer_text) + attachment_tokens)
+
     def test_usage_delta_factory_uses_token_counts(self) -> None:
         prompt = "hello world hello world hello world"
         answer_text = "I will keep this concise."
@@ -67,6 +77,151 @@ class CompletionBridgeUsageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreater(result.usage["completion_tokens"], 0)
         self.assertEqual(result.usage["total_tokens"], result.usage["prompt_tokens"] + result.usage["completion_tokens"])
+
+    async def test_retryable_bridge_includes_context_attachment_tokens_in_usage(self) -> None:
+        prompt = "prompt"
+        attachment_tokens = 23
+        execution = SimpleNamespace(
+            state=SimpleNamespace(answer_text="answer", tool_calls=[]),
+            acc=None,
+            chat_id=None,
+        )
+        standard_request = StandardRequest(
+            prompt=prompt,
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+            context_attachment_tokens=attachment_tokens,
+        )
+        users_db = object()
+
+        with patch.object(completion_bridge, "collect_completion_run", AsyncMock(return_value=execution)), \
+             patch.object(completion_bridge, "evaluate_retry_directive", return_value=RuntimeRetryDirective(retry=False, next_prompt="")), \
+             patch.object(completion_bridge, "build_tool_directive", return_value=RuntimeToolDirective(stop_reason="end_turn")), \
+             patch.object(completion_bridge, "_apply_terminal_tool_guard", return_value=(execution, RuntimeToolDirective(stop_reason="end_turn"))), \
+             patch.object(completion_bridge, "add_used_tokens", AsyncMock()) as add_tokens_mock, \
+             patch.object(completion_bridge, "cleanup_runtime_resources", AsyncMock()):
+            result = await completion_bridge.run_retryable_completion_bridge(
+                client=object(),
+                standard_request=standard_request,
+                prompt=prompt,
+                users_db=users_db,
+                token="tok",
+                history_messages=[],
+                max_attempts=1,
+                usage_delta_factory=build_usage_delta_factory(prompt, extra_prompt_tokens=attachment_tokens),
+            )
+
+        self.assertEqual(result.usage["prompt_tokens"], count_tokens(prompt) + attachment_tokens)
+        self.assertEqual(result.usage["total_tokens"], result.usage["prompt_tokens"] + result.usage["completion_tokens"])
+        add_tokens_mock.assert_awaited_once_with(users_db, "tok", result.usage["total_tokens"])
+
+    async def test_retryable_bridge_fails_when_attachment_account_cannot_be_reacquired(self) -> None:
+        prompt = "prompt"
+        execution = SimpleNamespace(
+            state=SimpleNamespace(answer_text="", tool_calls=[]),
+            acc=SimpleNamespace(email="acc@example.com"),
+            chat_id="chat_1",
+        )
+        standard_request = StandardRequest(
+            prompt=prompt,
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+            bound_account_email="acc@example.com",
+            upstream_files=[{"file_id": "file-history"}],
+        )
+        client = SimpleNamespace(account_pool=SimpleNamespace(acquire_wait_preferred=AsyncMock(return_value=None)))
+
+        with patch.object(completion_bridge, "collect_completion_run", AsyncMock(return_value=execution)), \
+             patch.object(completion_bridge, "evaluate_retry_directive", return_value=RuntimeRetryDirective(retry=True, next_prompt="retry")), \
+             patch.object(completion_bridge, "cleanup_runtime_resources", AsyncMock()):
+            with self.assertRaises(RuntimeError):
+                await completion_bridge.run_retryable_completion_bridge(
+                    client=client,
+                    standard_request=standard_request,
+                    prompt=prompt,
+                    users_db=object(),
+                    token="tok",
+                    history_messages=[],
+                    max_attempts=2,
+                )
+
+        client.account_pool.acquire_wait_preferred.assert_awaited_once_with("acc@example.com", timeout=60)
+
+    async def test_retryable_bridge_releases_account_when_post_collection_step_fails(self) -> None:
+        prompt = "prompt"
+        execution = SimpleNamespace(
+            state=SimpleNamespace(answer_text="hello", tool_calls=[]),
+            acc=SimpleNamespace(email="acc@example.com"),
+            chat_id="chat_1",
+        )
+        standard_request = StandardRequest(
+            prompt=prompt,
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+        )
+
+        client = object()
+
+        with patch.object(completion_bridge, "collect_completion_run", AsyncMock(return_value=execution)), \
+             patch.object(completion_bridge, "evaluate_retry_directive", return_value=RuntimeRetryDirective(retry=False, next_prompt="")), \
+             patch.object(completion_bridge, "build_tool_directive", return_value=RuntimeToolDirective(stop_reason="end_turn")), \
+             patch.object(completion_bridge, "_apply_terminal_tool_guard", return_value=(execution, RuntimeToolDirective(stop_reason="end_turn"))), \
+             patch.object(completion_bridge, "add_used_tokens", AsyncMock(side_effect=RuntimeError("quota write failed"))), \
+             patch.object(completion_bridge, "cleanup_runtime_resources", AsyncMock()) as cleanup_mock:
+            with self.assertRaises(RuntimeError):
+                await completion_bridge.run_retryable_completion_bridge(
+                    client=client,
+                    standard_request=standard_request,
+                    prompt=prompt,
+                    users_db=object(),
+                    token="tok",
+                    history_messages=[],
+                    max_attempts=1,
+                )
+
+        cleanup_mock.assert_awaited_once_with(
+            client,
+            execution.acc,
+            execution.chat_id,
+            preserve_chat=False,
+        )
+
+    async def test_completion_bridge_releases_account_when_usage_write_fails(self) -> None:
+        prompt = "prompt"
+        execution = SimpleNamespace(
+            state=SimpleNamespace(answer_text="hello", tool_calls=[]),
+            acc=SimpleNamespace(email="acc@example.com"),
+            chat_id="chat_1",
+        )
+        standard_request = StandardRequest(
+            prompt=prompt,
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+        )
+        client = object()
+
+        with patch.object(completion_bridge, "collect_completion_run", AsyncMock(return_value=execution)), \
+             patch.object(completion_bridge, "add_used_tokens", AsyncMock(side_effect=RuntimeError("quota write failed"))), \
+             patch.object(completion_bridge, "cleanup_runtime_resources", AsyncMock()) as cleanup_mock:
+            with self.assertRaises(RuntimeError):
+                await completion_bridge.run_completion_bridge(
+                    client=client,
+                    standard_request=standard_request,
+                    prompt=prompt,
+                    users_db=object(),
+                    token="tok",
+                )
+
+        cleanup_mock.assert_awaited_once_with(
+            client,
+            execution.acc,
+            execution.chat_id,
+            preserve_chat=False,
+        )
 
 
 if __name__ == "__main__":

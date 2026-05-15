@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from backend.services.context_attachment_manager import derive_session_key, prepare_context_attachments
+from backend.services.token_calc import count_tokens
 from backend.toolcore.context_offload import ContextOffloader
 
 
@@ -187,6 +188,7 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("context", uploaded_filename)
         self.assertEqual(len(uploaded), 1)
         self.assertEqual(len(saved_texts), 1)
+        self.assertEqual(result["context_attachment_tokens"], count_tokens(saved_texts[0]))
         self.assertIn("Always answer as a pirate captain.", saved_texts[0])
         self.assertIn("Who are you?", saved_texts[0])
 

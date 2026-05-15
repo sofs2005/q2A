@@ -666,6 +666,7 @@ async def chat_completions(request: Request):
     standard_request.upstream_files = context_prepared["upstream_files"]
     standard_request.session_key = context_prepared["session_key"]
     standard_request.context_mode = context_prepared["context_mode"]
+    standard_request.context_attachment_tokens = context_prepared.get("context_attachment_tokens", 0)
     standard_request.bound_account_email = context_prepared["bound_account_email"]
     standard_request.bound_account = context_prepared["bound_account"]
 
@@ -825,7 +826,10 @@ async def chat_completions(request: Request):
                                     token=token,
                                     history_messages=history_messages,
                                     max_attempts=request_max_attempts(standard_request),
-                                    usage_delta_factory=build_usage_delta_factory(prompt),
+                                    usage_delta_factory=build_usage_delta_factory(
+                                        prompt,
+                                        extra_prompt_tokens=standard_request.context_attachment_tokens,
+                                    ),
                                     allow_after_visible_output=True,
                                     capture_events=False,
                                     on_delta=on_delta,
@@ -918,7 +922,10 @@ async def chat_completions(request: Request):
                                     token=token,
                                     history_messages=history_messages,
                                     max_attempts=request_max_attempts(standard_request),
-                                    usage_delta_factory=build_usage_delta_factory(prompt),
+                                    usage_delta_factory=build_usage_delta_factory(
+                                        prompt,
+                                        extra_prompt_tokens=standard_request.context_attachment_tokens,
+                                    ),
                                     allow_after_visible_output=True,
                                     capture_events=False,
                                     on_delta=on_delta,
@@ -1036,7 +1043,10 @@ async def chat_completions(request: Request):
                     token=token,
                     history_messages=history_messages,
                     max_attempts=request_max_attempts(standard_request),
-                    usage_delta_factory=build_usage_delta_factory(prompt),
+                    usage_delta_factory=build_usage_delta_factory(
+                        prompt,
+                        extra_prompt_tokens=standard_request.context_attachment_tokens,
+                    ),
                     allow_after_visible_output=True,
                 )
                 execution = result.execution

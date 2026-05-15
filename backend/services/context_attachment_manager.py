@@ -8,6 +8,7 @@ from typing import Any
 
 from backend.core.upstream_file_cache import UpstreamFileCacheEntry
 from backend.services.client_profiles import user_role_system_text
+from backend.services.token_calc import count_tokens
 from backend.toolcore.context_offload import SYSTEM_CONTEXT_FILE_PREFIX, SYSTEM_CONTEXT_PROMPT_NOTE
 
 
@@ -114,6 +115,7 @@ def _fallback_context_attachment_result(
         "bound_account": None,
         "bound_account_email": None,
         "generated_local_files": [],
+        "context_attachment_tokens": 0,
         "attachment_fallback": True,
     }
 
@@ -142,6 +144,7 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
             "bound_account": None,
             "bound_account_email": None,
             "generated_local_files": [],
+            "context_attachment_tokens": 0,
             "attachment_fallback": False,
         }
 
@@ -175,6 +178,7 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
 
     upstream_files = list(payload.get("upstream_files", []) or [])
     local_file_records: list[dict[str, Any]] = []
+    context_attachment_tokens = 0
 
     async def _switch_account_on_retry(current_acc, upload_exc: Exception):
         if not _is_retryable_attachment_upload_error(upload_exc):
@@ -267,6 +271,7 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                         expires_at=local_meta["created_at"] + context_offloader.settings.CONTEXT_ATTACHMENT_TTL_SECONDS,
                     ))
                 upstream_files.append(remote["remote_ref"])
+                context_attachment_tokens += count_tokens(generated.text)
                 await affinity.add_uploaded_file(session_key, remote)
                 await file_store.delete_path(local_meta["path"])
                 local_file_records.append(local_meta)
@@ -300,5 +305,6 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
         "bound_account": acc,
         "bound_account_email": acc.email,
         "generated_local_files": local_file_records,
+        "context_attachment_tokens": context_attachment_tokens,
         "attachment_fallback": False,
     }

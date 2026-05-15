@@ -16,7 +16,7 @@ def _client_tool_name(name: str, tool_catalog=None) -> str:
     return tool_catalog.get_client_name(canonical)
 
 
-def build_canonical_openai_chat_payload(*, completion_id: str, created: int, model_name: str, prompt: str, answer_text: str, reasoning_text: str, directives: list[dict[str, Any]], tool_catalog=None) -> dict[str, Any]:
+def build_canonical_openai_chat_payload(*, completion_id: str, created: int, model_name: str, prompt: str, answer_text: str, reasoning_text: str, directives: list[dict[str, Any]], tool_catalog=None, extra_prompt_tokens: int = 0) -> dict[str, Any]:
     del reasoning_text
     tool_blocks = [block for block in directives if block.get("type") == "tool_use"]
     if tool_blocks:
@@ -45,11 +45,11 @@ def build_canonical_openai_chat_payload(*, completion_id: str, created: int, mod
         "created": created,
         "model": model_name,
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": calculate_usage(prompt, answer_text, message.get("tool_calls", [])),
+        "usage": calculate_usage(prompt, answer_text, message.get("tool_calls", []), extra_prompt_tokens=extra_prompt_tokens),
     }
 
 
-def build_canonical_openai_responses_payload(*, response_id: str, created: int, model_name: str, prompt: str, answer_text: str, reasoning_text: str, directives: list[dict[str, Any]], tool_catalog=None) -> dict[str, Any]:
+def build_canonical_openai_responses_payload(*, response_id: str, created: int, model_name: str, prompt: str, answer_text: str, reasoning_text: str, directives: list[dict[str, Any]], tool_catalog=None, extra_prompt_tokens: int = 0) -> dict[str, Any]:
     tool_blocks = [block for block in directives if block.get("type") == "tool_use"]
     output: list[dict[str, Any]] = []
     if tool_blocks:
@@ -84,7 +84,7 @@ def build_canonical_openai_responses_payload(*, response_id: str, created: int, 
                 "content": [{"type": "output_text", "text": answer_text, "annotations": []}],
             }
         )
-    input_tokens = count_tokens(prompt)
+    input_tokens = count_tokens(prompt) + max(0, int(extra_prompt_tokens or 0))
     output_tokens = count_tokens(completion_text_for_usage(answer_text, tool_blocks))
     return {
         "id": response_id,
@@ -103,7 +103,7 @@ def build_canonical_openai_responses_payload(*, response_id: str, created: int, 
     }
 
 
-def build_canonical_anthropic_message(*, msg_id: str, model_name: str, prompt: str, answer_text: str, reasoning_text: str, directives: list[dict[str, Any]]) -> dict[str, Any]:
+def build_canonical_anthropic_message(*, msg_id: str, model_name: str, prompt: str, answer_text: str, reasoning_text: str, directives: list[dict[str, Any]], extra_prompt_tokens: int = 0) -> dict[str, Any]:
     content_blocks: list[dict[str, Any]] = []
     if reasoning_text:
         content_blocks.append({"type": "thinking", "thinking": reasoning_text})
@@ -116,7 +116,7 @@ def build_canonical_anthropic_message(*, msg_id: str, model_name: str, prompt: s
         "content": content_blocks,
         "stop_reason": "tool_use" if any(block.get("type") == "tool_use" for block in directives) else "end_turn",
         "stop_sequence": None,
-        "usage": {"input_tokens": count_tokens(prompt), "output_tokens": count_tokens(answer_text)},
+        "usage": {"input_tokens": count_tokens(prompt) + max(0, int(extra_prompt_tokens or 0)), "output_tokens": count_tokens(answer_text)},
     }
 
 

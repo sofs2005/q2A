@@ -48,6 +48,7 @@ def build_openai_completion_payload(*, completion_id: str, created: int, model_n
         reasoning_text=execution.state.reasoning_text,
         directives=directive.tool_blocks,
         tool_catalog=standard_request.tool_catalog,
+        extra_prompt_tokens=standard_request.context_attachment_tokens,
     )
     oai_tool_calls = payload["choices"][0]["message"].get("tool_calls", [])
     finish_reason = payload["choices"][0]["finish_reason"]
@@ -91,6 +92,7 @@ def build_openai_response_payload(
         reasoning_text=execution.state.reasoning_text,
         directives=directive.tool_blocks,
         tool_catalog=standard_request.tool_catalog,
+        extra_prompt_tokens=standard_request.context_attachment_tokens,
     )
     if standard_request.required_tool_name:
         payload["tool_choice"] = {"type": "function", "function": {"name": standard_request.required_tool_name}}
@@ -125,6 +127,7 @@ def build_anthropic_message_payload(*, msg_id: str, model_name: str, prompt: str
         answer_text=execution.state.answer_text,
         reasoning_text=execution.state.reasoning_text,
         directives=directive.tool_blocks,
+        extra_prompt_tokens=standard_request.context_attachment_tokens,
     )
 
 

@@ -140,6 +140,8 @@ async def _reacquire_bound_account_if_needed(*, client, standard_request: Standa
     preferred_email = getattr(standard_request, 'bound_account_email', None)
     if preferred_email:
         standard_request.bound_account = await client.account_pool.acquire_wait_preferred(preferred_email, timeout=60)
+        if standard_request.bound_account is None and getattr(standard_request, "upstream_files", None):
+            raise RuntimeError(f"Unable to reacquire bound account for uploaded context files: {preferred_email}")
     else:
         standard_request.bound_account = None
 
@@ -162,15 +164,32 @@ async def run_completion_bridge(
         capture_events=capture_events,
         on_delta=on_delta,
     )
-    usage = calculate_usage(prompt, execution.state.answer_text, getattr(execution.state, "tool_calls", []))
-    await add_used_tokens(users_db, token, usage_delta if usage_delta is not None else usage["total_tokens"])
-    await cleanup_runtime_resources(
-        client,
-        execution.acc,
-        execution.chat_id,
-        preserve_chat=bool(getattr(standard_request, 'persistent_session', False)),
-    )
-    return CompletionBridgeResult(execution=execution, usage=usage, prompt=prompt, attempt_index=0)
+    usage = None
+    execution_cleaned = False
+    try:
+        usage = calculate_usage(
+            prompt,
+            execution.state.answer_text,
+            getattr(execution.state, "tool_calls", []),
+            extra_prompt_tokens=getattr(standard_request, "context_attachment_tokens", 0),
+        )
+        await add_used_tokens(users_db, token, usage_delta if usage_delta is not None else usage["total_tokens"])
+        await cleanup_runtime_resources(
+            client,
+            execution.acc,
+            execution.chat_id,
+            preserve_chat=bool(getattr(standard_request, 'persistent_session', False)),
+        )
+        execution_cleaned = True
+        return CompletionBridgeResult(execution=execution, usage=usage, prompt=prompt, attempt_index=0)
+    finally:
+        if not execution_cleaned:
+            await cleanup_runtime_resources(
+                client,
+                execution.acc,
+                execution.chat_id,
+                preserve_chat=bool(getattr(standard_request, 'persistent_session', False)),
+            )
 
 
 async def run_retryable_completion_bridge(
@@ -203,53 +222,70 @@ async def run_retryable_completion_bridge(
             capture_events=capture_events,
             on_delta=on_delta,
         )
-        retry = evaluate_retry_directive(
-            request=standard_request,
-            current_prompt=current_prompt,
-            history_messages=history_messages,
-            attempt_index=attempt_index,
-            max_attempts=max_attempts,
-            state=execution.state,
-            allow_after_visible_output=allow_after_visible_output,
-        )
-        if retry.retry:
-            if on_retry is not None:
-                await on_retry(attempt_index, retry, execution)
-            preserve_chat = bool(getattr(standard_request, 'persistent_session', False))
-            await cleanup_runtime_resources(client, execution.acc, execution.chat_id, preserve_chat=preserve_chat)
+        execution_cleaned = False
+        try:
+            retry = evaluate_retry_directive(
+                request=standard_request,
+                current_prompt=current_prompt,
+                history_messages=history_messages,
+                attempt_index=attempt_index,
+                max_attempts=max_attempts,
+                state=execution.state,
+                allow_after_visible_output=allow_after_visible_output,
+            )
+            if retry.retry:
+                if on_retry is not None:
+                    await on_retry(attempt_index, retry, execution)
+                preserve_chat = bool(getattr(standard_request, 'persistent_session', False))
+                await cleanup_runtime_resources(client, execution.acc, execution.chat_id, preserve_chat=preserve_chat)
+                execution_cleaned = True
 
-            reused_persistent_chat = bool(getattr(standard_request, 'persistent_session', False) and getattr(standard_request, 'upstream_chat_id', None))
-            if reused_persistent_chat:
-                current_prompt = build_retry_rebase_prompt(standard_request, reason=retry.reason)
-            else:
-                current_prompt = retry.next_prompt
+                reused_persistent_chat = bool(getattr(standard_request, 'persistent_session', False) and getattr(standard_request, 'upstream_chat_id', None))
+                if reused_persistent_chat:
+                    current_prompt = build_retry_rebase_prompt(standard_request, reason=retry.reason)
+                else:
+                    current_prompt = retry.next_prompt
 
-            if not preserve_chat:
-                await asyncio.sleep(0.15)
-            await _reacquire_bound_account_if_needed(client=client, standard_request=standard_request)
-            continue
+                if not preserve_chat:
+                    await asyncio.sleep(0.15)
+                await _reacquire_bound_account_if_needed(client=client, standard_request=standard_request)
+                continue
 
-        directive = build_tool_directive(standard_request, execution.state)
-        execution, directive = _apply_terminal_tool_guard(
-            execution=execution,
-            directive=directive,
-            history_messages=history_messages,
-        )
-        usage = calculate_usage(current_prompt, execution.state.answer_text, getattr(execution.state, "tool_calls", []))
-        usage_delta = usage_delta_factory(execution, current_prompt) if usage_delta_factory is not None else usage["total_tokens"]
-        await add_used_tokens(users_db, token, usage_delta)
-        await cleanup_runtime_resources(
-            client,
-            execution.acc,
-            execution.chat_id,
-            preserve_chat=bool(getattr(standard_request, 'persistent_session', False)),
-        )
-        return CompletionBridgeResult(
-            execution=execution,
-            usage=usage,
-            prompt=current_prompt,
-            attempt_index=attempt_index,
-            directive=directive,
-        )
+            directive = build_tool_directive(standard_request, execution.state)
+            execution, directive = _apply_terminal_tool_guard(
+                execution=execution,
+                directive=directive,
+                history_messages=history_messages,
+            )
+            usage = calculate_usage(
+                current_prompt,
+                execution.state.answer_text,
+                getattr(execution.state, "tool_calls", []),
+                extra_prompt_tokens=getattr(standard_request, "context_attachment_tokens", 0),
+            )
+            usage_delta = usage_delta_factory(execution, current_prompt) if usage_delta_factory is not None else usage["total_tokens"]
+            await add_used_tokens(users_db, token, usage_delta)
+            await cleanup_runtime_resources(
+                client,
+                execution.acc,
+                execution.chat_id,
+                preserve_chat=bool(getattr(standard_request, 'persistent_session', False)),
+            )
+            execution_cleaned = True
+            return CompletionBridgeResult(
+                execution=execution,
+                usage=usage,
+                prompt=current_prompt,
+                attempt_index=attempt_index,
+                directive=directive,
+            )
+        finally:
+            if not execution_cleaned:
+                await cleanup_runtime_resources(
+                    client,
+                    execution.acc,
+                    execution.chat_id,
+                    preserve_chat=bool(getattr(standard_request, 'persistent_session', False)),
+                )
 
     raise RuntimeError("Retryable completion bridge exhausted attempts")

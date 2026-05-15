@@ -14,7 +14,7 @@ from backend.core.config import API_KEYS, settings
 from backend.core.request_logging import new_request_id, request_context, update_request_context
 from backend.runtime.execution import RuntimeAttemptState, build_tool_directive, build_usage_delta_factory, request_max_attempts
 from backend.services.attachment_preprocessor import preprocess_attachments
-from backend.services.auth_quota import add_used_tokens, resolve_auth_context
+from backend.services.auth_quota import resolve_auth_context
 from backend.services.completion_bridge import run_retryable_completion_bridge
 from backend.services.context_attachment_manager import derive_session_key, prepare_context_attachments
 from backend.services.qwen_client import QwenClient
@@ -136,6 +136,7 @@ async def create_response(request: Request):
     standard_request.upstream_files = context_prepared["upstream_files"]
     standard_request.session_key = context_prepared["session_key"]
     standard_request.context_mode = context_prepared["context_mode"]
+    standard_request.context_attachment_tokens = context_prepared.get("context_attachment_tokens", 0)
     standard_request.bound_account_email = context_prepared["bound_account_email"]
     standard_request.bound_account = context_prepared["bound_account"]
 
@@ -195,7 +196,10 @@ async def create_response(request: Request):
                             token=token,
                             history_messages=history_messages,
                             max_attempts=request_max_attempts(standard_request),
-                            usage_delta_factory=build_usage_delta_factory(prompt),
+                            usage_delta_factory=build_usage_delta_factory(
+                                prompt,
+                                extra_prompt_tokens=standard_request.context_attachment_tokens,
+                            ),
                             allow_after_visible_output=True,
                             capture_events=False,
                             on_delta=on_delta,
@@ -255,7 +259,10 @@ async def create_response(request: Request):
                     token=token,
                     history_messages=history_messages,
                     max_attempts=request_max_attempts(standard_request),
-                    usage_delta_factory=build_usage_delta_factory(prompt),
+                    usage_delta_factory=build_usage_delta_factory(
+                        prompt,
+                        extra_prompt_tokens=standard_request.context_attachment_tokens,
+                    ),
                     allow_after_visible_output=True,
                 )
                 execution = result.execution
@@ -356,6 +363,7 @@ async def create_response_websocket(websocket: WebSocket):
         standard_request.upstream_files = context_prepared["upstream_files"]
         standard_request.session_key = context_prepared["session_key"]
         standard_request.context_mode = context_prepared["context_mode"]
+        standard_request.context_attachment_tokens = context_prepared.get("context_attachment_tokens", 0)
         standard_request.bound_account_email = context_prepared["bound_account_email"]
         standard_request.bound_account = context_prepared["bound_account"]
 
@@ -398,7 +406,7 @@ async def create_response_websocket(websocket: WebSocket):
                 update_request_context(stream_attempt=1)
 
                 async def on_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
-                    del evt, tool_calls
+                    del evt
                     if text_chunk:
                         translator.on_text_delta(text_chunk)
                     if tool_calls and settings.TOOLCORE_V2_ENABLED:
@@ -414,7 +422,10 @@ async def create_response_websocket(websocket: WebSocket):
                     token=token,
                     history_messages=history_messages,
                     max_attempts=request_max_attempts(standard_request),
-                    usage_delta_factory=build_usage_delta_factory(prompt),
+                    usage_delta_factory=build_usage_delta_factory(
+                        prompt,
+                        extra_prompt_tokens=standard_request.context_attachment_tokens,
+                    ),
                     allow_after_visible_output=True,
                     capture_events=False,
                     on_delta=on_delta,
@@ -445,8 +456,6 @@ async def create_response_websocket(websocket: WebSocket):
                     execution=execution,
                     assistant_message=assistant_message,
                 )
-                if user is not None:
-                    await add_used_tokens(users_db, token, response_payload["usage"]["output_tokens"])
                 for chunk in translator.finalize(response_payload=response_payload, standard_request=standard_request, execution=execution):
                     await websocket.send_json(sse_chunk_to_payload(chunk))
     except WebSocketDisconnect:

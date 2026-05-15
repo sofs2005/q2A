@@ -733,8 +733,12 @@ def build_tool_directive(
     return directive
 
 
-def anthropic_stream_usage_delta(prompt: str, answer_text: str) -> int:
-    return count_tokens(answer_text) + count_tokens(prompt)
+def _safe_extra_prompt_tokens(value: int | None) -> int:
+    return max(0, int(value or 0))
+
+
+def anthropic_stream_usage_delta(prompt: str, answer_text: str, *, extra_prompt_tokens: int = 0) -> int:
+    return count_tokens(answer_text) + count_tokens(prompt) + _safe_extra_prompt_tokens(extra_prompt_tokens)
 
 
 def anthropic_stream_stop_reason(request: StandardRequest, state: RuntimeAttemptState, pending_chunks: list[str]) -> str:
@@ -748,7 +752,11 @@ def finalize_anthropic_stream_success(*, request: StandardRequest, prompt: str, 
     chunks = translator.finalize(answer_text=execution.state.answer_text, stop_reason=stop_reason)
     return AnthropicStreamSuccessResult(
         chunks=chunks,
-        usage_delta=anthropic_stream_usage_delta(prompt, execution.state.answer_text),
+        usage_delta=anthropic_stream_usage_delta(
+            prompt,
+            execution.state.answer_text,
+            extra_prompt_tokens=getattr(request, "context_attachment_tokens", 0),
+        ),
     )
 
 
@@ -778,12 +786,28 @@ def _execution_completion_text_for_usage(execution: RuntimeExecutionResult) -> s
     return completion_text_for_usage(state.answer_text, getattr(state, "tool_calls", []))
 
 
-def retryable_usage_delta(prompt: str):
-    return lambda execution, current_prompt=None: count_tokens(_execution_completion_text_for_usage(execution)) + count_tokens(current_prompt or prompt)
+def _usage_delta_for_execution(execution: RuntimeExecutionResult, prompt: str, extra_prompt_tokens: int) -> int:
+    return (
+        count_tokens(_execution_completion_text_for_usage(execution))
+        + count_tokens(prompt)
+        + _safe_extra_prompt_tokens(extra_prompt_tokens)
+    )
 
 
-def build_usage_delta_factory(prompt: str) -> Callable[[RuntimeExecutionResult, Any | None], int]:
-    return lambda execution, current_prompt=None: count_tokens(_execution_completion_text_for_usage(execution)) + count_tokens(current_prompt or prompt)
+def retryable_usage_delta(prompt: str, *, extra_prompt_tokens: int = 0):
+    return lambda execution, current_prompt=None: _usage_delta_for_execution(
+        execution,
+        current_prompt or prompt,
+        extra_prompt_tokens,
+    )
+
+
+def build_usage_delta_factory(prompt: str, *, extra_prompt_tokens: int = 0) -> Callable[[RuntimeExecutionResult, Any | None], int]:
+    return lambda execution, current_prompt=None: _usage_delta_for_execution(
+        execution,
+        current_prompt or prompt,
+        extra_prompt_tokens,
+    )
 
 
 def request_max_attempts(request: StandardRequest) -> int:

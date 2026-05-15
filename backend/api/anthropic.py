@@ -44,10 +44,11 @@ router = APIRouter()
 
 
 class _AnthropicStreamState:
-    def __init__(self, *, msg_id: str, model_name: str, prompt: str):
+    def __init__(self, *, msg_id: str, model_name: str, prompt: str, extra_prompt_tokens: int = 0):
         self.msg_id = msg_id
         self.model_name = model_name
         self.prompt = prompt
+        self.extra_prompt_tokens = extra_prompt_tokens
         self.pending_chunks: list[str] = []
         self.answer_text_buffer: list[tuple[int, str]] = []
         self.block_index = 0
@@ -56,7 +57,13 @@ class _AnthropicStreamState:
 
     def ensure_message_start(self) -> None:
         if not self.pending_chunks:
-            self.pending_chunks.append(_message_start_event(self.msg_id, self.model_name, self.prompt, ""))
+            self.pending_chunks.append(_message_start_event(
+                self.msg_id,
+                self.model_name,
+                self.prompt,
+                "",
+                extra_prompt_tokens=self.extra_prompt_tokens,
+            ))
 
     def close_current_block(self) -> None:
         index = self.current_block.get("index")
@@ -160,12 +167,12 @@ def _build_standard_request(req_data: dict) -> StandardRequest:
     )
 
 
-def _anthropic_usage(prompt: str, answer_text: str) -> dict[str, int]:
-    return {"input_tokens": count_tokens(prompt), "output_tokens": count_tokens(answer_text)}
+def _anthropic_usage(prompt: str, answer_text: str, *, extra_prompt_tokens: int = 0) -> dict[str, int]:
+    return {"input_tokens": count_tokens(prompt) + max(0, int(extra_prompt_tokens or 0)), "output_tokens": count_tokens(answer_text)}
 
 
-def _message_start_event(msg_id: str, model_name: str, prompt: str, answer_text: str) -> str:
-    return stream_presenter.anthropic_message_start(msg_id, model_name, _anthropic_usage(prompt, answer_text))
+def _message_start_event(msg_id: str, model_name: str, prompt: str, answer_text: str, *, extra_prompt_tokens: int = 0) -> str:
+    return stream_presenter.anthropic_message_start(msg_id, model_name, _anthropic_usage(prompt, answer_text, extra_prompt_tokens=extra_prompt_tokens))
 
 
 def _visible_answer_text_length(*, directive, execution, stream_state: _AnthropicStreamState | None = None) -> int:
@@ -178,11 +185,11 @@ def _visible_answer_text_length(*, directive, execution, stream_state: _Anthropi
     return count_tokens(execution.state.answer_text)
 
 
-async def _add_used_tokens_for_prompt(*, users_db, token: str, prompt_text: str, answer_text_length: int) -> None:
+async def _add_used_tokens_for_prompt(*, users_db, token: str, prompt_text: str, answer_text_length: int, extra_prompt_tokens: int = 0) -> None:
     users = await users_db.get()
     for user in users:
         if user["id"] == token:
-            user["used_tokens"] += answer_text_length + count_tokens(prompt_text)
+            user["used_tokens"] += answer_text_length + count_tokens(prompt_text) + max(0, int(extra_prompt_tokens or 0))
             break
     await users_db.save(users)
 
@@ -249,6 +256,7 @@ async def anthropic_messages(request: Request):
         standard_request.upstream_files = context_prepared["upstream_files"]
         standard_request.session_key = context_prepared["session_key"]
         standard_request.context_mode = context_prepared["context_mode"]
+        standard_request.context_attachment_tokens = context_prepared.get("context_attachment_tokens", 0)
         standard_request.bound_account_email = context_prepared["bound_account_email"]
         standard_request.bound_account = context_prepared["bound_account"]
 
@@ -294,7 +302,12 @@ async def anthropic_messages(request: Request):
                     current_prompt = prompt
                     max_attempts = request_max_attempts(standard_request)
                     for stream_attempt in range(max_attempts):
-                        stream_state = _AnthropicStreamState(msg_id=msg_id, model_name=model_name, prompt=current_prompt)
+                        stream_state = _AnthropicStreamState(
+                            msg_id=msg_id,
+                            model_name=model_name,
+                            prompt=current_prompt,
+                            extra_prompt_tokens=standard_request.context_attachment_tokens,
+                        )
                         try:
                             update_request_context(stream_attempt=stream_attempt + 1)
 
@@ -353,7 +366,13 @@ async def anthropic_messages(request: Request):
                                 continue
 
                             if not stream_state.pending_chunks:
-                                stream_state.pending_chunks.append(_message_start_event(msg_id, model_name, current_prompt, execution.state.answer_text))
+                                stream_state.pending_chunks.append(_message_start_event(
+                                    msg_id,
+                                    model_name,
+                                    current_prompt,
+                                    execution.state.answer_text,
+                                    extra_prompt_tokens=standard_request.context_attachment_tokens,
+                                ))
 
                             stream_state.close_current_block()
                             directive = build_tool_directive(standard_request, execution.state)
@@ -393,6 +412,7 @@ async def anthropic_messages(request: Request):
                                 token=token,
                                 prompt_text=current_prompt,
                                 answer_text_length=count_tokens(execution.state.answer_text),
+                                extra_prompt_tokens=standard_request.context_attachment_tokens,
                             )
                             assistant_message = build_anthropic_assistant_history_message(
                                 execution=execution,
