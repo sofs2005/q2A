@@ -28,7 +28,7 @@ class OpenAIStreamTranslatorTests(unittest.TestCase):
         tool_call_chunks = [payload["choices"][0]["delta"]["tool_calls"][0] for payload in payloads if payload["choices"][0]["delta"].get("tool_calls")]
 
         self.assertEqual(tool_call_chunks[0]["function"]["name"], "Read")
-        self.assertEqual(tool_call_chunks[0]["function"]["arguments"], "")
+        self.assertNotIn("arguments", tool_call_chunks[0]["function"])
         rebuilt = "".join(chunk["function"].get("arguments", "") for chunk in tool_call_chunks[1:])
         self.assertEqual(rebuilt, json.dumps({"file_path": "a" * 300}, ensure_ascii=False))
         self.assertGreater(len(tool_call_chunks), 2)
@@ -72,9 +72,51 @@ class OpenAIStreamTranslatorTests(unittest.TestCase):
         chunks = translator.finalize("stop", usage=usage)
 
         payloads = [json.loads(chunk[6:].strip()) for chunk in chunks if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"]
-        usage_payload = payloads[-1]
-        self.assertEqual(usage_payload["choices"], [])
-        self.assertEqual(usage_payload["usage"], usage)
+        finish_payload = payloads[-1]
+        self.assertEqual(finish_payload["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(finish_payload["usage"], usage)
+        self.assertFalse(any(payload.get("choices") == [] for payload in payloads))
+
+    def test_finalize_tool_calls_uses_call_id_full_arguments_and_finish_usage(self) -> None:
+        directive = type(
+            "Directive",
+            (),
+            {
+                "stop_reason": "tool_use",
+                "tool_blocks": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_123_1",
+                        "name": "image_generate",
+                        "input": {"prompt": "x" * 300},
+                    }
+                ],
+            },
+        )()
+        translator = OpenAIStreamTranslator(
+            completion_id="chatcmpl_tool_usage",
+            created=1,
+            model_name="gpt-4.1",
+            client_profile="openclaw_openai",
+            build_final_directive=lambda _text: directive,
+            allowed_tool_names=["image_generate"],
+        )
+        translator.on_delta({"phase": "answer"}, "<tool markup buffered>", None)
+        usage = calculate_usage("prompt text", "")
+
+        chunks = translator.finalize("stop", usage=usage)
+
+        payloads = [json.loads(chunk[6:].strip()) for chunk in chunks if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"]
+        tool_call_chunks = [payload["choices"][0]["delta"]["tool_calls"][0] for payload in payloads if payload["choices"] and payload["choices"][0]["delta"].get("tool_calls")]
+        finish_payload = payloads[-1]
+
+        self.assertEqual(len(tool_call_chunks), 1)
+        self.assertRegex(tool_call_chunks[0]["id"], r"^call_[0-9a-f]+$")
+        self.assertEqual(tool_call_chunks[0]["function"]["name"], "image_generate")
+        self.assertEqual(tool_call_chunks[0]["function"]["arguments"], json.dumps({"prompt": "x" * 300}, ensure_ascii=False))
+        self.assertEqual(finish_payload["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(finish_payload["usage"], usage)
+        self.assertFalse(any(payload.get("choices") == [] for payload in payloads))
 
     def test_stream_tool_call_discards_preceding_content_chunks(self) -> None:
         translator = OpenAIStreamTranslator(

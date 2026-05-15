@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any, Callable
 
 from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW_OPENAI_PROFILE
@@ -113,7 +114,14 @@ class OpenAIStreamTranslator:
             return name
         return self.tool_catalog.get_client_name(canonical)
 
-    def emit_tool_calls(self, tool_calls: list[dict[str, Any]]) -> None:
+    @staticmethod
+    def _openai_tool_call_id(call_id: Any) -> str:
+        text = str(call_id or "").strip()
+        if text.startswith("call_"):
+            return text
+        return f"call_{uuid.uuid4().hex}"
+
+    def emit_tool_calls(self, tool_calls: list[dict[str, Any]], *, split_arguments: bool = True) -> None:
         self._ensure_role_chunk()
         if tool_calls and not self.tool_calls_emitted:
             self._discard_pending_content_chunks()
@@ -121,13 +129,18 @@ class OpenAIStreamTranslator:
             idx = self.emitted_tool_index
             self.emitted_tool_index += 1
             tool_name = self._client_tool_name(str(tool_call['name']))
-            self.pending_chunks.append(
-                f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': idx, 'id': tool_call['id'], 'type': 'function', 'function': {'name': tool_name, 'arguments': ''}}]}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
-            )
             arguments = json.dumps(tool_call['input'], ensure_ascii=False)
-            for start in range(0, len(arguments), TOOL_ARGUMENT_CHUNK_SIZE):
+            if split_arguments:
                 self.pending_chunks.append(
-                    f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': idx, 'function': {'arguments': arguments[start:start + TOOL_ARGUMENT_CHUNK_SIZE]}}]}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                    f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': idx, 'id': self._openai_tool_call_id(tool_call.get('id')), 'type': 'function', 'function': {'name': tool_name}}]}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                )
+                for start in range(0, len(arguments), TOOL_ARGUMENT_CHUNK_SIZE):
+                    self.pending_chunks.append(
+                        f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': idx, 'function': {'arguments': arguments[start:start + TOOL_ARGUMENT_CHUNK_SIZE]}}]}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                    )
+            else:
+                self.pending_chunks.append(
+                    f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': idx, 'id': self._openai_tool_call_id(tool_call.get('id')), 'type': 'function', 'function': {'name': tool_name, 'arguments': arguments}}]}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
                 )
         if tool_calls:
             self.tool_calls_emitted = True
@@ -153,7 +166,7 @@ class OpenAIStreamTranslator:
                     if block.get("type") == "tool_use"
                 ]
                 if tool_calls:
-                    self.emit_tool_calls(tool_calls)
+                    self.emit_tool_calls(tool_calls, split_arguments=False)
                     final_finish_reason = "tool_calls"
         else:
             for event in self.state_machine.flush(final_tool_use=finish_reason == "tool_calls"):
@@ -163,12 +176,15 @@ class OpenAIStreamTranslator:
                     self.emit_tool_calls(event.calls)
 
         chunks = list(self.pending_chunks)
-        chunks.append(
-            f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': final_finish_reason}]}, ensure_ascii=False)}\n\n"
-        )
+        finish_payload = {
+            'id': self.completion_id,
+            'object': 'chat.completion.chunk',
+            'created': self.created,
+            'model': self.model_name,
+            'choices': [{'index': 0, 'delta': {}, 'finish_reason': final_finish_reason}],
+        }
         if usage is not None:
-            chunks.append(
-                f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [], 'usage': usage}, ensure_ascii=False)}\n\n"
-            )
+            finish_payload['usage'] = usage
+        chunks.append(f"data: {json.dumps(finish_payload, ensure_ascii=False)}\n\n")
         chunks.append("data: [DONE]\n\n")
         return chunks
