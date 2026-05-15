@@ -56,7 +56,7 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         guard_patch.start()
         self.addCleanup(guard_patch.stop)
 
-    async def test_repeated_user_only_request_short_circuits_before_context_upload(self) -> None:
+    async def test_repeated_user_only_request_is_logged_without_short_circuiting(self) -> None:
         app = types.SimpleNamespace(
             state=types.SimpleNamespace(
                 users_db=object(),
@@ -89,18 +89,34 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         )
         prepare_context_attachments = AsyncMock()
 
-        with patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
+        async def fake_bridge(**kwargs):
+            await kwargs["on_attempt_start"](0, "prompt")
+            return types.SimpleNamespace(
+                execution=types.SimpleNamespace(chat_id="chat_1", state=types.SimpleNamespace(finish_reason="stop", answer_text="ok", reasoning_text="", tool_calls=[])),
+                directive=types.SimpleNamespace(stop_reason="end_turn", tool_blocks=[]),
+                usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            )
+
+        with self.assertLogs("qwen2api.chat", level="WARNING") as captured_logs, \
+             patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
              patch.object(v1_chat, "derive_session_key", return_value="session"), \
              patch.object(v1_chat, "_build_standard_request", return_value=standard_request), \
              patch.object(v1_chat, "_repeated_tool_request_guard", guard), \
              patch.object(v1_chat, "prepare_context_attachments", prepare_context_attachments), \
-             patch.object(v1_chat, "run_retryable_completion_bridge", AsyncMock()):
+             patch.object(v1_chat, "plan_persistent_session_turn", AsyncMock(return_value=types.SimpleNamespace(enabled=False))), \
+             patch.object(v1_chat, "run_retryable_completion_bridge", new=fake_bridge), \
+             patch.object(v1_chat, "build_tool_directive", return_value=types.SimpleNamespace(stop_reason="end_turn", tool_blocks=[])), \
+             patch.object(v1_chat, "build_openai_assistant_history_message", return_value={"role": "assistant", "content": "ok"}), \
+             patch.object(v1_chat, "persist_session_turn", AsyncMock()), \
+             patch.object(v1_chat, "clear_invalidated_session_chat", AsyncMock()), \
+             patch.object(v1_chat, "update_request_context"):
             response = await v1_chat.chat_completions(request)
             self.assertIsInstance(response, StreamingResponse)
             chunks = [chunk async for chunk in response.body_iterator]
 
-        prepare_context_attachments.assert_not_awaited()
+        prepare_context_attachments.assert_awaited_once()
         self.assertTrue(chunks)
+        self.assertIn("repeated_user_only_tool_request", "\n".join(captured_logs.output))
 
     async def test_streaming_response_yields_delta_before_finalize(self) -> None:
         app = types.SimpleNamespace(

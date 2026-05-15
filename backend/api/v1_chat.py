@@ -627,35 +627,15 @@ async def chat_completions(request: Request):
         early_diagnostics,
     )
     if repeated_tool_names:
-        notice = _build_repeated_tool_request_notice(repeated_tool_names, prompt=early_standard_request.prompt)
         with request_context(req_id=req_id, surface="openai", requested_model=early_standard_request.response_model, resolved_model=early_standard_request.resolved_model):
             log.warning(
-                "[OAI] repeated_user_only_tool_request req_id=%s completion_id=%s session=%s prompt_hash=%s tool_names=%s before_context_upload=True",
+                "[OAI] repeated_user_only_tool_request req_id=%s completion_id=%s session=%s prompt_hash=%s tool_names=%s before_context_upload=True action=log_only",
                 req_id,
                 completion_id,
                 session_key,
                 early_diagnostics["prompt_hash"],
                 repeated_tool_names,
             )
-        if early_standard_request.stream:
-            return StreamingResponse(
-                _openai_text_stream_chunks(
-                    completion_id=completion_id,
-                    created=created,
-                    model_name=early_standard_request.response_model,
-                    content=notice,
-                    prompt=early_standard_request.prompt,
-                ),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-            )
-        return JSONResponse(_build_openai_text_payload(
-            completion_id=completion_id,
-            created=created,
-            model_name=early_standard_request.response_model,
-            content=notice,
-            prompt=early_standard_request.prompt,
-        ))
 
     context_prepared = await prepare_context_attachments(app=app, payload=req_data, surface="openai", auth_token=token, client_profile=client_profile, existing_attachments=(preprocessed.attachments if preprocessed is not None else None))
     req_data = context_prepared["payload"]
@@ -748,34 +728,14 @@ async def chat_completions(request: Request):
             diagnostics,
         )
         if repeated_tool_names:
-            notice = _build_repeated_tool_request_notice(repeated_tool_names, prompt=prompt)
             log.warning(
-                "[OAI] repeated_user_only_tool_request req_id=%s completion_id=%s session=%s prompt_hash=%s tool_names=%s",
+                "[OAI] repeated_user_only_tool_request req_id=%s completion_id=%s session=%s prompt_hash=%s tool_names=%s action=log_only",
                 req_id,
                 completion_id,
                 standard_request.session_key,
                 diagnostics["prompt_hash"],
                 repeated_tool_names,
             )
-            if standard_request.stream:
-                return StreamingResponse(
-                    _openai_text_stream_chunks(
-                        completion_id=completion_id,
-                        created=created,
-                        model_name=model_name,
-                        content=notice,
-                        prompt=prompt,
-                    ),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-                )
-            return JSONResponse(_build_openai_text_payload(
-                completion_id=completion_id,
-                created=created,
-                model_name=model_name,
-                content=notice,
-                prompt=prompt,
-            ))
 
         if standard_request.stream:
             async def generate():
