@@ -214,9 +214,24 @@ class _RepeatedToolRequestGuard:
             return None
         if diagnostics.get("message_count") != 1 or diagnostics.get("role_counts") != {"user": 1}:
             return None
-        key = (session_key, str(diagnostics.get("prompt_hash") or ""), str(diagnostics.get("latest_user_hash") or ""))
+        prompt_hash = str(diagnostics.get("prompt_hash") or "")
+        latest_user_hash = str(diagnostics.get("latest_user_hash") or "")
+        key = (session_key, prompt_hash, latest_user_hash)
         if not all(key):
             return None
+        exact = self._active_entry(key)
+        if exact is not None:
+            return exact
+        for candidate_key in list(self._entries):
+            candidate_session, _candidate_prompt_hash, candidate_user_hash = candidate_key
+            if candidate_session != session_key or candidate_user_hash != latest_user_hash:
+                continue
+            fallback = self._active_entry(candidate_key)
+            if fallback is not None:
+                return fallback
+        return None
+
+    def _active_entry(self, key: tuple[str, str, str]) -> list[str] | None:
         entry = self._entries.get(key)
         if entry is None:
             return None
@@ -236,8 +251,10 @@ class _RepeatedToolRequestGuard:
 _repeated_tool_request_guard = _RepeatedToolRequestGuard()
 
 
-def _build_repeated_tool_request_notice(tool_names: list[str]) -> str:
+def _build_repeated_tool_request_notice(tool_names: list[str], *, prompt: str = "") -> str:
     del tool_names
+    if "[SILENT]" in prompt:
+        return "[SILENT]"
     return ""
 
 
@@ -554,7 +571,7 @@ async def chat_completions(request: Request):
         early_diagnostics,
     )
     if repeated_tool_names:
-        notice = _build_repeated_tool_request_notice(repeated_tool_names)
+        notice = _build_repeated_tool_request_notice(repeated_tool_names, prompt=early_standard_request.prompt)
         with request_context(req_id=req_id, surface="openai", requested_model=early_standard_request.response_model, resolved_model=early_standard_request.resolved_model):
             log.warning(
                 "[OAI] repeated_user_only_tool_request req_id=%s completion_id=%s session=%s prompt_hash=%s tool_names=%s before_context_upload=True",
@@ -670,7 +687,7 @@ async def chat_completions(request: Request):
             diagnostics,
         )
         if repeated_tool_names:
-            notice = _build_repeated_tool_request_notice(repeated_tool_names)
+            notice = _build_repeated_tool_request_notice(repeated_tool_names, prompt=prompt)
             log.warning(
                 "[OAI] repeated_user_only_tool_request req_id=%s completion_id=%s session=%s prompt_hash=%s tool_names=%s",
                 req_id,

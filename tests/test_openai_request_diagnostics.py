@@ -69,6 +69,22 @@ class OpenAIRequestDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(repeated, ["execute_code"])
 
+    def test_repeated_tool_request_guard_detects_replay_when_prompt_hash_drifts(self) -> None:
+        guard = _RepeatedToolRequestGuard(ttl_seconds=60.0, now=lambda: 100.0)
+        req_data = {"messages": [{"role": "user", "content": "检查 gateway 进程"}]}
+        original = _build_openai_request_diagnostics(req_data, prompt="prompt before context upload")
+        replay = _build_openai_request_diagnostics(req_data, prompt="prompt after regenerated context upload")
+        guard.record_tool_response(
+            session_key="session-1",
+            prompt_hash=original["prompt_hash"],
+            latest_user_hash=original["latest_user_hash"],
+            tool_names=["execute_code"],
+        )
+
+        repeated = guard.repeated_user_only_tool_request("session-1", replay)
+
+        self.assertEqual(repeated, ["execute_code"])
+
     def test_repeated_tool_request_guard_ignores_tool_continuation(self) -> None:
         guard = _RepeatedToolRequestGuard(ttl_seconds=60.0, now=lambda: 100.0)
         original = _build_openai_request_diagnostics(
@@ -102,6 +118,11 @@ class OpenAIRequestDiagnosticsTests(unittest.TestCase):
         self.assertEqual(notice, "")
         self.assertNotIn("上一轮已经返回工具调用", notice)
         self.assertNotIn("请让客户端执行工具", notice)
+
+    def test_repeated_tool_request_notice_uses_silent_when_prompt_requests_it(self) -> None:
+        notice = _build_repeated_tool_request_notice(["terminal"], prompt='respond with exactly "[SILENT]"')
+
+        self.assertEqual(notice, "[SILENT]")
 
 
 if __name__ == "__main__":
