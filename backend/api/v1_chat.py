@@ -514,15 +514,27 @@ def _openai_text_stream_chunks(*, completion_id: str, created: int, model_name: 
     yield "data: [DONE]\n\n"
 
 
-def _record_repeated_tool_guard(*, session_key: str, diagnostics: dict[str, Any], tool_names: list[str], finish_reason: str) -> None:
+def _record_repeated_tool_guard(
+    *,
+    session_key: str,
+    diagnostics: dict[str, Any],
+    tool_names: list[str],
+    finish_reason: str,
+    final_diagnostics: dict[str, Any] | None = None,
+    guard: _RepeatedToolRequestGuard | None = None,
+) -> None:
     if finish_reason != "tool_calls" or not tool_names:
         return
-    _repeated_tool_request_guard.record_tool_response(
-        session_key=session_key,
-        prompt_hash=str(diagnostics.get("prompt_hash") or ""),
-        latest_user_hash=str(diagnostics.get("latest_user_hash") or ""),
-        tool_names=tool_names,
-    )
+    target_guard = guard or _repeated_tool_request_guard
+    for item in (diagnostics, final_diagnostics):
+        if item is None:
+            continue
+        target_guard.record_tool_response(
+            session_key=session_key,
+            prompt_hash=str(item.get("prompt_hash") or ""),
+            latest_user_hash=str(item.get("latest_user_hash") or ""),
+            tool_names=tool_names,
+        )
 
 
 def _build_standard_request(req_data: dict, *, client_profile: str) -> StandardRequest:
@@ -790,6 +802,7 @@ async def chat_completions(request: Request):
                                 _record_repeated_tool_guard(
                                     session_key=standard_request.session_key or session_key,
                                     diagnostics=guard_diagnostics,
+                                    final_diagnostics=diagnostics,
                                     tool_names=tool_names,
                                     finish_reason=final_finish_reason,
                                 )
@@ -870,6 +883,7 @@ async def chat_completions(request: Request):
                                 _record_repeated_tool_guard(
                                     session_key=standard_request.session_key or session_key,
                                     diagnostics=guard_diagnostics,
+                                    final_diagnostics=diagnostics,
                                     tool_names=tool_names,
                                     finish_reason=final_finish_reason,
                                 )
@@ -975,6 +989,7 @@ async def chat_completions(request: Request):
                 _record_repeated_tool_guard(
                     session_key=standard_request.session_key or session_key,
                     diagnostics=guard_diagnostics,
+                    final_diagnostics=diagnostics,
                     tool_names=tool_names,
                     finish_reason=final_finish_reason,
                 )

@@ -4,6 +4,7 @@ from backend.api.v1_chat import (
     _RepeatedToolRequestGuard,
     _build_openai_request_diagnostics,
     _build_repeated_tool_request_notice,
+    _record_repeated_tool_guard,
 )
 
 
@@ -84,6 +85,25 @@ class OpenAIRequestDiagnosticsTests(unittest.TestCase):
         repeated = guard.repeated_user_only_tool_request("session-1", replay)
 
         self.assertEqual(repeated, ["execute_code"])
+
+    def test_record_repeated_tool_guard_stores_final_context_diagnostics(self) -> None:
+        guard = _RepeatedToolRequestGuard(ttl_seconds=60.0, now=lambda: 100.0)
+        req_data = {"messages": [{"role": "user", "content": "生成一张图"}]}
+        early = _build_openai_request_diagnostics(req_data, prompt="early prompt")
+        final = _build_openai_request_diagnostics(req_data, prompt="final prompt with context attachment")
+
+        _record_repeated_tool_guard(
+            guard=guard,
+            session_key="session-1",
+            diagnostics=early,
+            final_diagnostics=final,
+            tool_names=["image_generate"],
+            finish_reason="tool_calls",
+        )
+
+        repeated = guard.repeated_user_only_tool_request("session-1", final)
+
+        self.assertEqual(repeated, ["image_generate"])
 
     def test_repeated_tool_request_guard_ignores_tool_continuation(self) -> None:
         guard = _RepeatedToolRequestGuard(ttl_seconds=60.0, now=lambda: 100.0)
