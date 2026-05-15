@@ -167,7 +167,7 @@ def build_tool_instruction_block(
         "These are gateway bridge tools, not upstream/native Qwen tools; do not invoke the platform's built-in tool system.",
         f"If you need a tool, output the DSML text block directly; never answer with platform errors such as `Tool {native_error_example} does not exists.`",
         "Follow the client's system/developer instructions for persona, style, language, and normal response format.",
-        f"You have access to these tools: {', '.join(names)}",
+        f"Bridge-call slots available: {', '.join(names)}",
         "",
         "TOOL CALL FORMAT — FOLLOW EXACTLY:",
         "<|DSML|tool_calls>",
@@ -179,7 +179,7 @@ def build_tool_instruction_block(
         "Rules:",
         "- Use one <|DSML|tool_calls> root when calling tools.",
         "- Put one or more <|DSML|invoke> entries under the root.",
-        "- Use the exact tool name from the list above in the invoke name attribute.",
+        "- Use the exact bridge slot id from the list above in the invoke name attribute.",
         "- Every top-level argument must be a <|DSML|parameter name=\"ARG_NAME\"> node.",
         "- Use <![CDATA[...]]> for string values, including code, paths, prompts, and file contents.",
         "- Objects use nested XML elements inside the parameter body. Arrays may repeat <item> children.",
@@ -192,7 +192,7 @@ def build_tool_instruction_block(
         "",
         *force_constraint_lines,
         *([""] if force_constraint_lines else []),
-        "Available tools (use these EXACT names):",
+        "Available bridge slots (copy the slot id exactly into DSML invoke name):"
     ]
     for tool in tools:
         lines.append(

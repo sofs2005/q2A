@@ -38,7 +38,7 @@ def _normalize_messages(raw_messages: Any) -> list[dict[str, Any]]:
 
 
 def _model_tool_name(index: int) -> str:
-    return f"gateway_tool_{index}"
+    return f"bridge-{index}"
 
 
 def _normalize_tools(raw_tools: Any) -> list[ToolDefinition]:

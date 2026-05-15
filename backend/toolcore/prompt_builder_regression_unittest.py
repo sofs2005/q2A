@@ -64,7 +64,7 @@ class ClientPresetPromptRegressionTest(unittest.TestCase):
         self.assertTrue(result.tool_enabled)
         self.assertEqual(["Read", "Bash"], [tool.get("name") for tool in result.tools])
         self.assertIn("MANDATORY TOOL CALL INSTRUCTIONS", result.prompt)
-        self.assertIn("You have access to these tools: Read, Bash", result.prompt)
+        self.assertIn("Bridge-call slots available: Read, Bash", result.prompt)
 
     def test_claude_code_runtime_native_tools_are_rendered_when_declared_by_client(self) -> None:
         result = messages_to_prompt(
@@ -106,7 +106,7 @@ class ClientPresetPromptRegressionTest(unittest.TestCase):
         self.assertTrue(result.tool_enabled)
         self.assertEqual(["Read", "Bash"], [tool.get("name") for tool in result.tools])
         self.assertIn("MANDATORY TOOL CALL INSTRUCTIONS", result.prompt)
-        self.assertIn("You have access to these tools: Read, Bash", result.prompt)
+        self.assertIn("Bridge-call slots available: Read, Bash", result.prompt)
 
     def test_regular_client_function_tools_are_preserved(self) -> None:
         result = messages_to_prompt(
@@ -132,7 +132,7 @@ class ClientPresetPromptRegressionTest(unittest.TestCase):
 
         self.assertTrue(result.tool_enabled)
         self.assertEqual(["get_weather"], [tool.get("name") for tool in result.tools])
-        self.assertIn("You have access to these tools: get_weather", result.prompt)
+        self.assertIn("Bridge-call slots available: get_weather", result.prompt)
         self.assertIn("Human (CURRENT TASK - TOP PRIORITY): What is the weather in Hangzhou?", result.prompt)
 
 

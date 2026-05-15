@@ -43,7 +43,7 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
             "latest instruction",
         )
 
-    def test_messages_to_prompt_places_gateway_tool_contract_before_user_history(self) -> None:
+    def test_messages_to_prompt_places_bridge_tool_contract_before_user_history(self) -> None:
         req_data = {
             "system": "Always answer as a pirate captain.",
             "messages": [{"role": "user", "content": "Who are you?"}],
@@ -120,7 +120,7 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
         self.assertLess(result.prompt.index("Read README.md and summarize it"), result.prompt.index("[Tool Result] id=call_1"))
         self.assertTrue(result.prompt.endswith("Assistant:"))
 
-    def test_standard_request_prompt_uses_gateway_names_for_tools_and_history(self) -> None:
+    def test_standard_request_prompt_uses_bridge_slots_for_tools_and_history(self) -> None:
         req_data = {
             "model": "gpt-4.1",
             "messages": [
@@ -152,10 +152,10 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
 
         result = build_chat_standard_request(req_data, default_model="gpt-4.1", surface="openai")
 
-        self.assertIn("gateway_tool_0", result.prompt)
-        self.assertIn('<|DSML|invoke name="gateway_tool_0">', result.prompt)
+        self.assertIn("bridge-0", result.prompt)
+        self.assertIn('<|DSML|invoke name="bridge-0">', result.prompt)
         self.assertNotIn('<|DSML|invoke name="exec">', result.prompt)
-        self.assertEqual(result.tool_names, ["gateway_tool_0"])
+        self.assertEqual(result.tool_names, ["bridge-0"])
 
     def test_messages_to_prompt_preserves_openclaw_runtime_system_prose(self) -> None:
         req_data = {

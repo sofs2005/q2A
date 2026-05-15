@@ -91,8 +91,8 @@ class ChatRequestNormalizationTests(unittest.TestCase):
 
         payload = to_prompt_payload(result, model="gpt-4.1")
 
-        self.assertEqual([tool["name"] for tool in payload["tools"]], ["gateway_tool_0", "gateway_tool_1"])
-        self.assertEqual(payload["tool_choice"], {"type": "function", "function": {"name": "gateway_tool_0"}})
+        self.assertEqual([tool["name"] for tool in payload["tools"]], ["bridge-0", "bridge-1"])
+        self.assertEqual(payload["tool_choice"], {"type": "function", "function": {"name": "bridge-0"}})
 
     def test_chat_request_invalid_tool_choice_raises_error(self) -> None:
         with self.assertRaisesRegex(ValueError, "Invalid tool_choice"):

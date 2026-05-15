@@ -35,7 +35,7 @@ class OpenAIStreamTranslatorTests(unittest.TestCase):
 
     def test_emit_tool_calls_maps_gateway_name_back_to_client_name(self) -> None:
         catalog = ToolCatalog([
-            ToolDefinition(name="exec", client_name="exec", model_name="gateway_tool_0"),
+            ToolDefinition(name="exec", client_name="exec", model_name="bridge-0"),
         ])
         translator = OpenAIStreamTranslator(
             completion_id="chatcmpl_test",
@@ -48,7 +48,7 @@ class OpenAIStreamTranslatorTests(unittest.TestCase):
         translator.emit_tool_calls([
             {
                 "id": "call_1",
-                "name": "gateway_tool_0",
+                "name": "bridge-0",
                 "input": {"command": "echo hi"},
             }
         ])
@@ -57,7 +57,7 @@ class OpenAIStreamTranslatorTests(unittest.TestCase):
         tool_call_chunks = [payload["choices"][0]["delta"]["tool_calls"][0] for payload in payloads if payload["choices"][0]["delta"].get("tool_calls")]
 
         self.assertEqual(tool_call_chunks[0]["function"]["name"], "exec")
-        self.assertNotEqual(tool_call_chunks[0]["function"]["name"], "gateway_tool_0")
+        self.assertNotEqual(tool_call_chunks[0]["function"]["name"], "bridge-0")
 
     def test_finalize_can_emit_token_usage_chunk(self) -> None:
         translator = OpenAIStreamTranslator(

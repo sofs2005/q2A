@@ -25,7 +25,7 @@ class StandardRequestToolChoiceTests(unittest.TestCase):
         )
 
         self.assertEqual(request.tool_choice_mode, "required")
-        self.assertEqual(request.required_tool_name, "gateway_tool_0")
+        self.assertEqual(request.required_tool_name, "bridge-0")
         self.assertEqual(request.tool_choice_raw, {"type": "function", "function": {"name": "Read"}})
 
     def test_required_tool_choice_adds_prompt_constraint(self) -> None:
@@ -63,7 +63,7 @@ class StandardRequestToolChoiceTests(unittest.TestCase):
             surface="openai",
         )
 
-        self.assertEqual(request.required_tool_name, "gateway_tool_0")
+        self.assertEqual(request.required_tool_name, "bridge-0")
 
     def test_undeclared_forced_tool_choice_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "undeclared tool"):

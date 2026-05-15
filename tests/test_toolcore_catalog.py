@@ -80,12 +80,12 @@ class ToolCatalogTests(unittest.TestCase):
         )
 
         self.assertEqual([tool.client_name for tool in request.tools], ["exec", "image_generate"])
-        self.assertEqual([tool.model_name for tool in request.tools], ["gateway_tool_0", "gateway_tool_1"])
+        self.assertEqual([tool.model_name for tool in request.tools], ["bridge-0", "bridge-1"])
         catalog = request.tool_catalog
         assert catalog is not None
-        self.assertEqual(catalog.get_canonical_name("gateway_tool_0"), "exec")
+        self.assertEqual(catalog.get_canonical_name("bridge-0"), "exec")
         self.assertEqual(catalog.get_client_name("exec"), "exec")
-        self.assertEqual(catalog.get_model_name("image_generate"), "gateway_tool_1")
+        self.assertEqual(catalog.get_model_name("image_generate"), "bridge-1")
 
 
 if __name__ == "__main__":
