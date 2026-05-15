@@ -688,15 +688,30 @@ async def collect_completion_run(
     return _finalize_result(reason="stream_end")
 
 
+def _coerce_runtime_tool_blocks(tool_blocks: list[dict[str, Any]], tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not tools:
+        return tool_blocks
+
+    coerced_blocks: list[dict[str, Any]] = []
+    for block in tool_blocks:
+        if block.get("type") != "tool_use":
+            coerced_blocks.append(block)
+            continue
+        coerced = dict(block)
+        coerced["input"] = tool_parser.coerce_tool_input(str(block.get("name") or ""), block.get("input", {}), tools)
+        coerced_blocks.append(coerced)
+    return coerced_blocks
+
+
 def parse_tool_directive_once(request: StandardRequest, state: RuntimeAttemptState) -> RuntimeToolDirective:
     if settings.TOOLCORE_V2_ENABLED:
         if state.tool_calls:
             parsed = parse_state_tool_calls(state.tool_calls, request.tool_names)
-            return RuntimeToolDirective(tool_blocks=parsed.tool_blocks, stop_reason=parsed.stop_reason)
+            return RuntimeToolDirective(tool_blocks=_coerce_runtime_tool_blocks(parsed.tool_blocks, request.tools), stop_reason=parsed.stop_reason)
 
         if request.tools and state.answer_text:
             parsed = parse_textual_tool_calls(state.answer_text, request.tools)
-            return RuntimeToolDirective(tool_blocks=parsed.tool_blocks, stop_reason=parsed.stop_reason)
+            return RuntimeToolDirective(tool_blocks=_coerce_runtime_tool_blocks(parsed.tool_blocks, request.tools), stop_reason=parsed.stop_reason)
     else:
         if state.tool_calls:
             allowed_names = {str(name).strip() for name in request.tool_names if str(name).strip()}

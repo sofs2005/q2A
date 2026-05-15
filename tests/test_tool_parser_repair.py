@@ -25,6 +25,35 @@ class ToolParserRepairTests(unittest.TestCase):
         tool_blocks = [block for block in blocks if block.get("type") == "tool_use"]
         self.assertEqual(tool_blocks[0]["input"], {"file_path": "legacy.md"})
 
+    def test_image_generate_filters_drift_fields_to_declared_schema(self) -> None:
+        blocks, stop_reason = parse_tool_calls_silent(
+            '##TOOL_CALL##\n{"name": "image_generate", "input": {"action": "generate", "model": "qwen-image", "prompt": "cat", "aspectRatio": "16:9"}}\n##END_CALL##',
+            [{
+                "name": "image_generate",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string"},
+                        "aspect_ratio": {"type": "string"},
+                    },
+                },
+            }],
+        )
+
+        self.assertEqual(stop_reason, "tool_use")
+        tool_blocks = [block for block in blocks if block.get("type") == "tool_use"]
+        self.assertEqual(tool_blocks[0]["input"], {"prompt": "cat", "aspect_ratio": "16:9"})
+
+    def test_image_generate_without_schema_keeps_prompt_only(self) -> None:
+        blocks, stop_reason = parse_tool_calls_silent(
+            '##TOOL_CALL##\n{"name": "image_generate", "input": {"action": "generate", "model": "qwen-image", "prompt": "cat"}}\n##END_CALL##',
+            [{"name": "image_generate", "parameters": {}}],
+        )
+
+        self.assertEqual(stop_reason, "tool_use")
+        tool_blocks = [block for block in blocks if block.get("type") == "tool_use"]
+        self.assertEqual(tool_blocks[0]["input"], {"prompt": "cat"})
+
 
 if __name__ == "__main__":
     unittest.main()

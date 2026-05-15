@@ -10,7 +10,7 @@ from backend.toolcall.formats_json import load_json_with_repair
 from backend.toolcall.parser import parse_tool_calls_detailed
 from backend.toolcore.directive_parser import parse_textual_tool_calls
 
-__all__ = ["parse_tool_calls", "parse_tool_calls_detailed", "inject_format_reminder", "parse_tool_calls_silent", "ToolSieve"]
+__all__ = ["parse_tool_calls", "parse_tool_calls_detailed", "inject_format_reminder", "parse_tool_calls_silent", "coerce_tool_input", "ToolSieve"]
 
 log = logging.getLogger("qwen2api.tool_parser")
 
@@ -340,6 +340,28 @@ def _coerce_search_files_input(input_data: dict[str, Any], _props: dict[str, Any
     return fixed
 
 
+def _coerce_image_generate_input(input_data: dict[str, Any], props: dict[str, Any]) -> dict[str, Any]:
+    fixed = dict(input_data)
+    prompt_key = _pick_declared_key(props, ["prompt", "query", "description", "text", "value"], "prompt")
+    aspect_key = _pick_declared_key(props, ["aspect_ratio", "aspectRatio", "ratio"], "aspect_ratio")
+
+    _move_alias_value(fixed, prompt_key, ["prompt", "query", "description", "text", "value"])
+    _move_alias_value(fixed, aspect_key, ["aspect_ratio", "aspectRatio", "ratio"])
+
+    allowed_keys = set(props) if props else {prompt_key}
+    coerced: dict[str, Any] = {}
+    for key in fixed:
+        if key not in allowed_keys:
+            continue
+        value = fixed[key]
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                continue
+        coerced[key] = value
+    return coerced
+
+
 TOOL_INPUT_COERCERS_BY_NAME = {
     "AskUserQuestion": _coerce_ask_user_question_input,
     "Agent": _coerce_agent_input,
@@ -356,6 +378,8 @@ TOOL_INPUT_COERCERS_BY_NORMALIZED_NAME = {
     "runshellcommand": _coerce_shell_input,
     "run_shell_command": _coerce_shell_input,
     "search_files": _coerce_search_files_input,
+    "image_generate": _coerce_image_generate_input,
+    "imagegenerate": _coerce_image_generate_input,
 }
 
 
@@ -397,6 +421,10 @@ def _coerce_tool_input(name: str, input_data: Any, tools: list[dict[str, Any]]) 
         fixed = coercer(fixed, props)
 
     return _coerce_query_aliases(fixed, tools)
+
+
+def coerce_tool_input(name: str, input_data: Any, tools: list[dict[str, Any]]) -> Any:
+    return _coerce_tool_input(name, input_data, tools)
 
 
 def parse_tool_calls(answer: str, tools: list):
