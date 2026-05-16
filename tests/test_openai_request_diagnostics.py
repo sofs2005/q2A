@@ -144,6 +144,11 @@ class OpenAIRequestDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(notice, "[SILENT]")
 
+    def test_repeated_tool_request_notice_uses_openclaw_no_reply_when_prompt_requests_it(self) -> None:
+        notice = _build_repeated_tool_request_notice(["image_generate"], prompt="After sending with the message tool, reply with ONLY: NO_REPLY.")
+
+        self.assertEqual(notice, "NO_REPLY")
+
 
 if __name__ == "__main__":
     unittest.main()

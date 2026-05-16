@@ -255,6 +255,8 @@ def _build_repeated_tool_request_notice(tool_names: list[str], *, prompt: str = 
     del tool_names
     if "[SILENT]" in prompt:
         return "[SILENT]"
+    if "NO_REPLY" in prompt:
+        return "NO_REPLY"
     return ""
 
 
