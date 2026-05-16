@@ -523,6 +523,9 @@ def _log_openai_stream_sse_chunk(*, req_id: str, completion_id: str, prompt_hash
                     "arguments_chars": len(arguments) if isinstance(arguments, str) else 0,
                 }
             )
+    finish_reason = choice.get("finish_reason")
+    if not tool_calls and finish_reason is None:
+        return
     content = str(delta.get("content") or "")
     log.info(
         "[OAI] stream_sse_chunk req_id=%s completion_id=%s prompt_hash=%s choices=%s role=%s has_content=%s content_chars=%s content_preview=%r has_tool_calls=%s tool_names=%s tool_details=%s finish_reason=%s",
@@ -537,7 +540,7 @@ def _log_openai_stream_sse_chunk(*, req_id: str, completion_id: str, prompt_hash
         bool(tool_calls),
         tool_names,
         tool_details,
-        choice.get("finish_reason"),
+        finish_reason,
     )
 
 

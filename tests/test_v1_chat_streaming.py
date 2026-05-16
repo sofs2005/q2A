@@ -56,6 +56,25 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         guard_patch.start()
         self.addCleanup(guard_patch.stop)
 
+    def test_plain_stream_content_chunk_is_not_logged(self) -> None:
+        payload = {
+            "choices": [
+                {
+                    "delta": {"content": "普通流式文本片段"},
+                    "finish_reason": None,
+                }
+            ]
+        }
+        chunk = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        with self.assertNoLogs("qwen2api.chat", level="INFO"):
+            v1_chat._log_openai_stream_sse_chunk(
+                req_id="req",
+                completion_id="chatcmpl-test",
+                prompt_hash="prompt-hash",
+                chunk=chunk,
+            )
+
     async def test_repeated_user_only_request_short_circuits_before_context_upload(self) -> None:
         app = types.SimpleNamespace(
             state=types.SimpleNamespace(
