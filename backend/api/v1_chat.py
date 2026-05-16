@@ -88,7 +88,40 @@ def _tool_name_map_entries(standard_request: StandardRequest) -> list[dict[str, 
     return entries
 
 
-def _build_openai_request_diagnostics(req_data: dict[str, Any], *, prompt: str) -> dict[str, Any]:
+def _build_openai_context_fingerprint(
+    *,
+    req_data: dict[str, Any],
+    context_prepared: dict[str, Any] | None = None,
+) -> str:
+    context_prepared = context_prepared or {}
+    request_upstream_files = req_data.get("upstream_files", []) or []
+    prepared_upstream_files = context_prepared.get("upstream_files", []) or []
+    generated_files = context_prepared.get("generated_local_files", []) or []
+    context_mode = str(context_prepared.get("context_mode") or "")
+    attachment_fallback = bool(context_prepared.get("attachment_fallback"))
+    context_attachment_tokens = int(context_prepared.get("context_attachment_tokens") or 0)
+    if not any((request_upstream_files, prepared_upstream_files, generated_files, context_mode, attachment_fallback, context_attachment_tokens)):
+        return ""
+    generated_file_fingerprints = [
+        {
+            "sha256": str(item.get("sha256") or ""),
+            "content_type": str(item.get("content_type") or ""),
+        }
+        for item in generated_files
+        if isinstance(item, dict)
+    ]
+    basis = {
+        "request_upstream_files": request_upstream_files,
+        "prepared_upstream_files": prepared_upstream_files,
+        "generated_files": generated_file_fingerprints,
+        "context_mode": context_mode,
+        "attachment_fallback": attachment_fallback,
+        "context_attachment_tokens": context_attachment_tokens,
+    }
+    return _short_hash(json.dumps(basis, ensure_ascii=False, sort_keys=True, default=str))
+
+
+def _build_openai_request_diagnostics(req_data: dict[str, Any], *, prompt: str, context_fingerprint: str = "") -> dict[str, Any]:
     messages = [message for message in (req_data.get("messages", []) or []) if isinstance(message, dict)]
     role_counts: dict[str, int] = {}
     assistant_tool_call_count = 0
@@ -117,6 +150,7 @@ def _build_openai_request_diagnostics(req_data: dict[str, Any], *, prompt: str) 
         "has_tool_results": tool_result_count > 0,
         "latest_user_hash": _short_hash(latest_user_text) if latest_user_text else "",
         "prompt_hash": _short_hash(prompt),
+        "context_fingerprint": str(context_fingerprint or ""),
     }
 
 
@@ -197,14 +231,22 @@ class _RepeatedToolRequestGuard:
         self.ttl_seconds = ttl_seconds
         self.max_entries = max_entries
         self.now = now
-        self._entries: dict[tuple[str, str, str], tuple[float, list[str]]] = {}
+        self._entries: dict[tuple[str, str, str, str], tuple[float, list[str]]] = {}
 
-    def record_tool_response(self, *, session_key: str, prompt_hash: str, latest_user_hash: str, tool_names: list[str]) -> None:
+    def record_tool_response(
+        self,
+        *,
+        session_key: str,
+        prompt_hash: str,
+        latest_user_hash: str,
+        tool_names: list[str],
+        context_fingerprint: str = "",
+    ) -> None:
         names = [name for name in dict.fromkeys(tool_names) if name]
         if not session_key or not prompt_hash or not latest_user_hash or not names:
             return
         self._prune()
-        self._entries[(session_key, prompt_hash, latest_user_hash)] = (self.now(), names)
+        self._entries[(session_key, prompt_hash, latest_user_hash, str(context_fingerprint or ""))] = (self.now(), names)
         if len(self._entries) > self.max_entries:
             oldest_key = min(self._entries, key=lambda key: self._entries[key][0])
             self._entries.pop(oldest_key, None)
@@ -216,22 +258,13 @@ class _RepeatedToolRequestGuard:
             return None
         prompt_hash = str(diagnostics.get("prompt_hash") or "")
         latest_user_hash = str(diagnostics.get("latest_user_hash") or "")
-        key = (session_key, prompt_hash, latest_user_hash)
-        if not all(key):
+        context_fingerprint = str(diagnostics.get("context_fingerprint") or "")
+        key = (session_key, prompt_hash, latest_user_hash, context_fingerprint)
+        if not session_key or not prompt_hash or not latest_user_hash:
             return None
-        exact = self._active_entry(key)
-        if exact is not None:
-            return exact
-        for candidate_key in list(self._entries):
-            candidate_session, _candidate_prompt_hash, candidate_user_hash = candidate_key
-            if candidate_session != session_key or candidate_user_hash != latest_user_hash:
-                continue
-            fallback = self._active_entry(candidate_key)
-            if fallback is not None:
-                return fallback
-        return None
+        return self._active_entry(key)
 
-    def _active_entry(self, key: tuple[str, str, str]) -> list[str] | None:
+    def _active_entry(self, key: tuple[str, str, str, str]) -> list[str] | None:
         entry = self._entries.get(key)
         if entry is None:
             return None
@@ -579,6 +612,7 @@ def _record_repeated_tool_guard(
             session_key=session_key,
             prompt_hash=str(item.get("prompt_hash") or ""),
             latest_user_hash=str(item.get("latest_user_hash") or ""),
+            context_fingerprint=str(item.get("context_fingerprint") or ""),
             tool_names=tool_names,
         )
 
@@ -656,7 +690,12 @@ async def chat_completions(request: Request):
     req_id = new_request_id()
     client_host = request.client.host if request.client else "-"
     early_standard_request = _build_standard_request(req_data, client_profile=client_profile)
-    early_diagnostics = _build_openai_request_diagnostics(req_data, prompt=early_standard_request.prompt)
+    early_context_fingerprint = _build_openai_context_fingerprint(req_data=req_data)
+    early_diagnostics = _build_openai_request_diagnostics(
+        req_data,
+        prompt=early_standard_request.prompt,
+        context_fingerprint=early_context_fingerprint,
+    )
     repeated_tool_names = _repeated_tool_request_guard.repeated_user_only_tool_request(
         session_key,
         early_diagnostics,
@@ -665,11 +704,12 @@ async def chat_completions(request: Request):
         notice = _build_repeated_tool_request_notice(repeated_tool_names, prompt=early_standard_request.prompt)
         with request_context(req_id=req_id, surface="openai", requested_model=early_standard_request.response_model, resolved_model=early_standard_request.resolved_model):
             log.warning(
-                "[OAI] repeated_user_only_tool_request req_id=%s completion_id=%s session=%s prompt_hash=%s tool_names=%s before_context_upload=True",
+                "[OAI] repeated_user_only_tool_request req_id=%s completion_id=%s session=%s prompt_hash=%s context_fingerprint=%s tool_names=%s before_context_upload=True",
                 req_id,
                 completion_id,
                 session_key,
                 early_diagnostics["prompt_hash"],
+                early_diagnostics["context_fingerprint"],
                 repeated_tool_names,
             )
         if early_standard_request.stream:
@@ -702,6 +742,7 @@ async def chat_completions(request: Request):
     standard_request.session_key = context_prepared["session_key"]
     standard_request.context_mode = context_prepared["context_mode"]
     standard_request.context_attachment_tokens = context_prepared.get("context_attachment_tokens", 0)
+    standard_request.context_fingerprint = _build_openai_context_fingerprint(req_data=req_data, context_prepared=context_prepared)
     standard_request.bound_account_email = context_prepared["bound_account_email"]
     standard_request.bound_account = context_prepared["bound_account"]
 
@@ -733,7 +774,11 @@ async def chat_completions(request: Request):
     tools = standard_request.tools
     history_messages = original_history_messages
 
-    diagnostics = _build_openai_request_diagnostics(req_data, prompt=prompt)
+    diagnostics = _build_openai_request_diagnostics(
+        req_data,
+        prompt=prompt,
+        context_fingerprint=standard_request.context_fingerprint,
+    )
     guard_diagnostics = early_diagnostics
 
     with request_context(req_id=req_id, surface="openai", requested_model=model_name, resolved_model=qwen_model):
@@ -748,11 +793,12 @@ async def chat_completions(request: Request):
             prompt[-500:],
         )
         log.info(
-            "[OAI] request_diag req_id=%s client=%s session=%s prompt_hash=%s messages=%s roles=%s assistant_tool_calls=%s tool_results=%s latest_user_hash=%s context_mode=%s upstream_files=%s completion_id=%s",
+            "[OAI] request_diag req_id=%s client=%s session=%s prompt_hash=%s context_fingerprint=%s messages=%s roles=%s assistant_tool_calls=%s tool_results=%s latest_user_hash=%s context_mode=%s upstream_files=%s completion_id=%s",
             req_id,
             client_host,
             standard_request.session_key,
             diagnostics["prompt_hash"],
+            diagnostics["context_fingerprint"],
             diagnostics["message_count"],
             diagnostics["role_counts"],
             diagnostics["assistant_tool_call_count"],
@@ -786,11 +832,12 @@ async def chat_completions(request: Request):
         if repeated_tool_names:
             notice = _build_repeated_tool_request_notice(repeated_tool_names, prompt=prompt)
             log.warning(
-                "[OAI] repeated_user_only_tool_request req_id=%s completion_id=%s session=%s prompt_hash=%s tool_names=%s",
+                "[OAI] repeated_user_only_tool_request req_id=%s completion_id=%s session=%s prompt_hash=%s context_fingerprint=%s tool_names=%s",
                 req_id,
                 completion_id,
                 standard_request.session_key,
                 diagnostics["prompt_hash"],
+                diagnostics["context_fingerprint"],
                 repeated_tool_names,
             )
             await _release_bound_account_before_short_circuit(app, standard_request)

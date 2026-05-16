@@ -90,6 +90,7 @@ class StandardRequest:
     session_key: str | None = None
     context_mode: str = "inline"
     context_attachment_tokens: int = 0
+    context_fingerprint: str = ""
     bound_account_email: str | None = None
     bound_account: Any | None = None
     stage_labels: dict[str, str] = field(default_factory=dict)

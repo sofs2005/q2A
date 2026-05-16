@@ -143,11 +143,29 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
             tool_enabled=True,
         )
         guard = v1_chat._RepeatedToolRequestGuard(now=lambda: 100.0)
-        prepared_diagnostics = v1_chat._build_openai_request_diagnostics(prepared_payload, prompt="rewritten prompt")
+        context_prepared = {
+            "payload": prepared_payload,
+            "upstream_files": ["file_1"],
+            "session_key": "session",
+            "context_mode": "file",
+            "bound_account_email": "bound@example.com",
+            "bound_account": bound_account,
+            "context_attachment_tokens": 10,
+        }
+        prepared_context_fingerprint = v1_chat._build_openai_context_fingerprint(
+            req_data=prepared_payload,
+            context_prepared=context_prepared,
+        )
+        prepared_diagnostics = v1_chat._build_openai_request_diagnostics(
+            prepared_payload,
+            prompt="rewritten prompt",
+            context_fingerprint=prepared_context_fingerprint,
+        )
         guard.record_tool_response(
             session_key="session",
             prompt_hash=prepared_diagnostics["prompt_hash"],
             latest_user_hash=prepared_diagnostics["latest_user_hash"],
+            context_fingerprint=prepared_diagnostics["context_fingerprint"],
             tool_names=["exec"],
         )
 
@@ -155,7 +173,7 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
              patch.object(v1_chat, "derive_session_key", return_value="session"), \
              patch.object(v1_chat, "_build_standard_request", side_effect=[early_standard_request, prepared_standard_request]), \
              patch.object(v1_chat, "_repeated_tool_request_guard", guard), \
-             patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value={"payload": prepared_payload, "upstream_files": ["file_1"], "session_key": "session", "context_mode": "file", "bound_account_email": "bound@example.com", "bound_account": bound_account, "context_attachment_tokens": 10})), \
+             patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value=context_prepared)), \
              patch.object(v1_chat, "plan_persistent_session_turn", AsyncMock(return_value=types.SimpleNamespace(enabled=False))), \
              patch.object(v1_chat, "run_retryable_completion_bridge", AsyncMock()):
             response = await v1_chat.chat_completions(request)

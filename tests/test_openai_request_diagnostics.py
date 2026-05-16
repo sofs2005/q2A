@@ -70,7 +70,7 @@ class OpenAIRequestDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(repeated, ["execute_code"])
 
-    def test_repeated_tool_request_guard_detects_replay_when_prompt_hash_drifts(self) -> None:
+    def test_repeated_tool_request_guard_ignores_prompt_hash_drift_without_final_record(self) -> None:
         guard = _RepeatedToolRequestGuard(ttl_seconds=60.0, now=lambda: 100.0)
         req_data = {"messages": [{"role": "user", "content": "检查 gateway 进程"}]}
         original = _build_openai_request_diagnostics(req_data, prompt="prompt before context upload")
@@ -84,13 +84,34 @@ class OpenAIRequestDiagnosticsTests(unittest.TestCase):
 
         repeated = guard.repeated_user_only_tool_request("session-1", replay)
 
-        self.assertEqual(repeated, ["execute_code"])
+        self.assertIsNone(repeated)
+
+    def test_repeated_tool_request_guard_ignores_replay_when_context_fingerprint_changes(self) -> None:
+        guard = _RepeatedToolRequestGuard(ttl_seconds=60.0, now=lambda: 100.0)
+        req_data = {"messages": [{"role": "user", "content": "生成一张图"}]}
+        original = _build_openai_request_diagnostics(req_data, prompt="same prompt", context_fingerprint="ctx-file-a")
+        replay = _build_openai_request_diagnostics(req_data, prompt="same prompt", context_fingerprint="ctx-file-b")
+        guard.record_tool_response(
+            session_key="session-1",
+            prompt_hash=original["prompt_hash"],
+            latest_user_hash=original["latest_user_hash"],
+            context_fingerprint=original["context_fingerprint"],
+            tool_names=["image_generate"],
+        )
+
+        repeated = guard.repeated_user_only_tool_request("session-1", replay)
+
+        self.assertIsNone(repeated)
 
     def test_record_repeated_tool_guard_stores_final_context_diagnostics(self) -> None:
         guard = _RepeatedToolRequestGuard(ttl_seconds=60.0, now=lambda: 100.0)
         req_data = {"messages": [{"role": "user", "content": "生成一张图"}]}
         early = _build_openai_request_diagnostics(req_data, prompt="early prompt")
-        final = _build_openai_request_diagnostics(req_data, prompt="final prompt with context attachment")
+        final = _build_openai_request_diagnostics(
+            req_data,
+            prompt="final prompt with context attachment",
+            context_fingerprint="ctx-file-a",
+        )
 
         _record_repeated_tool_guard(
             guard=guard,
