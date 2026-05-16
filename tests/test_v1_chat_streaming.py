@@ -102,6 +102,67 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         prepare_context_attachments.assert_not_awaited()
         self.assertTrue(chunks)
 
+    async def test_repeated_user_only_request_releases_bound_account_after_context_upload(self) -> None:
+        bound_account = types.SimpleNamespace(email="bound@example.com")
+        account_pool = types.SimpleNamespace(
+            acquire_wait_preferred=AsyncMock(return_value=None),
+            release=AsyncMock(),
+        )
+        app = types.SimpleNamespace(
+            state=types.SimpleNamespace(
+                users_db=object(),
+                qwen_client=object(),
+                file_store=None,
+                session_locks=_DummyLocks(),
+                account_pool=account_pool,
+            )
+        )
+        original_payload = {"messages": [{"role": "user", "content": "check process"}], "stream": False}
+        prepared_payload = {"messages": [{"role": "user", "content": "Current user request:\ncheck process"}], "stream": False}
+        request = _FakeRequest(app, original_payload)
+        early_standard_request = StandardRequest(
+            prompt="raw prompt",
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+            stream=False,
+            client_profile="openclaw_openai",
+            tool_names=["exec"],
+            tools=[{"name": "exec", "parameters": {}}],
+            tool_enabled=True,
+        )
+        prepared_standard_request = StandardRequest(
+            prompt="rewritten prompt",
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+            stream=False,
+            client_profile="openclaw_openai",
+            tool_names=["exec"],
+            tools=[{"name": "exec", "parameters": {}}],
+            tool_enabled=True,
+        )
+        guard = v1_chat._RepeatedToolRequestGuard(now=lambda: 100.0)
+        prepared_diagnostics = v1_chat._build_openai_request_diagnostics(prepared_payload, prompt="rewritten prompt")
+        guard.record_tool_response(
+            session_key="session",
+            prompt_hash=prepared_diagnostics["prompt_hash"],
+            latest_user_hash=prepared_diagnostics["latest_user_hash"],
+            tool_names=["exec"],
+        )
+
+        with patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
+             patch.object(v1_chat, "derive_session_key", return_value="session"), \
+             patch.object(v1_chat, "_build_standard_request", side_effect=[early_standard_request, prepared_standard_request]), \
+             patch.object(v1_chat, "_repeated_tool_request_guard", guard), \
+             patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value={"payload": prepared_payload, "upstream_files": ["file_1"], "session_key": "session", "context_mode": "file", "bound_account_email": "bound@example.com", "bound_account": bound_account, "context_attachment_tokens": 10})), \
+             patch.object(v1_chat, "plan_persistent_session_turn", AsyncMock(return_value=types.SimpleNamespace(enabled=False))), \
+             patch.object(v1_chat, "run_retryable_completion_bridge", AsyncMock()):
+            response = await v1_chat.chat_completions(request)
+
+        self.assertEqual(response.status_code, 200)
+        account_pool.release.assert_awaited_once_with(bound_account)
+
     async def test_streaming_response_yields_delta_before_finalize(self) -> None:
         app = types.SimpleNamespace(
             state=types.SimpleNamespace(

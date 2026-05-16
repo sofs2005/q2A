@@ -581,6 +581,17 @@ def _record_repeated_tool_guard(
         )
 
 
+async def _release_bound_account_before_short_circuit(app, standard_request: StandardRequest) -> None:
+    acc = getattr(standard_request, "bound_account", None)
+    if acc is None:
+        return
+    release_result = app.state.account_pool.release(acc)
+    if asyncio.iscoroutine(release_result):
+        await release_result
+    standard_request.bound_account = None
+    standard_request.bound_account_email = None
+
+
 def _build_standard_request(req_data: dict, *, client_profile: str) -> StandardRequest:
     standard_request = build_chat_standard_request(
         req_data,
@@ -758,6 +769,7 @@ async def chat_completions(request: Request):
                 diagnostics["prompt_hash"],
                 repeated_tool_names,
             )
+            await _release_bound_account_before_short_circuit(app, standard_request)
             if standard_request.stream:
                 return StreamingResponse(
                     _openai_text_stream_chunks(
