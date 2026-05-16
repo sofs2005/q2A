@@ -592,6 +592,28 @@ async def _release_bound_account_before_short_circuit(app, standard_request: Sta
     standard_request.bound_account_email = None
 
 
+def _stage_directive_tool_calls_if_missing(
+    *,
+    translator: OpenAIStreamTranslator | None,
+    directive,
+    staged_chunks: list[str],
+) -> None:
+    if translator is None or getattr(translator, "tool_calls_emitted", False):
+        return
+    if getattr(directive, "stop_reason", None) != "tool_use":
+        return
+    tool_calls = [
+        {"id": block["id"], "name": block["name"], "input": block.get("input", {})}
+        for block in getattr(directive, "tool_blocks", []) or []
+        if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id") and block.get("name")
+    ]
+    if not tool_calls:
+        return
+    translator.emit_tool_calls(tool_calls, split_arguments=False)
+    while translator.pending_chunks:
+        staged_chunks.append(translator.pending_chunks.pop(0))
+
+
 def _build_standard_request(req_data: dict, *, client_profile: str) -> StandardRequest:
     standard_request = build_chat_standard_request(
         req_data,
@@ -870,6 +892,11 @@ async def chat_completions(request: Request):
                                     final_diagnostics=diagnostics,
                                     tool_names=tool_names,
                                     finish_reason=final_finish_reason,
+                                )
+                                _stage_directive_tool_calls_if_missing(
+                                    translator=translator,
+                                    directive=directive,
+                                    staged_chunks=staged_chunks,
                                 )
                                 log.info(
                                     "[OAI] stream_final req_id=%s completion_id=%s chat_id=%s prompt_hash=%s finish_reason=%s stop_reason=%s tool_names=%s answer_chars=%s staged_chunks=%s",

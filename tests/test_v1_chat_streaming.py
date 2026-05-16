@@ -284,6 +284,76 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"tool_calls"', joined)
         self.assertIn('"finish_reason": "tool_calls"', joined)
 
+    async def test_final_tool_call_uses_execution_directive_when_no_tool_delta_was_streamed(self) -> None:
+        app = types.SimpleNamespace(
+            state=types.SimpleNamespace(
+                users_db=object(),
+                qwen_client=object(),
+                file_store=None,
+                session_locks=_DummyLocks(),
+                account_pool=types.SimpleNamespace(acquire_wait_preferred=AsyncMock(return_value=None)),
+            )
+        )
+        request = _FakeRequest(app, {"messages": [{"role": "user", "content": "hi"}], "stream": True})
+        standard_request = StandardRequest(
+            prompt="hi",
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+            stream=True,
+            client_profile="openclaw_openai",
+            tool_names=["image_generate"],
+            tools=[{"name": "image_generate", "parameters": {}}],
+            tool_enabled=True,
+        )
+        directive = types.SimpleNamespace(
+            stop_reason="tool_use",
+            tool_blocks=[{"type": "tool_use", "id": "call_1", "name": "image_generate", "input": {"prompt": "cat"}}],
+        )
+
+        async def fake_bridge(**kwargs):
+            await kwargs["on_attempt_start"](0, "prompt")
+            return types.SimpleNamespace(
+                execution=types.SimpleNamespace(
+                    chat_id="chat_1",
+                    state=types.SimpleNamespace(finish_reason="tool_calls", answer_text="", reasoning_text="", tool_calls=[]),
+                ),
+                directive=directive,
+                usage={"prompt_tokens": 2, "completion_tokens": 0, "total_tokens": 2},
+            )
+
+        chunks = []
+        with patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
+             patch.object(v1_chat, "derive_session_key", return_value="session"), \
+             patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value={"payload": request._payload, "upstream_files": [], "session_key": "session", "context_mode": "inline", "bound_account_email": None, "bound_account": None})), \
+             patch.object(v1_chat, "_build_standard_request", return_value=standard_request), \
+             patch.object(v1_chat, "plan_persistent_session_turn", AsyncMock(return_value=types.SimpleNamespace(enabled=False))), \
+             patch.object(v1_chat, "run_retryable_completion_bridge", new=fake_bridge), \
+             patch.object(v1_chat, "build_tool_directive", return_value=types.SimpleNamespace(stop_reason="end_turn", tool_blocks=[])), \
+             patch.object(v1_chat, "build_openai_assistant_history_message", return_value={"role": "assistant", "content": None, "tool_calls": []}), \
+             patch.object(v1_chat, "persist_session_turn", AsyncMock()), \
+             patch.object(v1_chat, "clear_invalidated_session_chat", AsyncMock()), \
+             patch.object(v1_chat, "update_request_context"):
+            response = await v1_chat.chat_completions(request)
+            self.assertIsInstance(response, StreamingResponse)
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+
+        payloads = [
+            json.loads(chunk[6:].strip())
+            for chunk in chunks
+            if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"
+        ]
+        tool_call_chunks = [
+            payload["choices"][0]["delta"]["tool_calls"][0]
+            for payload in payloads
+            if payload.get("choices") and payload["choices"][0]["delta"].get("tool_calls")
+        ]
+        self.assertEqual(len(tool_call_chunks), 1)
+        self.assertEqual(tool_call_chunks[0]["function"]["name"], "image_generate")
+        self.assertEqual(tool_call_chunks[0]["function"]["arguments"], json.dumps({"prompt": "cat"}, ensure_ascii=False))
+        self.assertIn('"finish_reason": "tool_calls"', "".join(chunks))
+
     async def test_streaming_response_does_not_leak_cross_chunk_tool_prefix(self) -> None:
         app = types.SimpleNamespace(
             state=types.SimpleNamespace(

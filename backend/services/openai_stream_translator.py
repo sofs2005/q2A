@@ -168,6 +168,8 @@ class OpenAIStreamTranslator:
                 if tool_calls:
                     self.emit_tool_calls(tool_calls, split_arguments=False)
                     final_finish_reason = "tool_calls"
+        elif self.tool_calls_emitted and finish_reason == "tool_calls":
+            self._discard_pending_content_chunks()
         else:
             for event in self.state_machine.flush(final_tool_use=finish_reason == "tool_calls"):
                 if event.type == "content" and event.text:
