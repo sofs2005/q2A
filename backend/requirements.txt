@@ -6,5 +6,4 @@ python-dotenv
 python-multipart
 tiktoken
 curl_cffi
-camoufox
 oss2

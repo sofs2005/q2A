@@ -41,8 +41,9 @@ async def get_system_status(request: Request):
             "description": "普通请求直连 HTTP，不经过浏览器",
         },
         "browser_automation": {
-            "mode": "on_demand_registration_only",
-            "description": "仅注册/激活/刷新 Token 时按需启动真实浏览器",
+            "mode": "disabled",
+            "available": False,
+            "description": "轻量无浏览器镜像不包含注册/激活/刷新 Token 的浏览器自动化能力",
         }
     }
 
@@ -114,31 +115,13 @@ async def list_accounts(request: Request):
 
 @router.post("/accounts/register", dependencies=[Depends(verify_admin)])
 async def register_new_account(request: Request):
-    """一键调用浏览器无头注册新千问账号"""
+    """无浏览器镜像不支持自动注册新千问账号。"""
     import logging
-    from backend.services.auth_resolver import register_qwen_account
-    from backend.core.account_pool import AccountPool
-    pool: AccountPool = request.app.state.account_pool
 
     log = logging.getLogger("backend.api.admin")
-
     client_ip = request.client.host if request.client else "127.0.0.1"
-    log.info(f"[注册] 管理员触发注册，来源IP: {client_ip}")
-
-    # 简单的频率限制保护
-    current = len(pool.accounts)
-    if current >= 100:
-        return {"ok": False, "error": "账号池已满，请先清理死号"}
-
-    try:
-        acc = await register_qwen_account()
-        if acc:
-            await pool.add(acc)
-            log.info(f"[注册] 注册成功: {acc.email}（当前账号数: {len(pool.accounts)}/100）")
-            return {"ok": True, "email": acc.email, "message": "新账号注册成功并已入池"}
-        return {"ok": False, "error": "自动化注册失败，可能遇到风控或页面元素改变"}
-    except Exception as e:
-        return {"ok": False, "error": f"注册发生异常: {str(e)}"}
+    log.info(f"[注册] 无浏览器模式拒绝自动注册请求，来源IP: {client_ip}")
+    return {"ok": False, "error": "轻量无浏览器镜像不支持自动注册，请手动添加账号 token"}
 
 @router.post("/verify", dependencies=[Depends(verify_admin)])
 async def verify_all_accounts(request: Request):
@@ -166,30 +149,13 @@ async def verify_all_accounts(request: Request):
 
 @router.post("/accounts/{email}/activate", dependencies=[Depends(verify_admin)])
 async def activate_account(email: str, request: Request):
-    """单独激活某个账号"""
-    from backend.services.auth_resolver import activate_account as activate_logic
-    from backend.core.account_pool import AccountPool
+    """无浏览器镜像不支持页面式账号激活。"""
+    import logging
 
-    pool: AccountPool = request.app.state.account_pool
-    acc = next((a for a in pool.accounts if a.email == email), None)
-    if not acc:
-        raise HTTPException(status_code=404, detail="Account not found")
-
-    # 防止并发点击：检查一个运行时标志
-    if getattr(acc, "_is_activating", False):
-        return {"ok": False, "error": "该账号正在激活中，请勿重复点击"}
-
-    try:
-        setattr(acc, "_is_activating", True)
-        success = await activate_logic(acc)
-        if success:
-            acc.valid = True
-            acc.activation_pending = False
-            await pool.add(acc) # 这会触发覆盖保存
-            return {"ok": True, "message": "账号激活成功"}
-        return {"ok": False, "error": "未能找到激活链接或获取Token"}
-    finally:
-        setattr(acc, "_is_activating", False)
+    log = logging.getLogger("backend.api.admin")
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    log.info(f"[激活] 无浏览器模式拒绝页面激活请求: {email}, 来源IP: {client_ip}")
+    return {"ok": False, "error": "轻量无浏览器镜像不支持页面激活，请手动获取 token 后重新添加账号"}
 
 @router.post("/accounts/{email}/verify", dependencies=[Depends(verify_admin)])
 async def verify_account(email: str, request: Request):

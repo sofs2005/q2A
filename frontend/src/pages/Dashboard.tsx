@@ -43,11 +43,11 @@ export default function Dashboard() {
           <div className="absolute inset-0 bg-gradient-to-br from-blue-500/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
           <div className="p-6 relative z-10">
             <div className="flex flex-row items-center justify-between space-y-0 pb-4">
-              <h3 className="tracking-tight text-sm font-semibold text-foreground/80 uppercase">当前并发引擎</h3>
+              <h3 className="tracking-tight text-sm font-semibold text-foreground/80 uppercase">请求运行模式</h3>
               <div className="p-2 bg-blue-500/10 rounded-lg"><Activity className="h-5 w-5 text-blue-400" /></div>
             </div>
-            <div className="text-4xl font-black bg-gradient-to-r from-foreground to-foreground/70 bg-clip-text text-transparent flex items-baseline gap-2">
-              {status?.browser_engine?.pool_size || 0} <span className="text-lg font-bold text-muted-foreground">Pages</span>
+            <div className="text-4xl font-black bg-gradient-to-r from-foreground to-foreground/70 bg-clip-text text-transparent">
+              {status?.request_runtime?.mode || "unknown"}
             </div>
           </div>
         </div>
@@ -56,12 +56,15 @@ export default function Dashboard() {
           <div className="absolute inset-0 bg-gradient-to-br from-destructive/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
           <div className="p-6 relative z-10">
             <div className="flex flex-row items-center justify-between space-y-0 pb-4">
-              <h3 className="tracking-tight text-sm font-semibold text-destructive uppercase">排队请求数</h3>
+              <h3 className="tracking-tight text-sm font-semibold text-destructive uppercase">浏览器自动化</h3>
               <div className="p-2 bg-destructive/10 rounded-lg"><ShieldAlert className="h-5 w-5 text-destructive" /></div>
             </div>
             <div className="text-4xl font-black text-destructive drop-shadow-[0_0_15px_rgba(239,68,68,0.3)]">
-              {status?.browser_engine?.queue || 0}
+              {status?.browser_automation?.mode || "unknown"}
             </div>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {status?.browser_automation?.available ? "可用" : "不可用"}
+            </p>
           </div>
         </div>
 
