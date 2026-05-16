@@ -8,9 +8,15 @@ from backend.core.config import settings
 class AccountPoolDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.original_min_interval_ms = settings.ACCOUNT_MIN_INTERVAL_MS
+        self.original_busy_timeout = getattr(settings, "ACCOUNT_BUSY_TIMEOUT_SECONDS", None)
 
     async def asyncTearDown(self) -> None:
         settings.ACCOUNT_MIN_INTERVAL_MS = self.original_min_interval_ms
+        if self.original_busy_timeout is None:
+            if hasattr(settings, "ACCOUNT_BUSY_TIMEOUT_SECONDS"):
+                delattr(settings, "ACCOUNT_BUSY_TIMEOUT_SECONDS")
+        else:
+            settings.ACCOUNT_BUSY_TIMEOUT_SECONDS = self.original_busy_timeout
 
     def _pool(self, *accounts: Account, max_inflight: int = 1) -> AccountPool:
         pool = AccountPool(db=None, max_inflight=max_inflight)
@@ -108,6 +114,20 @@ class AccountPoolDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pool.last_acquire_wait_diagnostics["timeout"], 0.0)
         self.assertEqual(pool.last_acquire_wait_diagnostics["snapshot"]["ready"], 0)
         self.assertEqual(pool.last_acquire_wait_diagnostics["snapshot"]["blocked_reasons"], {"busy": 1})
+
+    async def test_acquire_reclaims_stale_busy_account_after_timeout(self) -> None:
+        settings.ACCOUNT_BUSY_TIMEOUT_SECONDS = 30
+        stale = Account(email="stale@example.com")
+        stale.inflight = 1
+        stale.last_request_started = 100.0
+        pool = self._pool(stale)
+
+        with patch("backend.core.account_pool.time.time", return_value=131.0), patch("backend.core.account_pool._jitter_seconds", return_value=0.0):
+            selected = await pool.acquire()
+
+        self.assertIs(selected, stale)
+        self.assertEqual(stale.inflight, 1)
+        self.assertEqual(pool.last_acquire_diagnostics["selected_email"], "stale@example.com")
 
 
 if __name__ == "__main__":

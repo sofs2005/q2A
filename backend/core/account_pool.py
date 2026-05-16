@@ -134,6 +134,26 @@ class AccountPool:
     def get_by_email(self, email: str) -> Optional[Account]:
         return next((a for a in self.accounts if a.email == email), None)
 
+    def _reclaim_stale_inflight(self, now: float) -> None:
+        timeout = max(0.0, float(getattr(settings, "ACCOUNT_BUSY_TIMEOUT_SECONDS", 0) or 0))
+        if timeout <= 0:
+            return
+        for acc in self.accounts:
+            if acc.inflight <= 0 or acc.last_request_started <= 0:
+                continue
+            age = now - acc.last_request_started
+            if age < timeout:
+                continue
+            log.warning(
+                "[账号池] reclaim_stale_busy email=%s inflight=%s age=%.3fs timeout=%.3fs",
+                acc.email,
+                acc.inflight,
+                age,
+                timeout,
+            )
+            acc.inflight = 0
+            acc.last_request_finished = now
+
     def _account_diagnostic(self, acc: Account, now: float, exclude: set | None = None) -> dict:
         min_interval = max(0, settings.ACCOUNT_MIN_INTERVAL_MS) / 1000.0
         next_available_at = max(acc.rate_limited_until, acc.last_request_started + min_interval)
@@ -239,6 +259,7 @@ class AccountPool:
         preferred_block_reason = "missing"
         async with self._lock:
             now = time.time()
+            self._reclaim_stale_inflight(now)
             diagnostics = [self._account_diagnostic(acc, now, exclude) for acc in self.accounts]
             preferred_diag = next((item for item in diagnostics if item["email"] == preferred_email), None)
             preferred = next((a for a in self.accounts if a.email == preferred_email), None)
@@ -294,6 +315,7 @@ class AccountPool:
     async def acquire(self, exclude: set = None) -> Optional[Account]:
         async with self._lock:
             now = time.time()
+            self._reclaim_stale_inflight(now)
             diagnostics = [self._account_diagnostic(acc, now, exclude) for acc in self.accounts]
             ready_emails = {item["email"] for item in diagnostics if item["ready"]}
             ready = [a for a in self.accounts if a.email in ready_emails]
