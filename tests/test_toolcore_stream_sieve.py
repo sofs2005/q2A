@@ -151,6 +151,20 @@ class ToolStreamSieveTests(unittest.TestCase):
         text = "".join(event.get("text", "") for event in events if event.get("type") == "content")
         self.assertEqual(text, '`<|DSML|tool_calls><|DSML|invoke name="Read"></|DSML|invoke></|DSML|tool_calls>`')
 
+    def test_incomplete_dsml_tool_block_does_not_flush_as_text(self) -> None:
+        sieve = ToolStreamSieve(["bridge-23"])
+        sieve.process_chunk(
+            '<|DSML|tool_calls>\n'
+            '  <|DSML|invoke name="bridge-23">\n'
+            '    <|DSML|parameter name="query"><![CDATA[AI artificial intelligence open source LLM breakthrough last 2 hours]]></|DSML|parameter>\n'
+            '    <'
+        )
+        events = sieve.flush()
+
+        self.assertFalse(any(event.get("type") == "tool_calls" for event in events))
+        text = "".join(event.get("text", "") for event in events if event.get("type") == "content")
+        self.assertEqual(text, "")
+
     def test_incomplete_tool_block_flushes_as_text(self) -> None:
         sieve = ToolStreamSieve(["Read"])
         sieve.process_chunk('##TOOL_CALL##\n{"name": "Read"')
