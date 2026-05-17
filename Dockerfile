@@ -38,6 +38,6 @@ RUN mkdir -p /workspace/data /workspace/logs /workspace/frontend
 EXPOSE 7860
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${PORT:-7860}/healthz" || exit 1
+    CMD curl --max-time 5 -fsS "http://127.0.0.1:${PORT:-7860}/healthz" || exit 1
 
 CMD ["sh", "-c", "python -m uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-7860} --workers ${WORKERS:-1}"]

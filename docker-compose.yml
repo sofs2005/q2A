@@ -20,8 +20,9 @@ services:
       PORT: "7860"
       WORKERS: "1"
       LOG_LEVEL: "INFO"
+      DIAGNOSTIC_STACK_DUMP_ENABLED: "true"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:7860/healthz || exit 1"]
+      test: ["CMD-SHELL", "curl --max-time 5 -fsS http://localhost:7860/healthz || exit 1"]
       interval: 30s
       timeout: 10s
       start_period: 120s

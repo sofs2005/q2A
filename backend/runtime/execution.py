@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -474,6 +475,8 @@ async def collect_completion_run(
     tool_state = StreamingToolCallState()
     emitted_visible_output = False
     first_event_marked = False
+    answer_chunk_count = 0
+    answer_chars = 0
     raw_events: list[dict[str, Any]] = []
     metrics = StreamMetrics()
 
@@ -628,14 +631,36 @@ async def collect_completion_run(
 
         if phase == "answer" and content:
             answer_fragments.append(content)
+            answer_chunk_count += 1
+            answer_chars += len(content)
             emitted_visible_output = True
             if not first_event_marked:
                 metrics.mark("first_event", float(len(raw_events)))
                 first_event_marked = True
+            if answer_chunk_count % 100 == 0:
+                log.info(
+                    "[Collect] stream heartbeat chat_id=%s chunks=%s answer_chars=%s raw_events=%s",
+                    chat_id,
+                    answer_chunk_count,
+                    answer_chars,
+                    len(raw_events),
+                )
 
             # Tool Sieve 实时检测
             if tool_sieve:
+                sieve_started = time.perf_counter()
                 sieve_events = tool_sieve.process_chunk(content)
+                sieve_elapsed = time.perf_counter() - sieve_started
+                if sieve_elapsed > 0.05:
+                    log.warning(
+                        "[Collect] slow tool_sieve chat_id=%s elapsed=%.3fs chunk_chars=%s pending_chars=%s capture_chars=%s capturing=%s",
+                        chat_id,
+                        sieve_elapsed,
+                        len(content),
+                        len(getattr(tool_sieve, "pending", "")),
+                        len(getattr(tool_sieve, "capture", "")),
+                        getattr(tool_sieve, "capturing", False),
+                    )
                 for sieve_evt in sieve_events:
                     if sieve_evt.get("type") == "tool_calls":
                         # 检测到工具调用！
@@ -658,9 +683,23 @@ async def collect_completion_run(
             if on_delta is not None:
                 await on_delta(evt, content, None)
             if request.tools:
+                join_started = time.perf_counter()
                 answer_text = "".join(answer_fragments)
+                join_elapsed = time.perf_counter() - join_started
                 if len(answer_fragments) % 3 == 0 or "does not exist" in content.lower():
+                    blocked_started = time.perf_counter()
                     blocked_tool_names = extract_blocked_tool_names(answer_text.strip(), request.tool_names)
+                    blocked_elapsed = time.perf_counter() - blocked_started
+                    if join_elapsed + blocked_elapsed > 0.05:
+                        log.warning(
+                            "[Collect] slow tool_guard chat_id=%s elapsed=%.3fs join=%.3fs blocked=%.3fs answer_chars=%s chunks=%s",
+                            chat_id,
+                            join_elapsed + blocked_elapsed,
+                            join_elapsed,
+                            blocked_elapsed,
+                            len(answer_text),
+                            answer_chunk_count,
+                        )
                     if blocked_tool_names:
                         return _finalize_result(reason=f"blocked_tool_name:{blocked_tool_names[0]}")
                 if "##TOOL_CALL##" in answer_text or "<tool_call>" in answer_text:

@@ -105,6 +105,10 @@ class QwenExecutor:
         started_at = time.perf_counter()
         first_event_logged = False
         last_chunk_time = time.perf_counter()
+        chunk_count = 0
+        stream_chars = 0
+        parsed_event_count = 0
+        last_heartbeat_at = started_at
 
         # Log the actual feature_config being sent
         feature_config = payload.get("messages", [{}])[0].get("feature_config", {})
@@ -131,10 +135,25 @@ class QwenExecutor:
                     raise Exception(f"HTTP {chunk_result['status']}: {str(body)[:100]}")
 
                 if "chunk" in chunk_result:
-                    buffer += chunk_result["chunk"]
+                    chunk = chunk_result["chunk"]
+                    chunk_count += 1
+                    stream_chars += len(chunk)
+                    now = time.perf_counter()
+                    if chunk_count % 100 == 0 or now - last_heartbeat_at >= 60:
+                        last_heartbeat_at = now
+                        log.info(
+                            "[Executor] stream heartbeat chat_id=%s chunks=%s chars=%s parsed_events=%s elapsed=%.3fs",
+                            chat_id,
+                            chunk_count,
+                            stream_chars,
+                            parsed_event_count,
+                            now - started_at,
+                        )
+                    buffer += chunk
                     while "\n\n" in buffer:
                         msg, buffer = buffer.split("\n\n", 1)
                         for evt in parse_sse_chunk(msg):
+                            parsed_event_count += 1
                             if not first_event_logged:
                                 first_event_logged = True
                                 log.info(
@@ -153,6 +172,7 @@ class QwenExecutor:
 
         if buffer:
             for evt in parse_sse_chunk(buffer):
+                parsed_event_count += 1
                 if not first_event_logged:
                     first_event_logged = True
                     log.info(
@@ -160,7 +180,14 @@ class QwenExecutor:
                     )
                 yield evt
 
-        log.info(f"[Executor] stream finish chat_id={chat_id} total={(time.perf_counter() - started_at):.3f}s")
+        log.info(
+            "[Executor] stream finish chat_id=%s total=%.3fs chunks=%s chars=%s parsed_events=%s",
+            chat_id,
+            time.perf_counter() - started_at,
+            chunk_count,
+            stream_chars,
+            parsed_event_count,
+        )
 
     async def chat_stream_events_with_retry(
         self,

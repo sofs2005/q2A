@@ -1,5 +1,8 @@
 import asyncio
+import faulthandler
 import logging
+import signal
+import sys
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +20,7 @@ from backend.core.session_affinity import SessionAffinityStore
 from backend.core.upstream_file_cache import UpstreamFileCache
 from backend.core.session_lock import SessionLockRegistry
 from backend.core.request_logging import configure_logging, request_context
+from backend.core.diagnostics import install_stack_dump_handler
 from backend.services.qwen_client import QwenClient
 from backend.services.file_store import LocalFileStore
 from backend.toolcore.context_offload import ContextOffloader
@@ -28,6 +32,12 @@ from backend.services.garbage_collector import garbage_collect_chats
 from backend.services.context_cleanup import context_cleanup_loop
 
 configure_logging(getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
+install_stack_dump_handler(
+    settings=settings,
+    faulthandler_module=faulthandler,
+    signal_module=signal,
+    stream=sys.stderr,
+)
 log = logging.getLogger("qwen2api")
 
 @asynccontextmanager
