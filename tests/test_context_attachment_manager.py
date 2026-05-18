@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 from backend.services.context_attachment_manager import derive_session_key, prepare_context_attachments
 from backend.services.token_calc import count_tokens
-from backend.toolcore.context_offload import ContextOffloader
+from backend.toolcore.context_offload import ContextOffloader, SYSTEM_CONTEXT_PROMPT_NOTE
 
 
 class ContextAttachmentManagerTests(unittest.TestCase):
@@ -269,7 +269,23 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Subagent alias", tools_text)
         self.assertNotIn("Tool: bridge-2", tools_text)
 
-    async def test_large_prior_history_with_small_latest_user_stays_inline(self) -> None:
+    async def test_large_prior_history_with_small_latest_user_uploads_history_and_tools(self) -> None:
+        saved_texts = []
+
+        async def save_text(filename, text, content_type, purpose):
+            saved_texts.append(text)
+            return {
+                "id": filename,
+                "path": f"/tmp/{filename}",
+                "filename": filename,
+                "content_type": content_type,
+                "sha256": f"sha-{len(saved_texts)}",
+                "created_at": 1,
+            }
+
+        async def upload_local_file(_acc, local_meta):
+            return {"remote_ref": {"file_id": local_meta["sha256"], "filename": local_meta["filename"]}}
+
         app = SimpleNamespace(state=SimpleNamespace(
             context_offloader=ContextOffloader(SimpleNamespace(
                 CONTEXT_INLINE_MAX_CHARS=80,
@@ -277,12 +293,12 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
                 CONTEXT_ATTACHMENT_TTL_SECONDS=600,
             )),
             account_pool=SimpleNamespace(
-                acquire_wait=AsyncMock(),
-                acquire_wait_preferred=AsyncMock(),
+                acquire_wait=AsyncMock(return_value=SimpleNamespace(email="bot@example.com")),
+                acquire_wait_preferred=AsyncMock(return_value=SimpleNamespace(email="bot@example.com")),
                 release=lambda _acc: None,
             ),
             file_store=SimpleNamespace(
-                save_text=AsyncMock(),
+                save_text=save_text,
                 delete_path=AsyncMock(),
             ),
             session_affinity=SimpleNamespace(
@@ -294,7 +310,7 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
                 get=AsyncMock(return_value=None),
                 set=AsyncMock(),
             ),
-            upstream_file_uploader=SimpleNamespace(upload_local_file=AsyncMock()),
+            upstream_file_uploader=SimpleNamespace(upload_local_file=upload_local_file),
         ))
         payload = {
             "model": "gpt-4.1",
@@ -314,11 +330,11 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
             client_profile="openclaw_openai",
         )
 
-        self.assertEqual(result["context_mode"], "inline")
-        self.assertEqual(result["payload"]["messages"], payload["messages"])
-        self.assertEqual(result["upstream_files"], [])
-        app.state.account_pool.acquire_wait.assert_not_awaited()
-        app.state.file_store.save_text.assert_not_awaited()
+        self.assertEqual(result["context_mode"], "file")
+        self.assertEqual(len(result["upstream_files"]), 2)
+        self.assertTrue(any("Message 1 [assistant]" in text for text in saved_texts))
+        self.assertTrue(any("Available tool descriptions" in text for text in saved_texts))
+        self.assertIn(SYSTEM_CONTEXT_PROMPT_NOTE, result["payload"]["messages"][0]["content"])
 
     async def test_generated_context_ignores_existing_affinity_when_selecting_upload_account(self) -> None:
         async def save_text(filename, text, content_type, purpose):

@@ -105,23 +105,28 @@ class ContextOffloader:
 
     def plan(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, client_profile: str = "") -> ContextOffloadPlan:
         estimated = self.estimate_prompt_len(messages, tools=tools, client_profile=client_profile)
+        history_estimated = self.estimate_prompt_len(messages, tools=[], client_profile=client_profile)
+        tools_text = self._tools_context_text(tools)
+        history_needs_file = history_estimated > self.settings.CONTEXT_INLINE_MAX_CHARS
+        if not history_needs_file and not tools_text:
+            return ContextOffloadPlan(mode="inline", inline_messages=messages, estimated_prompt_len=estimated)
+
         user_messages = [message for message in messages if message.get("role") == "user"]
         latest_user = user_messages[-1] if user_messages else {"role": "user", "content": ""}
         latest_user_text = self._extract_text(latest_user)
-        if len(latest_user_text) <= self.settings.CONTEXT_INLINE_MAX_CHARS:
-            return ContextOffloadPlan(mode="inline", inline_messages=messages, estimated_prompt_len=estimated)
 
         serialized_parts: list[str] = []
-        for idx, msg in enumerate(messages or [], 1):
-            role = msg.get("role", "unknown")
-            text = self._extract_text(msg)
-            if not text.strip():
-                continue
-            serialized_parts.append(f"## Message {idx} [{role}]\n{text.strip()}\n")
+        if history_needs_file:
+            for idx, msg in enumerate(messages or [], 1):
+                role = msg.get("role", "unknown")
+                text = self._extract_text(msg)
+                if not text.strip():
+                    continue
+                serialized_parts.append(f"## Message {idx} [{role}]\n{text.strip()}\n")
         attachment_text = "\n".join(serialized_parts).strip()
         summary_text = attachment_text[:1200] if attachment_text else ""
 
-        if estimated <= self.settings.CONTEXT_FORCE_FILE_MAX_CHARS:
+        if history_estimated <= self.settings.CONTEXT_FORCE_FILE_MAX_CHARS:
             mode = "hybrid"
         else:
             mode = "file"
@@ -136,7 +141,6 @@ class ContextOffloader:
                     "text/plain",
                 )
             )
-        tools_text = self._tools_context_text(tools)
         if tools_text:
             generated_files.append(
                 self._make_file(

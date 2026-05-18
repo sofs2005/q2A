@@ -22,7 +22,7 @@ class ToolCoreContextOffloadTests(unittest.TestCase):
         self.assertEqual(plan.inline_messages, messages)
         self.assertEqual(plan.generated_files, [])
 
-    def test_plan_keeps_large_history_inline_when_latest_user_is_small(self) -> None:
+    def test_plan_offloads_large_history_even_when_latest_user_is_small(self) -> None:
         messages = [
             {"role": "assistant", "content": "A" * 120},
             {"role": "tool", "content": "tool output\n" * 20},
@@ -31,9 +31,11 @@ class ToolCoreContextOffloadTests(unittest.TestCase):
 
         plan = self.offloader.plan(messages, tools=[], client_profile="openclaw_openai")
 
-        self.assertEqual(plan.mode, "inline")
-        self.assertEqual(plan.inline_messages, messages)
-        self.assertEqual(plan.generated_files, [])
+        self.assertEqual(plan.mode, "file")
+        self.assertEqual(len(plan.generated_files), 1)
+        self.assertIn("Message 1 [assistant]", plan.generated_files[0].text)
+        self.assertIn("Message 2 [tool]", plan.generated_files[0].text)
+        self.assertIn(SYSTEM_CONTEXT_PROMPT_NOTE, plan.inline_messages[0]["content"])
 
     def test_plan_creates_file_mode_for_large_latest_user_input(self) -> None:
         messages = [
@@ -90,6 +92,26 @@ class ToolCoreContextOffloadTests(unittest.TestCase):
         self.assertIn("Tool: bridge-0", tools_file.text)
         self.assertNotIn("Tool: Skill", tools_file.text)
         self.assertIn("Run an available slash command skill.", tools_file.text)
+        self.assertIn('"skill"', tools_file.text)
+
+    def test_plan_adds_tools_context_file_even_when_latest_user_is_small(self) -> None:
+        messages = [{"role": "user", "content": "latest task"}]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Skill",
+                    "description": "Run an available slash command skill.",
+                    "parameters": {"type": "object", "properties": {"skill": {"type": "string"}}},
+                },
+            }
+        ]
+
+        plan = self.offloader.plan(messages, tools=tools, client_profile="openclaw_openai")
+
+        self.assertEqual(plan.mode, "hybrid")
+        tools_file = next(file for file in plan.generated_files if "Available tool descriptions" in file.text)
+        self.assertIn("Tool: bridge-0", tools_file.text)
         self.assertIn('"skill"', tools_file.text)
 
 
