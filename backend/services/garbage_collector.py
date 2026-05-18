@@ -1,6 +1,8 @@
 import asyncio
 import logging
 
+from backend.core.config import settings
+
 log = logging.getLogger("qwen2api.gc")
 
 
@@ -13,6 +15,9 @@ async def garbage_collect_chats(app):
     client = app.state.qwen_client
     while True:
         await asyncio.sleep(900)  # 15??
+        if not settings.UPSTREAM_AUTO_DELETE_ENABLED:
+            log.info("[GC] upstream auto delete disabled")
+            continue
         log.info("[GC] ??????????...")
         pool = client.account_pool
         active_chat_ids = app.state.session_affinity.active_chat_ids()

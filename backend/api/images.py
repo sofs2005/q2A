@@ -136,5 +136,5 @@ async def create_image(request: Request):
     finally:
         if acc is not None:
             client.account_pool.release(acc)
-            if chat_id:
+            if chat_id and settings.UPSTREAM_AUTO_DELETE_ENABLED:
                 asyncio.create_task(client.delete_chat(acc.token, chat_id))

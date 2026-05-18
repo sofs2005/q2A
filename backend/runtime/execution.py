@@ -1167,7 +1167,7 @@ async def cleanup_runtime_resources(client, acc, chat_id: str | None, *, preserv
         return
     token = getattr(acc, "token", None)
     client.account_pool.release(acc)
-    if preserve_chat:
+    if preserve_chat or not settings.UPSTREAM_AUTO_DELETE_ENABLED:
         return
     if chat_id and token:
         async def _delete_chat_later() -> None:
