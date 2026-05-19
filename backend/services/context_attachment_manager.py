@@ -104,11 +104,19 @@ def _fallback_context_attachment_result(
         summary_parts.append(
             f"User attachments were provided but attachment upload failed. Attachment names: {names}"
         )
-    latest_text = summary_parts[0] if summary_parts else fallback_message
-    fallback_payload["messages"] = [{
-        "role": "user",
-        "content": f"{latest_text}\n\n{SYSTEM_CONTEXT_PROMPT_NOTE}"
-    }]
+    fallback_messages: list[dict[str, Any]] = []
+    if summary_parts:
+        fallback_messages.append({
+            "role": "user",
+            "content": f"{summary_parts[0]}\n\n{SYSTEM_CONTEXT_PROMPT_NOTE}",
+        })
+    elif fallback_message:
+        fallback_messages.append({"role": "user", "content": fallback_message})
+    if use_generated_context_files and getattr(plan, "inline_messages", None):
+        fallback_messages.extend(plan.inline_messages)
+    else:
+        fallback_messages.extend(payload.get("messages", []) or [])
+    fallback_payload["messages"] = fallback_messages
     return {
         "payload": fallback_payload,
         "session_key": session_key,

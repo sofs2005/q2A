@@ -48,7 +48,8 @@ class ToolCoreContextOffloadTests(unittest.TestCase):
         self.assertEqual(plan.mode, "file")
         self.assertEqual(len(plan.generated_files), 1)
         self.assertIn("Message 1 [assistant]", plan.generated_files[0].text)
-        self.assertTrue(plan.inline_messages[0]["content"].endswith(SYSTEM_CONTEXT_PROMPT_NOTE))
+        self.assertEqual(plan.inline_messages[0]["content"], SYSTEM_CONTEXT_PROMPT_NOTE)
+        self.assertIn("B" * 20, plan.inline_messages[1]["content"])
 
     def test_plan_rewrites_large_latest_user_message_with_note(self) -> None:
         messages = [
@@ -58,8 +59,8 @@ class ToolCoreContextOffloadTests(unittest.TestCase):
 
         plan = self.offloader.plan(messages, tools=[], client_profile="openclaw_openai")
 
-        self.assertIn("latest task", plan.inline_messages[0]["content"])
-        self.assertIn(SYSTEM_CONTEXT_PROMPT_NOTE, plan.inline_messages[0]["content"])
+        self.assertEqual(plan.inline_messages[0]["content"], SYSTEM_CONTEXT_PROMPT_NOTE)
+        self.assertIn("latest task", plan.inline_messages[1]["content"])
 
     def test_plan_history_file_contains_large_latest_user_message(self) -> None:
         messages = [

@@ -151,14 +151,9 @@ class ContextOffloader:
                 )
             )
 
+        rewritten_messages = [{"role": "user", "content": SYSTEM_CONTEXT_PROMPT_NOTE}]
         if latest_user_text.strip():
-            latest_user_rewrite = (
-                "Current user request (inline copy; full conversation context may be attached):\n"
-                f"{latest_user_text.strip()}\n\n{SYSTEM_CONTEXT_PROMPT_NOTE}"
-            )
-        else:
-            latest_user_rewrite = SYSTEM_CONTEXT_PROMPT_NOTE
-        rewritten_messages = [{"role": "user", "content": latest_user_rewrite}]
+            rewritten_messages.append({"role": "user", "content": latest_user_text.strip()})
 
         return ContextOffloadPlan(
             mode=mode,

@@ -2,9 +2,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from backend.services.client_profiles import OPENCLAW_OPENAI_PROFILE
 from backend.services.context_attachment_manager import derive_session_key, prepare_context_attachments
 from backend.services.token_calc import count_tokens
 from backend.toolcore.context_offload import ContextOffloader, SYSTEM_CONTEXT_PROMPT_NOTE
+from backend.toolcore.prompt_builder import messages_to_prompt
 
 
 class ContextAttachmentManagerTests(unittest.TestCase):
@@ -335,6 +337,55 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("Message 1 [assistant]" in text for text in saved_texts))
         self.assertTrue(any("Available tool descriptions" in text for text in saved_texts))
         self.assertIn(SYSTEM_CONTEXT_PROMPT_NOTE, result["payload"]["messages"][0]["content"])
+
+    async def test_generated_context_fallback_preserves_latest_user_task(self) -> None:
+        app = SimpleNamespace(state=SimpleNamespace(
+            context_offloader=ContextOffloader(SimpleNamespace(
+                CONTEXT_INLINE_MAX_CHARS=80,
+                CONTEXT_FORCE_FILE_MAX_CHARS=160,
+                CONTEXT_ATTACHMENT_TTL_SECONDS=600,
+            )),
+            account_pool=SimpleNamespace(
+                acquire_wait=AsyncMock(return_value=None),
+                acquire_wait_preferred=AsyncMock(return_value=None),
+                release=lambda _acc: None,
+            ),
+            file_store=SimpleNamespace(save_text=AsyncMock(), delete_path=AsyncMock()),
+            session_affinity=SimpleNamespace(
+                get=AsyncMock(return_value=None),
+                bind_account=AsyncMock(),
+                add_uploaded_file=AsyncMock(),
+            ),
+            upstream_file_cache=SimpleNamespace(get=AsyncMock(return_value=None), set=AsyncMock()),
+            upstream_file_uploader=SimpleNamespace(upload_local_file=AsyncMock()),
+        ))
+        payload = {
+            "model": "gpt-4.1",
+            "messages": [
+                {"role": "user", "content": "You are a personal assistant running inside OpenClaw.\n" + "tooling\n" * 500},
+                {"role": "assistant", "content": "prior answer"},
+                {"role": "user", "content": "现在检查当前项目为什么工具不可见"},
+            ],
+            "tools": [{"name": "read", "description": "Read file contents", "parameters": {}}],
+        }
+
+        result = await prepare_context_attachments(
+            app=app,
+            payload=payload,
+            surface="openai",
+            auth_token="tok",
+            client_profile="openclaw_openai",
+        )
+
+        self.assertTrue(result["attachment_fallback"])
+        self.assertEqual(result["context_mode"], "inline")
+        contents = [message.get("content", "") for message in result["payload"]["messages"]]
+        self.assertTrue(any("现在检查当前项目为什么工具不可见" in content for content in contents))
+        self.assertEqual(contents[-1], "现在检查当前项目为什么工具不可见")
+
+        prompt = messages_to_prompt(result["payload"], client_profile=OPENCLAW_OPENAI_PROFILE).prompt
+        self.assertIn("Human (CURRENT TASK - TOP PRIORITY): 现在检查当前项目为什么工具不可见", prompt)
+        self.assertNotIn(f"Human (CURRENT TASK - TOP PRIORITY): {SYSTEM_CONTEXT_PROMPT_NOTE}", prompt)
 
     async def test_generated_context_ignores_existing_affinity_when_selecting_upload_account(self) -> None:
         async def save_text(filename, text, content_type, purpose):
