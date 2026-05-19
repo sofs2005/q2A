@@ -1,7 +1,7 @@
 import unittest
 
 from backend.adapter.standard_request import StandardRequest
-from backend.runtime.execution import RuntimeAttemptState, evaluate_retry_directive, extract_blocked_tool_names, should_retry_textual_tool_contract
+from backend.runtime.execution import RuntimeAttemptState, evaluate_retry_directive, extract_blocked_tool_names, request_max_attempts, should_retry_textual_tool_contract
 
 
 class ExecutionToolChoiceRetryTests(unittest.TestCase):
@@ -220,6 +220,13 @@ class ExecutionToolChoiceRetryTests(unittest.TestCase):
 
     def test_bridge_missing_tool_error_with_empty_mapping_does_not_retry(self) -> None:
         self.assertEqual(extract_blocked_tool_names("Tool bridge-7 does not exists.", []), [])
+
+    def test_auto_tool_requests_allow_two_recovery_retries(self) -> None:
+        request = self._request()
+        request.tool_choice_mode = "auto"
+        request.required_tool_name = None
+
+        self.assertEqual(request_max_attempts(request), 3)
 
 
 if __name__ == "__main__":

@@ -858,9 +858,7 @@ def build_usage_delta_factory(prompt: str, *, extra_prompt_tokens: int = 0) -> C
 def request_max_attempts(request: StandardRequest) -> int:
     if not request.tools:
         return settings.MAX_RETRIES
-    if getattr(request, "tool_choice_mode", "auto") == "required":
-        return 3
-    return 2
+    return 3
 
 
 def plan_runtime_attempts(request: StandardRequest, *, initial_prompt: str) -> RuntimeAttemptPlan:

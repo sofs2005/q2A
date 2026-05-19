@@ -35,6 +35,9 @@ class CompletionBridgeResult:
     directive: Any | None = None
 
 
+FINAL_BLOCKED_TOOL_FALLBACK = "The upstream model failed to call the requested tool through the bridge after retries. Please retry the request."
+
+
 def _truncate_preview(text: str, limit: int = 220) -> str:
     compact = " ".join(str(text or "").split())
     return compact[:limit] + ("..." if len(compact) > limit else "")
@@ -101,34 +104,49 @@ def _build_terminal_tool_guard_message(loop_message: str, history_messages: list
     return "\n".join(lines)
 
 
+def _replace_execution_state(execution: Any, **state_updates) -> Any:
+    if dataclasses.is_dataclass(execution.state):
+        patched_state = dataclasses.replace(execution.state, **state_updates)
+    else:
+        patched_state = execution.state
+        for key, value in state_updates.items():
+            setattr(patched_state, key, value)
+
+    if dataclasses.is_dataclass(execution):
+        return dataclasses.replace(execution, state=patched_state)
+    execution.state = patched_state
+    return execution
+
+
+def _apply_final_blocked_tool_fallback(execution: Any) -> Any:
+    if not getattr(execution.state, "blocked_tool_names", None):
+        return execution
+    if getattr(execution.state, "tool_calls", None):
+        return execution
+    return _replace_execution_state(
+        execution,
+        answer_text=FINAL_BLOCKED_TOOL_FALLBACK,
+        reasoning_text="",
+        tool_calls=[],
+        blocked_tool_names=[],
+        finish_reason="stop",
+    )
+
+
 def _apply_terminal_tool_guard(*, execution: Any, directive: RuntimeToolDirective, history_messages: list[dict[str, Any]] | None) -> tuple[Any, RuntimeToolDirective]:
     loop_message = detect_terminal_tool_loop(history_messages, directive)
     if not loop_message:
         return execution, directive
     fallback_message = _build_terminal_tool_guard_message(loop_message, history_messages)
 
-    if dataclasses.is_dataclass(execution.state):
-        patched_state = dataclasses.replace(
-            execution.state,
-            answer_text=fallback_message,
-            reasoning_text="",
-            tool_calls=[],
-            blocked_tool_names=[],
-            finish_reason="stop",
-        )
-    else:
-        patched_state = execution.state
-        patched_state.answer_text = fallback_message
-        patched_state.reasoning_text = ""
-        patched_state.tool_calls = []
-        patched_state.blocked_tool_names = []
-        patched_state.finish_reason = "stop"
-
-    if dataclasses.is_dataclass(execution):
-        patched_execution = dataclasses.replace(execution, state=patched_state)
-    else:
-        patched_execution = execution
-        patched_execution.state = patched_state
+    patched_execution = _replace_execution_state(
+        execution,
+        answer_text=fallback_message,
+        reasoning_text="",
+        tool_calls=[],
+        blocked_tool_names=[],
+        finish_reason="stop",
+    )
     patched_directive = RuntimeToolDirective(
         tool_blocks=[{"type": "text", "text": fallback_message}],
         stop_reason="end_turn",
@@ -251,6 +269,7 @@ async def run_retryable_completion_bridge(
                 await _reacquire_bound_account_if_needed(client=client, standard_request=standard_request)
                 continue
 
+            execution = _apply_final_blocked_tool_fallback(execution)
             directive = build_tool_directive(standard_request, execution.state)
             execution, directive = _apply_terminal_tool_guard(
                 execution=execution,

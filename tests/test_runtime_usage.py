@@ -116,6 +116,47 @@ class CompletionBridgeUsageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.usage["total_tokens"], result.usage["prompt_tokens"] + result.usage["completion_tokens"])
         add_tokens_mock.assert_awaited_once_with(users_db, "tok", result.usage["total_tokens"])
 
+    async def test_retryable_bridge_replaces_final_blocked_tool_error(self) -> None:
+        prompt = "prompt"
+        execution = SimpleNamespace(
+            state=SimpleNamespace(
+                answer_text="Tool exec does not exists.",
+                reasoning_text="",
+                tool_calls=[],
+                blocked_tool_names=["exec"],
+                finish_reason="stop",
+            ),
+            acc=None,
+            chat_id=None,
+        )
+        standard_request = StandardRequest(
+            prompt=prompt,
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+            tools=[{"name": "bridge-3", "parameters": {}}],
+            tool_names=["bridge-3"],
+            tool_enabled=True,
+        )
+
+        with patch.object(completion_bridge, "collect_completion_run", AsyncMock(return_value=execution)), \
+             patch.object(completion_bridge, "add_used_tokens", AsyncMock()), \
+             patch.object(completion_bridge, "cleanup_runtime_resources", AsyncMock()):
+            result = await completion_bridge.run_retryable_completion_bridge(
+                client=object(),
+                standard_request=standard_request,
+                prompt=prompt,
+                users_db=object(),
+                token="tok",
+                history_messages=[],
+                max_attempts=1,
+            )
+
+        self.assertNotEqual(result.execution.state.answer_text, "Tool exec does not exists.")
+        self.assertIn("upstream model", result.execution.state.answer_text)
+        self.assertEqual(result.execution.state.blocked_tool_names, [])
+        self.assertEqual(result.execution.state.tool_calls, [])
+
     async def test_retryable_bridge_fails_when_attachment_account_cannot_be_reacquired(self) -> None:
         prompt = "prompt"
         execution = SimpleNamespace(
