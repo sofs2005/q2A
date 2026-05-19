@@ -34,7 +34,7 @@ def sanitize_visible_answer_text(answer_text: str, *, tool_use: bool) -> str:
         positions.append(dsml_index)
     if not positions:
         return text
-    return text[:min(positions)].strip()
+    return ""
 
 
 def _client_visible_tool_name(name: str, tool_catalog) -> str:

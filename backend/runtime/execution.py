@@ -17,6 +17,7 @@ from backend.services.token_calc import completion_text_for_usage, count_tokens
 from backend.toolcore.directive_parser import parse_state_tool_calls, parse_textual_tool_calls
 from backend.toolcore.policy import evaluate_tool_policy, recent_same_tool_identity_count_in_turn
 from backend.toolcore.stream_sieve import ToolStreamSieve
+from backend.toolcall.markup_scan import contains_tool_markup_syntax_outside_ignored
 from backend.toolcall.runtime_tools import (
     is_list_directory_tool_name,
     is_read_tool_name,
@@ -177,7 +178,8 @@ def extract_blocked_tool_names(text: str, allowed_tool_names: list[str] | None =
     blocked = re.findall(r"Tool\s+([A-Za-z0-9_.:-]+)\s+does not exists?\.?", text)
     if not blocked:
         return []
-    return blocked
+    allowed = set(allowed_tool_names or [])
+    return [name for name in blocked if not re.fullmatch(r"bridge-\d+", name) or allowed_tool_names is None or name in allowed]
 
 
 def normalize_streamed_tool_calls(tool_calls: list[dict[str, Any]], allowed_tool_names: list[str] | None = None) -> list[dict[str, Any]]:
@@ -408,7 +410,7 @@ def should_retry_textual_tool_contract(answer_text: str) -> bool:
         return False
     if "##TOOL_CALL##" in answer_text or "<tool_call>" in answer_text:
         return True
-    return False
+    return contains_tool_markup_syntax_outside_ignored(answer_text)
 
 
 def native_tool_calls_to_markup(tool_calls: list[dict[str, Any]]) -> str:

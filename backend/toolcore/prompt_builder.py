@@ -370,6 +370,13 @@ def build_prompt_with_tools(
                 latest_short = latest_text[:900] + ("...[latest task truncated]" if len(latest_text) > 900 else "")
                 latest_user_line = f"Human (CURRENT TASK - TOP PRIORITY): {latest_short}"
 
+    if latest_user_line and len(history_parts) > 1:
+        duplicate_latest_line = latest_user_line.replace("Human (CURRENT TASK - TOP PRIORITY): ", "Human: ", 1)
+        for index in range(len(history_parts) - 1, -1, -1):
+            if history_parts[index] == duplicate_latest_line:
+                history_parts.pop(index)
+                break
+
     if tools and log.isEnabledFor(logging.DEBUG):
         tool_names = [tool.get("name", "") for tool in tools if tool.get("name")]
         tool_instruction_preview = _safe_preview(tools_part, 360)

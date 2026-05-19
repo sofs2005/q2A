@@ -89,6 +89,28 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
         self.assertIn("Human (CURRENT TASK - TOP PRIORITY): Now inspect README.md", result.prompt)
         self.assertTrue(result.prompt.endswith("Assistant:"))
 
+    def test_messages_to_prompt_does_not_duplicate_latest_user_when_current_task_is_added(self) -> None:
+        req_data = {
+            "messages": [
+                {"role": "user", "content": "Generated system context files may be attached with opaque filenames."},
+                {"role": "user", "content": "画绫波丽的日常真人版"},
+            ],
+            "tools": [
+                {
+                    "name": "image_generate",
+                    "description": "Generate an image from a prompt.",
+                    "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}},
+                }
+            ],
+        }
+
+        result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+        self.assertIn("Human: Generated system context files", result.prompt)
+        self.assertNotIn("Human: 画绫波丽的日常真人版\n\nHuman (CURRENT TASK", result.prompt)
+        self.assertIn("Human (CURRENT TASK - TOP PRIORITY): 画绫波丽的日常真人版", result.prompt)
+        self.assertTrue(result.prompt.endswith("Assistant:"))
+
     def test_messages_to_prompt_does_not_repeat_current_task_after_tool_result(self) -> None:
         req_data = {
             "messages": [

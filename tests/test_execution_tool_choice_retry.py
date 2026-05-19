@@ -1,7 +1,7 @@
 import unittest
 
 from backend.adapter.standard_request import StandardRequest
-from backend.runtime.execution import RuntimeAttemptState, evaluate_retry_directive
+from backend.runtime.execution import RuntimeAttemptState, evaluate_retry_directive, extract_blocked_tool_names, should_retry_textual_tool_contract
 
 
 class ExecutionToolChoiceRetryTests(unittest.TestCase):
@@ -156,6 +156,70 @@ class ExecutionToolChoiceRetryTests(unittest.TestCase):
         )
 
         self.assertFalse(retry.retry)
+
+    def test_incomplete_dsml_tool_contract_triggers_retry(self) -> None:
+        request = self._request()
+        request.tool_choice_mode = "auto"
+        request.required_tool_name = None
+        answer_text = '<|DSML|tool_calls>\n<|DSML|invoke name="Read">\n<|\n</|DSML|tool_calls>'
+
+        self.assertTrue(should_retry_textual_tool_contract(answer_text))
+
+        retry = evaluate_retry_directive(
+            request=request,
+            current_prompt="prompt",
+            history_messages=[],
+            attempt_index=0,
+            max_attempts=3,
+            state=RuntimeAttemptState(answer_text=answer_text),
+        )
+
+        self.assertTrue(retry.retry)
+        self.assertEqual(retry.reason, "unparsed_textual_tool_contract:Read")
+
+    def test_mapped_bridge_missing_tool_error_retries(self) -> None:
+        request = self._request()
+        request.tool_choice_mode = "auto"
+        request.required_tool_name = None
+        request.tool_names = ["bridge-7"]
+
+        blocked = extract_blocked_tool_names("Tool bridge-7 does not exists.", request.tool_names)
+        retry = evaluate_retry_directive(
+            request=request,
+            current_prompt="prompt",
+            history_messages=[],
+            attempt_index=0,
+            max_attempts=3,
+            state=RuntimeAttemptState(answer_text="Tool bridge-7 does not exists.", blocked_tool_names=blocked),
+            allow_after_visible_output=True,
+        )
+
+        self.assertEqual(blocked, ["bridge-7"])
+        self.assertTrue(retry.retry)
+        self.assertEqual(retry.reason, "blocked_tool_name:bridge-7")
+
+    def test_unmapped_bridge_missing_tool_error_does_not_retry(self) -> None:
+        request = self._request()
+        request.tool_choice_mode = "auto"
+        request.required_tool_name = None
+        request.tool_names = ["bridge-7"]
+
+        blocked = extract_blocked_tool_names("Tool bridge-999 does not exists.", request.tool_names)
+        retry = evaluate_retry_directive(
+            request=request,
+            current_prompt="prompt",
+            history_messages=[],
+            attempt_index=0,
+            max_attempts=3,
+            state=RuntimeAttemptState(answer_text="Tool bridge-999 does not exists.", blocked_tool_names=blocked),
+            allow_after_visible_output=True,
+        )
+
+        self.assertEqual(blocked, [])
+        self.assertFalse(retry.retry)
+
+    def test_bridge_missing_tool_error_with_empty_mapping_does_not_retry(self) -> None:
+        self.assertEqual(extract_blocked_tool_names("Tool bridge-7 does not exists.", []), [])
 
 
 if __name__ == "__main__":

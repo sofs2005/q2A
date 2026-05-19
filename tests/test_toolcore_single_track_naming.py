@@ -64,6 +64,43 @@ class ToolCoreSingleTrackNamingTests(unittest.TestCase):
 
 
 class BlockedToolGuardStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mixed_text_and_dsml_tool_call_strips_visible_text(self) -> None:
+        class FakeClient:
+            async def chat_stream_events_with_retry(self, *args, **kwargs):
+                yield {"type": "meta", "chat_id": "chat-1", "acc": None}
+                yield {
+                    "type": "event",
+                    "event": {
+                        "type": "delta",
+                        "phase": "answer",
+                        "content": (
+                            "检查 gateway.platforms.api_server 进程。\n"
+                            "<|DSML|tool_calls>\n"
+                            "<|DSML|invoke name=\"bridge-22\">\n"
+                            "<|DSML|parameter name=\"command\"><![CDATA[pgrep -f \"gateway.platforms.api_server\"]]></|DSML|parameter>\n"
+                            "</|DSML|invoke>\n"
+                            "</|DSML|tool_calls>"
+                        ),
+                    },
+                }
+
+        request = StandardRequest(
+            prompt="prompt",
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+            tools=[{"name": "bridge-22", "parameters": {}}],
+            tool_names=["bridge-22"],
+            tool_enabled=True,
+        )
+
+        result = await collect_completion_run(FakeClient(), request, "prompt")
+
+        self.assertEqual(result.state.finish_reason, "tool_calls")
+        self.assertEqual(result.state.answer_text, "")
+        self.assertEqual(result.state.tool_calls[0]["name"], "bridge-22")
+        self.assertEqual(result.state.tool_calls[0]["input"], {"command": 'pgrep -f "gateway.platforms.api_server"'})
+
     async def test_plain_chunks_do_not_trigger_periodic_full_answer_blocked_scan(self) -> None:
         class FakeClient:
             async def chat_stream_events_with_retry(self, *args, **kwargs):
