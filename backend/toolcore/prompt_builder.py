@@ -250,14 +250,6 @@ def build_prompt_with_tools(
                 )
             elif not isinstance(tool_content, str):
                 tool_content = str(tool_content)
-            if tools and client_profile == QWEN_CODE_OPENAI_PROFILE:
-                tool_result_limit = 12000
-            elif tools and client_profile == CLAUDE_CODE_OPENAI_PROFILE:
-                tool_result_limit = 6000
-            else:
-                tool_result_limit = 300
-            if len(tool_content) > tool_result_limit:
-                tool_content = tool_content[:tool_result_limit] + "...[truncated]"
             line = f"[Tool Result]{(' id=' + tool_call_id) if tool_call_id else ''}\n{tool_content}\n[/Tool Result]"
             if used + len(line) + 2 > budget and history_parts:
                 break
@@ -304,24 +296,6 @@ def build_prompt_with_tools(
         is_tool_result = role == "user" and (
             "[tool result" in lower_text or text.startswith("{") or '"results"' in text[:100]
         )
-        if client_profile == QWEN_CODE_OPENAI_PROFILE and tools:
-            if is_tool_result:
-                max_len = 10000
-            elif role == "assistant":
-                max_len = 700
-            else:
-                max_len = 2200
-        elif client_profile == CLAUDE_CODE_OPENAI_PROFILE and tools:
-            if is_tool_result:
-                max_len = 6000
-            elif role == "assistant":
-                max_len = 500
-            else:
-                max_len = 1600
-        else:
-            max_len = 600 if is_tool_result else 1400
-        if len(text) > max_len:
-            text = text[:max_len] + "...[truncated]"
         is_tool_result_only_user_msg = role == "user" and not user_text_only.strip() and bool(text.strip())
         prefix = "" if is_tool_result_only_user_msg else {"user": "Human: ", "assistant": "Assistant: ", "system": "System: ", "developer": "System: "}.get(role, "")
         line = text if is_tool_result_only_user_msg else f"{prefix}{text}"
@@ -342,7 +316,7 @@ def build_prompt_with_tools(
         )
         if first_user:
             first_text = _extract_user_text_only(first_user.get("content", ""), client_profile=client_profile)
-            first_short = first_text[:800] + ("...[original task truncated]" if len(first_text) > 800 else "")
+            first_short = first_text
             first_line = f"Human: {first_short}"
             if not history_parts or not history_parts[0].startswith(f"Human: {first_text[:60]}"):
                 first_line_cost = len(first_line) + 2
@@ -367,7 +341,7 @@ def build_prompt_with_tools(
         if latest_user:
             latest_text = _extract_user_text_only(latest_user.get("content", ""), client_profile=client_profile).strip()
             if latest_text:
-                latest_short = latest_text[:900] + ("...[latest task truncated]" if len(latest_text) > 900 else "")
+                latest_short = latest_text
                 latest_user_line = f"Human (CURRENT TASK - TOP PRIORITY): {latest_short}"
 
     if latest_user_line and len(history_parts) > 1:

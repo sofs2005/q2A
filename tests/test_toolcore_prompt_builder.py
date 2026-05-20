@@ -562,6 +562,106 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
         self.assertIn("Assistant: 助手回复 40", result.prompt)
         self.assertIn("Human (CURRENT TASK - TOP PRIORITY): 现在总结前面的上下文", result.prompt)
 
+    def test_messages_to_prompt_preserves_long_history_message_without_truncation(self) -> None:
+        long_history = "历史消息-" + "H" * 1700
+        req_data = {
+            "messages": [
+                {"role": "user", "content": long_history},
+                {"role": "assistant", "content": "简短回复"},
+                {"role": "user", "content": "现在继续"},
+            ],
+            "tools": [
+                {
+                    "name": "read",
+                    "description": "Read file contents",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }
+            ],
+        }
+
+        result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+        self.assertIn(long_history, result.prompt)
+        self.assertNotIn("...[truncated]", result.prompt)
+
+    def test_messages_to_prompt_preserves_latest_task_without_truncation(self) -> None:
+        latest_task = "当前任务-" + "L" * 1000
+        req_data = {
+            "messages": [
+                {"role": "user", "content": "先说明一下"},
+                {"role": "assistant", "content": "好的"},
+                {"role": "user", "content": latest_task},
+            ],
+            "tools": [
+                {
+                    "name": "read",
+                    "description": "Read file contents",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }
+            ],
+        }
+
+        result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+        self.assertIn(f"Human (CURRENT TASK - TOP PRIORITY): {latest_task}", result.prompt)
+        self.assertNotIn("...[latest task truncated]", result.prompt)
+
+    def test_messages_to_prompt_preserves_original_task_without_truncation(self) -> None:
+        original_task = "原始任务-" + "O" * 1000
+        messages = [{"role": "user", "content": original_task}]
+        for index in range(1, 10):
+            messages.append({"role": "assistant", "content": f"助手回复 {index} " + "A" * 120})
+            messages.append({"role": "user", "content": f"后续任务 {index} " + "B" * 120})
+        messages.append({"role": "assistant", "content": "最后的助手回复"})
+        messages.append({"role": "user", "content": "现在总结前面的内容"})
+        req_data = {
+            "messages": messages,
+            "tools": [
+                {
+                    "name": "read",
+                    "description": "Read file contents",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }
+            ],
+        }
+
+        result = messages_to_prompt(req_data, client_profile=QWEN_CODE_OPENAI_PROFILE)
+
+        self.assertIn(f"Human: {original_task}", result.prompt)
+        self.assertNotIn("...[original task truncated]", result.prompt)
+
+    def test_messages_to_prompt_preserves_tool_result_without_truncation(self) -> None:
+        tool_result = "工具返回-" + "T" * 600
+        req_data = {
+            "messages": [
+                {"role": "user", "content": "请读取文件"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "Read", "arguments": '{"file_path": "README.md"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": tool_result},
+            ],
+            "tools": [
+                {
+                    "name": "Read",
+                    "description": "Read file contents",
+                    "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}},
+                }
+            ],
+        }
+
+        result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+        self.assertIn(f"[Tool Result] id=call_1\n{tool_result}\n[/Tool Result]", result.prompt)
+        self.assertNotIn("...[truncated]", result.prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
