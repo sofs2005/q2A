@@ -62,7 +62,7 @@ class AccountPoolDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(by_email["invalid@example.com"]["ready"])
         self.assertEqual(by_email["invalid@example.com"]["selection_block_reason"], "invalid")
 
-    async def test_acquire_records_round_robin_selection_diagnostics(self) -> None:
+    async def test_acquire_records_least_loaded_selection_diagnostics(self) -> None:
         first = Account(email="first@example.com")
         first.last_request_started = 10.0
         second = Account(email="second@example.com")
@@ -73,9 +73,41 @@ class AccountPoolDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             selected = await pool.acquire()
 
         self.assertEqual(selected.email, "first@example.com")
-        self.assertEqual(pool.last_acquire_diagnostics["strategy"], "round_robin")
+        self.assertEqual(pool.last_acquire_diagnostics["strategy"], "least_loaded")
         self.assertEqual(pool.last_acquire_diagnostics["selected_email"], "first@example.com")
         self.assertEqual(pool.last_acquire_diagnostics["ready_count"], 2)
+
+    async def test_acquire_prefers_lower_inflight_before_older_usage(self) -> None:
+        busy_old = Account(email="busy-old@example.com")
+        busy_old.inflight = 1
+        busy_old.last_request_started = 10.0
+        idle_new = Account(email="idle-new@example.com")
+        idle_new.inflight = 0
+        idle_new.last_request_started = 90.0
+        pool = self._pool(busy_old, idle_new, max_inflight=2)
+
+        with patch("backend.core.account_pool.time.time", return_value=100.0), patch("backend.core.account_pool._jitter_seconds", return_value=0.0):
+            selected = await pool.acquire()
+
+        self.assertEqual(selected.email, "idle-new@example.com")
+        self.assertEqual(idle_new.inflight, 1)
+        self.assertEqual(busy_old.inflight, 1)
+        self.assertEqual(pool.last_acquire_diagnostics["strategy"], "least_loaded")
+
+    async def test_acquire_uses_email_tie_breaker_for_equal_load_and_usage(self) -> None:
+        later_email = Account(email="z-last@example.com")
+        later_email.last_request_started = 10.0
+        later_email.last_used = 20.0
+        earlier_email = Account(email="a-first@example.com")
+        earlier_email.last_request_started = 10.0
+        earlier_email.last_used = 20.0
+        pool = self._pool(later_email, earlier_email)
+
+        with patch("backend.core.account_pool.time.time", return_value=100.0), patch("backend.core.account_pool._jitter_seconds", return_value=0.0):
+            selected = await pool.acquire()
+
+        self.assertEqual(selected.email, "a-first@example.com")
+        self.assertEqual(pool.last_acquire_diagnostics["strategy"], "least_loaded")
 
     async def test_acquire_preferred_records_preferred_and_fallback_diagnostics(self) -> None:
         preferred = Account(email="preferred@example.com")

@@ -313,6 +313,7 @@ class AccountPool:
                     self._waiters.remove(evt)
 
     async def acquire(self, exclude: set = None) -> Optional[Account]:
+        strategy = "least_loaded"
         async with self._lock:
             now = time.time()
             self._reclaim_stale_inflight(now)
@@ -321,7 +322,7 @@ class AccountPool:
             ready = [a for a in self.accounts if a.email in ready_emails]
             if not ready:
                 self._record_acquire_diagnostics(
-                    strategy="round_robin",
+                    strategy=strategy,
                     selected_email=None,
                     diagnostics=diagnostics,
                     now=now,
@@ -329,20 +330,25 @@ class AccountPool:
                 )
                 return None
 
-            ready.sort(key=lambda a: (a.inflight, a.last_request_started or 0.0, a.last_used or 0.0))
+            ready.sort(key=lambda a: (
+                a.inflight,
+                a.last_request_started or 0.0,
+                a.last_used or 0.0,
+                a.email or "",
+            ))
             best = ready[0]
             best.inflight += 1
             best.last_used = now
             best.last_request_started = now + _jitter_seconds()
             self._sticky_email = best.email if len(ready) == 1 else None
             self._record_acquire_diagnostics(
-                strategy="round_robin",
+                strategy=strategy,
                 selected_email=best.email,
                 diagnostics=diagnostics,
                 now=now,
                 exclude=exclude,
             )
-            log.info("[账号池] acquire_selected strategy=round_robin email=%s ready=%s", best.email, self.last_acquire_diagnostics["ready_count"])
+            log.info("[账号池] acquire_selected strategy=%s email=%s ready=%s", strategy, best.email, self.last_acquire_diagnostics["ready_count"])
             return best
 
     async def acquire_wait(self, timeout: float = 60, exclude: set = None) -> Optional[Account]:
