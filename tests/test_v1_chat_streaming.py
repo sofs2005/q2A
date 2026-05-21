@@ -1,3 +1,4 @@
+import asyncio
 import json
 import types
 import unittest
@@ -251,6 +252,65 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(chunks[0], "data: chunk-1\n\n")
         self.assertEqual(chunks[-1], "data: FINAL-stop-7\n\n")
+
+    async def test_tool_streaming_plain_text_yields_before_bridge_finalizes(self) -> None:
+        app = types.SimpleNamespace(
+            state=types.SimpleNamespace(
+                users_db=object(),
+                qwen_client=object(),
+                file_store=None,
+                session_locks=_DummyLocks(),
+                account_pool=types.SimpleNamespace(acquire_wait_preferred=AsyncMock(return_value=None)),
+            )
+        )
+        request = _FakeRequest(app, {"messages": [{"role": "user", "content": "hi"}], "stream": True})
+        standard_request = StandardRequest(
+            prompt="hi",
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+            stream=True,
+            client_profile="openclaw_openai",
+            tool_names=["Read"],
+            tools=[{"name": "Read", "parameters": {}}],
+            tool_enabled=True,
+        )
+        bridge_can_finish = asyncio.Event()
+
+        async def fake_bridge(**kwargs):
+            await kwargs["on_attempt_start"](0, "prompt")
+            await kwargs["on_delta"]({"phase": "answer"}, "plain chunk", None)
+            await bridge_can_finish.wait()
+            return types.SimpleNamespace(
+                execution=types.SimpleNamespace(
+                    chat_id="chat_1",
+                    state=types.SimpleNamespace(finish_reason="stop", answer_text="plain chunk", reasoning_text="", tool_calls=[]),
+                ),
+                directive=types.SimpleNamespace(stop_reason="end_turn", tool_blocks=[]),
+                usage={"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+            )
+
+        with patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
+             patch.object(v1_chat, "derive_session_key", return_value="session"), \
+             patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value={"payload": request._payload, "upstream_files": [], "session_key": "session", "context_mode": "inline", "bound_account_email": None, "bound_account": None})), \
+             patch.object(v1_chat, "_build_standard_request", return_value=standard_request), \
+             patch.object(v1_chat, "plan_persistent_session_turn", AsyncMock(return_value=types.SimpleNamespace(enabled=False))), \
+             patch.object(v1_chat, "OpenAIStreamTranslator", _FakeTranslator), \
+             patch.object(v1_chat, "run_retryable_completion_bridge", new=fake_bridge), \
+             patch.object(v1_chat, "build_tool_directive", return_value=types.SimpleNamespace(stop_reason="end_turn", tool_blocks=[])), \
+             patch.object(v1_chat, "build_openai_assistant_history_message", return_value={"role": "assistant", "content": "plain chunk"}), \
+             patch.object(v1_chat, "persist_session_turn", AsyncMock()), \
+             patch.object(v1_chat, "clear_invalidated_session_chat", AsyncMock()), \
+             patch.object(v1_chat, "update_request_context"):
+            response = await v1_chat.chat_completions(request)
+            self.assertIsInstance(response, StreamingResponse)
+            iterator = response.body_iterator.__aiter__()
+            first_chunk = await asyncio.wait_for(iterator.__anext__(), timeout=0.2)
+            bridge_can_finish.set()
+            remaining = [chunk async for chunk in iterator]
+
+        self.assertEqual(first_chunk, "data: plain chunk\n\n")
+        self.assertEqual(remaining[-1], "data: FINAL-stop-5\n\n")
 
     async def test_final_tool_call_discards_staged_content_chunks(self) -> None:
         app = types.SimpleNamespace(

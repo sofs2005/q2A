@@ -26,7 +26,7 @@ from backend.toolcore.task_session import (
     persist_session_turn,
     plan_persistent_session_turn,
 )
-from backend.runtime.execution import RuntimeAttemptState, build_tool_directive, build_usage_delta_factory, request_max_attempts
+from backend.runtime.execution import RuntimeAttemptState, RuntimeToolDirective, build_tool_directive, build_usage_delta_factory, request_max_attempts
 
 log = logging.getLogger("qwen2api.chat")
 router = APIRouter()
@@ -545,7 +545,31 @@ def _log_openai_stream_sse_chunk(*, req_id: str, completion_id: str, prompt_hash
 
 
 
+def _openai_content_delta_text(chunk: str) -> str | None:
+    if not isinstance(chunk, str) or not chunk.startswith("data: "):
+        return None
+    data = chunk[6:].strip()
+    if not data or data == "[DONE]":
+        return None
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        return None
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    if not isinstance(choices, list) or not choices:
+        return None
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    delta = choice.get("delta") if isinstance(choice, dict) else {}
+    if not isinstance(delta, dict) or "content" not in delta:
+        return None
+    return str(delta.get("content") or "")
+
+
 def _is_openai_content_delta_chunk(chunk: str) -> bool:
+    return _openai_content_delta_text(chunk) is not None
+
+
+def _is_openai_tool_call_delta_chunk(chunk: str) -> bool:
     if not isinstance(chunk, str) or not chunk.startswith("data: "):
         return False
     data = chunk[6:].strip()
@@ -560,7 +584,7 @@ def _is_openai_content_delta_chunk(chunk: str) -> bool:
         return False
     choice = choices[0] if isinstance(choices[0], dict) else {}
     delta = choice.get("delta") if isinstance(choice, dict) else {}
-    return isinstance(delta, dict) and "content" in delta
+    return isinstance(delta, dict) and isinstance(delta.get("tool_calls"), list)
 
 
 def _filter_staged_chunks_for_tool_calls(chunks: list[str]) -> list[str]:
@@ -875,9 +899,12 @@ async def chat_completions(request: Request):
                             if standard_request.tools:
                                 translator: OpenAIStreamTranslator | None = None
                                 staged_chunks: list[str] = []
+                                emitted_tool_call_chunks: list[str] = []
+                                buffered_content_chars = 0
+                                min_stream_content_chars = 80
 
                                 async def on_attempt_start(_attempt_index: int, _attempt_prompt: str) -> None:
-                                    nonlocal translator, staged_chunks
+                                    nonlocal translator, staged_chunks, emitted_tool_call_chunks, buffered_content_chars
                                     translator = OpenAIStreamTranslator(
                                         completion_id=completion_id,
                                         created=created,
@@ -892,17 +919,40 @@ async def chat_completions(request: Request):
                                         tool_catalog=standard_request.tool_catalog,
                                     )
                                     staged_chunks = []
+                                    emitted_tool_call_chunks = []
+                                    buffered_content_chars = 0
+
+                                streamed_content_to_client = False
 
                                 async def on_retry(_attempt_index: int, _retry, _execution) -> None:
-                                    nonlocal staged_chunks
+                                    nonlocal staged_chunks, emitted_tool_call_chunks, buffered_content_chars
                                     staged_chunks = []
+                                    emitted_tool_call_chunks = []
+                                    buffered_content_chars = 0
 
                                 async def on_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
+                                    nonlocal staged_chunks, emitted_tool_call_chunks, streamed_content_to_client, buffered_content_chars
                                     if translator is None:
                                         return
                                     translator.on_delta(evt, text_chunk, tool_calls)
                                     while translator.pending_chunks:
-                                        staged_chunks.append(translator.pending_chunks.pop(0))
+                                        chunk = translator.pending_chunks.pop(0)
+                                        content_text = _openai_content_delta_text(chunk)
+                                        if content_text is None:
+                                            if _is_openai_tool_call_delta_chunk(chunk):
+                                                emitted_tool_call_chunks.append(chunk)
+                                            await queue.put(chunk)
+                                            continue
+                                        if streamed_content_to_client:
+                                            await queue.put(chunk)
+                                            continue
+                                        staged_chunks.append(chunk)
+                                        buffered_content_chars += len(content_text)
+                                        if buffered_content_chars >= min_stream_content_chars:
+                                            for staged_chunk in staged_chunks:
+                                                await queue.put(staged_chunk)
+                                            staged_chunks = []
+                                            streamed_content_to_client = True
 
                                 result = await run_retryable_completion_bridge(
                                     client=client,
@@ -924,6 +974,17 @@ async def chat_completions(request: Request):
                                 )
                                 execution = result.execution
                                 directive = result.directive or build_tool_directive(standard_request, execution.state)
+                                if streamed_content_to_client and directive.stop_reason == "tool_use":
+                                    log.warning(
+                                        "[OAI] suppress_tool_calls_after_streamed_content req_id=%s completion_id=%s prompt_hash=%s",
+                                        req_id,
+                                        completion_id,
+                                        diagnostics["prompt_hash"],
+                                    )
+                                    directive = RuntimeToolDirective(
+                                        tool_blocks=[{"type": "text", "text": execution.state.answer_text or ""}],
+                                        stop_reason="end_turn",
+                                    )
                                 assistant_message = build_openai_assistant_history_message(
                                     execution=execution,
                                     request=standard_request,
@@ -969,7 +1030,7 @@ async def chat_completions(request: Request):
                                         completion_id=completion_id,
                                         prompt_hash=diagnostics["prompt_hash"],
                                         standard_request=standard_request,
-                                        chunks=output_staged_chunks,
+                                        chunks=emitted_tool_call_chunks + output_staged_chunks,
                                     )
                                 for chunk in output_staged_chunks:
                                     await queue.put(chunk)
