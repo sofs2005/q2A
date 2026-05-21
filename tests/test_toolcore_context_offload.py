@@ -114,6 +114,25 @@ class ToolCoreContextOffloadTests(unittest.TestCase):
         self.assertEqual(plan.inline_messages[0]["content"], SYSTEM_CONTEXT_PROMPT_NOTE)
         self.assertEqual(plan.inline_messages[1]["content"], "请回复飞哥刚才问的灵性问题")
 
+    def test_plan_preserves_latest_user_text_after_untrusted_prefix(self) -> None:
+        messages = [
+            {"role": "user", "content": "上一轮问题"},
+            {"role": "assistant", "content": "上一轮回答"},
+            {
+                "role": "user",
+                "content": (
+                    "System (untrusted): [2026-05-19 08:01:14 GMT+8] 心跳信息。\n\n"
+                    "当前轮问题：请只回答 banana。\n\n"
+                    "Conversation info (untrusted metadata):\n```json\n{\"chat_id\": \"wechat:telphy\"}\n```"
+                ),
+            },
+        ]
+
+        plan = self.offloader.plan(messages, tools=[], client_profile="openclaw_openai")
+
+        self.assertEqual(plan.inline_messages[0]["content"], SYSTEM_CONTEXT_PROMPT_NOTE)
+        self.assertEqual(plan.inline_messages[1]["content"], "当前轮问题：请只回答 banana。")
+
     def test_plan_adds_tools_context_file_even_when_latest_user_is_small(self) -> None:
         messages = [{"role": "user", "content": "latest task"}]
         tools = [

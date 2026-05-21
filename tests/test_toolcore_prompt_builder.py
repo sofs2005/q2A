@@ -538,6 +538,35 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
         self.assertNotIn("CURRENT TASK - TOP PRIORITY): System (untrusted)", result.prompt)
         self.assertIn("Human (CURRENT TASK - TOP PRIORITY): 请回复飞哥刚才问的灵性问题", result.prompt)
 
+    def test_messages_to_prompt_preserves_latest_user_text_after_untrusted_prefix(self) -> None:
+        req_data = {
+            "messages": [
+                {"role": "user", "content": "上一轮问题"},
+                {"role": "assistant", "content": "上一轮回答"},
+                {
+                    "role": "user",
+                    "content": (
+                        "System (untrusted): [2026-05-19 08:01:14 GMT+8] 心跳信息。\n\n"
+                        "当前轮问题：请只回答 banana。\n\n"
+                        "Conversation info (untrusted metadata):\n```json\n{\"chat_id\": \"wechat:telphy\"}\n```"
+                    ),
+                },
+            ],
+            "tools": [
+                {
+                    "name": "read",
+                    "description": "Read file contents",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }
+            ],
+        }
+
+        result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+        self.assertNotIn("CURRENT TASK - TOP PRIORITY): 上一轮问题", result.prompt)
+        self.assertNotIn("CURRENT TASK - TOP PRIORITY): System (untrusted)", result.prompt)
+        self.assertIn("Human (CURRENT TASK - TOP PRIORITY): 当前轮问题：请只回答 banana。", result.prompt)
+
     def test_messages_to_prompt_preserves_full_openclaw_tool_history(self) -> None:
         messages = []
         for index in range(1, 41):

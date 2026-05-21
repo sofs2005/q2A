@@ -197,6 +197,34 @@ def is_user_role_system_text(text: str) -> bool:
     return bool(user_role_system_text(text))
 
 
+def strip_openclaw_untrusted_metadata(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned or not any(cleaned.startswith(prefix) for prefix in UNTRUSTED_METADATA_PREFIXES):
+        return cleaned
+
+    kept_lines: list[str] = []
+    lines = cleaned.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if any(stripped.startswith(prefix) for prefix in UNTRUSTED_METADATA_PREFIXES):
+            index += 1
+            while index < len(lines) and not lines[index].strip():
+                index += 1
+            if index < len(lines) and lines[index].strip().startswith("```"):
+                index += 1
+                while index < len(lines) and not lines[index].strip().startswith("```"):
+                    index += 1
+                if index < len(lines):
+                    index += 1
+            continue
+        kept_lines.append(line)
+        index += 1
+
+    return "\n".join(kept_lines).strip()
+
+
 def sanitize_openclaw_user_text(text: str) -> str:
     cleaned = text.strip()
     if not cleaned:
@@ -212,14 +240,10 @@ def sanitize_openclaw_user_text(text: str) -> str:
             return ""
     if any(marker in cleaned for marker in OPENCLAW_STARTUP_PATTERNS):
         return ""
-    if cleaned.startswith(OPENCLAW_UNTRUSTED_METADATA_PREFIX):
-        match = re.search(r"\n\n(\[[^\n]+\]\s*[\s\S]*)$", cleaned)
-        if match:
-            cleaned = match.group(1).strip()
-        else:
+    if any(cleaned.startswith(prefix) for prefix in UNTRUSTED_METADATA_PREFIXES):
+        cleaned = strip_openclaw_untrusted_metadata(cleaned)
+        if not cleaned:
             return ""
-    elif any(cleaned.startswith(prefix) for prefix in UNTRUSTED_METADATA_PREFIXES):
-        return ""
     lowered = cleaned.lower()
     if all(prefix in lowered for prefix in SKILL_BOOTSTRAP_PREFIXES) and "<available_skills>" in lowered:
         cleaned = re.sub(r"(?is)^.*?</available_skills>\s*", "", cleaned).strip()
@@ -394,5 +418,6 @@ __all__ = [
     "request_looks_like_coding_task",
     "sanitize_openclaw_user_text",
     "sanitize_runtime_prompt_text",
+    "strip_openclaw_untrusted_metadata",
     "is_agent_runtime_prose",
 ]

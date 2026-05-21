@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE
-from backend.services.client_profiles import OPENCLAW_OPENAI_PROFILE, sanitize_openclaw_user_text
+from backend.services.client_profiles import OPENCLAW_OPENAI_PROFILE, sanitize_openclaw_user_text, strip_openclaw_untrusted_metadata
 from backend.toolcore.prompt_contract import model_bridge_tool_name, normalize_prompt_tool
 
 SYSTEM_CONTEXT_FILE_PREFIX = "qwen2api_context"
@@ -81,7 +81,8 @@ class ContextOffloader:
         cleaned = text.strip()
         if not cleaned:
             return "", ""
-        if cleaned.startswith("System (untrusted):"):
+        cleaned = strip_openclaw_untrusted_metadata(cleaned)
+        if not cleaned:
             return "", ""
         if not cleaned.startswith(("## Memory Recall", "## Compiled Wiki")):
             return "", sanitize_openclaw_user_text(cleaned).strip()
