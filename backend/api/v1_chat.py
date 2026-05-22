@@ -463,6 +463,109 @@ def _log_outbound_tool_call_diagnostics(
         )
 
 
+def _openai_stream_chunk_summary(chunk: str) -> dict[str, Any] | None:
+    if not isinstance(chunk, str) or not chunk.startswith("data: "):
+        return None
+    data = chunk[6:].strip()
+    if not data:
+        return None
+    if data == "[DONE]":
+        return {"kind": "done"}
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        return {"kind": "parse_error", "bytes": len(chunk.encode("utf-8", errors="ignore"))}
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    if not isinstance(choices, list) or not choices:
+        return {"kind": "usage" if isinstance(payload, dict) and payload.get("usage") is not None else "empty_choices"}
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    delta = choice.get("delta") if isinstance(choice, dict) else {}
+    delta = delta if isinstance(delta, dict) else {}
+    tool_calls = delta.get("tool_calls")
+    tool_details = []
+    if isinstance(tool_calls, list):
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            function = function if isinstance(function, dict) else {}
+            arguments = function.get("arguments")
+            tool_details.append(
+                {
+                    "index": tool_call.get("index"),
+                    "id": tool_call.get("id"),
+                    "type": tool_call.get("type"),
+                    "name": function.get("name"),
+                    "has_arguments": isinstance(arguments, str),
+                    "arguments_chars": len(arguments) if isinstance(arguments, str) else 0,
+                }
+            )
+    return {
+        "kind": "choice",
+        "role": delta.get("role"),
+        "delta_keys": sorted(str(key) for key in delta.keys()),
+        "tool_details": tool_details,
+        "finish_reason": choice.get("finish_reason"),
+    }
+
+
+def _log_openai_stream_protocol_diagnostics(
+    *,
+    req_id: str,
+    completion_id: str,
+    prompt_hash: str,
+    chunks: list[str],
+) -> None:
+    summaries = [_openai_stream_chunk_summary(chunk) for chunk in chunks]
+    summaries = [summary for summary in summaries if summary is not None]
+    role_positions = [index for index, summary in enumerate(summaries) if summary.get("role") == "assistant"]
+    tool_positions = [index for index, summary in enumerate(summaries) if summary.get("tool_details")]
+    finish_positions = [
+        {"index": index, "finish_reason": summary.get("finish_reason")}
+        for index, summary in enumerate(summaries)
+        if summary.get("finish_reason") is not None
+    ]
+    usage_positions = [index for index, summary in enumerate(summaries) if summary.get("kind") == "usage"]
+    done_positions = [index for index, summary in enumerate(summaries) if summary.get("kind") == "done"]
+    first_role = role_positions[0] if role_positions else None
+    first_tool = tool_positions[0] if tool_positions else None
+    role_before_tool = first_role is not None and first_tool is not None and first_role < first_tool
+    sequence: list[str] = []
+    tool_details: list[dict[str, Any]] = []
+    for index, summary in enumerate(summaries[:12]):
+        if summary.get("kind") == "done":
+            sequence.append(f"{index}:done")
+            continue
+        if summary.get("kind") == "usage":
+            sequence.append(f"{index}:usage")
+            continue
+        if summary.get("kind") == "parse_error":
+            sequence.append(f"{index}:parse_error")
+            continue
+        if summary.get("role"):
+            sequence.append(f"{index}:role={summary.get('role')}")
+        for detail in summary.get("tool_details") or []:
+            sequence.append(f"{index}:tool={detail.get('name') or '<args>'}")
+            tool_details.append(detail)
+        if summary.get("finish_reason") is not None:
+            sequence.append(f"{index}:finish={summary.get('finish_reason')}")
+    log.info(
+        "[OAI] stream_tool_protocol req_id=%s completion_id=%s prompt_hash=%s chunks=%s role_positions=%s tool_positions=%s role_before_first_tool=%s finish_positions=%s usage_positions=%s done_positions=%s sequence=%s tool_details=%s",
+        req_id,
+        completion_id,
+        prompt_hash,
+        len(summaries),
+        role_positions,
+        tool_positions,
+        role_before_tool,
+        finish_positions,
+        usage_positions,
+        done_positions,
+        sequence,
+        tool_details,
+    )
+
+
 def _log_openai_stream_sse_chunk(*, req_id: str, completion_id: str, prompt_hash: str, chunk: str) -> None:
     if not isinstance(chunk, str) or not chunk.startswith("data: "):
         return
@@ -524,16 +627,17 @@ def _log_openai_stream_sse_chunk(*, req_id: str, completion_id: str, prompt_hash
                 }
             )
     finish_reason = choice.get("finish_reason")
-    if not tool_calls and finish_reason is None:
+    if not tool_calls and finish_reason is None and delta.get("role") is None:
         return
     content = str(delta.get("content") or "")
     log.info(
-        "[OAI] stream_sse_chunk req_id=%s completion_id=%s prompt_hash=%s choices=%s role=%s has_content=%s content_chars=%s content_preview=%r has_tool_calls=%s tool_names=%s tool_details=%s finish_reason=%s",
+        "[OAI] stream_sse_chunk req_id=%s completion_id=%s prompt_hash=%s choices=%s role=%s delta_keys=%s has_content=%s content_chars=%s content_preview=%r has_tool_calls=%s tool_names=%s tool_details=%s finish_reason=%s",
         req_id,
         completion_id,
         prompt_hash,
         len(choices),
         delta.get("role"),
+        sorted(str(key) for key in delta.keys()),
         "content" in delta,
         len(content),
         _truncate_log_value(content, limit=160),
@@ -899,12 +1003,13 @@ async def chat_completions(request: Request):
                             if standard_request.tools:
                                 translator: OpenAIStreamTranslator | None = None
                                 staged_chunks: list[str] = []
+                                emitted_protocol_chunks: list[str] = []
                                 emitted_tool_call_chunks: list[str] = []
                                 buffered_content_chars = 0
                                 min_stream_content_chars = 80
 
                                 async def on_attempt_start(_attempt_index: int, _attempt_prompt: str) -> None:
-                                    nonlocal translator, staged_chunks, emitted_tool_call_chunks, buffered_content_chars
+                                    nonlocal translator, staged_chunks, emitted_protocol_chunks, emitted_tool_call_chunks, buffered_content_chars
                                     translator = OpenAIStreamTranslator(
                                         completion_id=completion_id,
                                         created=created,
@@ -919,19 +1024,21 @@ async def chat_completions(request: Request):
                                         tool_catalog=standard_request.tool_catalog,
                                     )
                                     staged_chunks = []
+                                    emitted_protocol_chunks = []
                                     emitted_tool_call_chunks = []
                                     buffered_content_chars = 0
 
                                 streamed_content_to_client = False
 
                                 async def on_retry(_attempt_index: int, _retry, _execution) -> None:
-                                    nonlocal staged_chunks, emitted_tool_call_chunks, buffered_content_chars
+                                    nonlocal staged_chunks, emitted_protocol_chunks, emitted_tool_call_chunks, buffered_content_chars
                                     staged_chunks = []
+                                    emitted_protocol_chunks = []
                                     emitted_tool_call_chunks = []
                                     buffered_content_chars = 0
 
                                 async def on_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
-                                    nonlocal staged_chunks, emitted_tool_call_chunks, streamed_content_to_client, buffered_content_chars
+                                    nonlocal staged_chunks, emitted_protocol_chunks, emitted_tool_call_chunks, streamed_content_to_client, buffered_content_chars
                                     if translator is None:
                                         return
                                     translator.on_delta(evt, text_chunk, tool_calls)
@@ -939,6 +1046,7 @@ async def chat_completions(request: Request):
                                         chunk = translator.pending_chunks.pop(0)
                                         content_text = _openai_content_delta_text(chunk)
                                         if content_text is None:
+                                            emitted_protocol_chunks.append(chunk)
                                             if _is_openai_tool_call_delta_chunk(chunk):
                                                 emitted_tool_call_chunks.append(chunk)
                                             await queue.put(chunk)
@@ -1045,7 +1153,15 @@ async def chat_completions(request: Request):
                                         usage=usage,
                                         answer_text=execution.state.answer_text or "",
                                     )
-                                    for chunk in translator.finalize(final_finish_reason, usage=usage):
+                                    final_chunks = translator.finalize(final_finish_reason, usage=usage)
+                                    if final_finish_reason == "tool_calls":
+                                        _log_openai_stream_protocol_diagnostics(
+                                            req_id=req_id,
+                                            completion_id=completion_id,
+                                            prompt_hash=diagnostics["prompt_hash"],
+                                            chunks=emitted_protocol_chunks + output_staged_chunks + final_chunks,
+                                        )
+                                    for chunk in final_chunks:
                                         await queue.put(chunk)
                             else:
                                 translator = OpenAIStreamTranslator(

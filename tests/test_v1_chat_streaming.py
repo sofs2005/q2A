@@ -76,6 +76,30 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
                 chunk=chunk,
             )
 
+    def test_role_stream_chunk_is_logged_for_tool_protocol_debugging(self) -> None:
+        payload = {
+            "choices": [
+                {
+                    "delta": {"role": "assistant"},
+                    "finish_reason": None,
+                }
+            ]
+        }
+        chunk = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        with self.assertLogs("qwen2api.chat", level="INFO") as captured_logs:
+            v1_chat._log_openai_stream_sse_chunk(
+                req_id="req",
+                completion_id="chatcmpl-test",
+                prompt_hash="prompt-hash",
+                chunk=chunk,
+            )
+
+        output = "\n".join(captured_logs.output)
+        self.assertIn("role=assistant", output)
+        self.assertIn("delta_keys=['role']", output)
+        self.assertIn("has_tool_calls=False", output)
+
     async def test_repeated_user_only_request_short_circuits_before_context_upload(self) -> None:
         app = types.SimpleNamespace(
             state=types.SimpleNamespace(
@@ -614,6 +638,12 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("client_name=exec", log_output)
         self.assertIn("arguments_json_valid=True", log_output)
         self.assertIn("input_keys=['command']", log_output)
+        self.assertIn("[OAI] stream_tool_protocol", log_output)
+        self.assertIn("role_before_first_tool=True", log_output)
+        self.assertIn("sequence=['0:role=assistant', '1:tool=exec'", log_output)
+        self.assertIn("finish_positions=[{'index': 2, 'finish_reason': 'tool_calls'}]", log_output)
+        self.assertIn("usage_positions=[3]", log_output)
+        self.assertIn("done_positions=[4]", log_output)
 
     async def test_streaming_retry_does_not_leak_failed_attempt_text(self) -> None:
         app = types.SimpleNamespace(
