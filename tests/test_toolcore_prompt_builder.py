@@ -1,5 +1,9 @@
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from backend.services.client_profiles import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW_OPENAI_PROFILE, QWEN_CODE_OPENAI_PROFILE
 from backend.services.standard_request_builder import build_chat_standard_request
@@ -504,29 +508,231 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
         self.assertIn("Human (CURRENT TASK - TOP PRIORITY):", result.prompt)
         self.assertIn("请生成一张龙狼传真人版竖屏海报", result.prompt)
 
-    def test_messages_to_prompt_strips_skill_bootstrap_from_latest_user_line(self) -> None:
-        req_data = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "The following skills provide specialized instructions for specific tasks.\n\nUse the read tool to load a skill's file when the task matches its name.\n\n<available_skills>\n  <skill>\n    <name>agent-orchestrator</name>\n    <location>~/.openclaw/workspace/skills/agent-orchestrator/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>ai-daily-digest</name>\n    <location>~/.openclaw/workspace/skills/ai-daily-digest/SKILL.md</location>\n  </skill>\n</available_skills>\n\n请阅读本地脚本并解释它如何抓取限免信息",
+    def test_messages_to_prompt_injects_loaded_skill_context_before_current_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "skills" / "smart-search"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("# smart-search\nUse web fetch.", encoding="utf-8")
+
+            req_data = {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "The following skills provide specialized instructions for specific tasks.\n\n"
+                            "Use the read tool to load a skill's file when the task matches its name.\n\n"
+                            "<available_skills>\n"
+                            "  <skill>\n"
+                            "    <name>smart-search</name>\n"
+                            f"    <location>{skill_dir / 'SKILL.md'}</location>\n"
+                            "  </skill>\n"
+                            "</available_skills>\n\n"
+                            "请用 smart-search 找今日资料"
+                        ),
+                    },
+                ],
+                "tools": [],
+                "_skill_catalog": {
+                    "smart-search": {"location": str(skill_dir / "SKILL.md")}
                 },
-            ],
-            "tools": [
-                {
-                    "name": "read",
-                    "description": "Read file contents",
-                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
-                }
-            ],
-        }
+            }
 
-        result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+            with patch.dict(os.environ, {"QWEN2API_SKILL_ROOTS": str(root / "skills")}):
+                result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
 
-        self.assertNotIn("The following skills provide specialized instructions", result.prompt)
-        self.assertNotIn("<available_skills>", result.prompt)
-        self.assertNotIn("agent-orchestrator", result.prompt)
-        self.assertIn("请阅读本地脚本并解释它如何抓取限免信息", result.prompt)
+            self.assertIn("# smart-search", result.prompt)
+            self.assertNotIn("<available_skills>", result.prompt)
+            self.assertNotIn("The following skills provide specialized instructions", result.prompt)
+            self.assertLess(result.prompt.index("# smart-search"), result.prompt.index("Human (CURRENT TASK - TOP PRIORITY): 请用 smart-search 找今日资料"))
+            self.assertNotIn("Human: 请用 smart-search 找今日资料", result.prompt)
+            self.assertTrue(result.prompt.endswith("Assistant:"))
+
+    def test_messages_to_prompt_extracts_skill_catalog_from_bootstrap_when_no_carrier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "skills" / "smart-search"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("# smart-search\nUse web fetch.", encoding="utf-8")
+
+            req_data = {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "The following skills provide specialized instructions for specific tasks.\n\n"
+                            "Use the read tool to load a skill's file when the task matches its name.\n\n"
+                            "<available_skills>\n"
+                            "  <skill>\n"
+                            "    <name>smart-search</name>\n"
+                            f"    <location>{skill_dir / 'SKILL.md'}</location>\n"
+                            "  </skill>\n"
+                            "</available_skills>\n\n"
+                            "请用 smart-search 找今日资料"
+                        ),
+                    },
+                ],
+                "tools": [],
+            }
+
+            with patch.dict(os.environ, {"QWEN2API_SKILL_ROOTS": str(root / "skills")}):
+                result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+            self.assertIn("# smart-search", result.prompt)
+            self.assertNotIn("<available_skills>", result.prompt)
+            self.assertIn("Human (CURRENT TASK - TOP PRIORITY): 请用 smart-search 找今日资料", result.prompt)
+            self.assertTrue(result.prompt.endswith("Assistant:"))
+
+    def test_messages_to_prompt_uses_explicit_skill_catalog_for_non_openclaw_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "skills" / "smart-search"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("# smart-search\nUse web fetch.", encoding="utf-8")
+
+            req_data = {
+                "messages": [{"role": "user", "content": "please use smart-search"}],
+                "tools": [],
+                "_skill_catalog": {"smart-search": {"location": str(skill_dir / "SKILL.md")}},
+            }
+
+            with patch.dict(os.environ, {"QWEN2API_SKILL_ROOTS": str(root / "skills")}):
+                result = messages_to_prompt(req_data, client_profile=CLAUDE_CODE_OPENAI_PROFILE)
+
+            self.assertIn("# smart-search", result.prompt)
+            self.assertIn("Human (CURRENT TASK - TOP PRIORITY): please use smart-search", result.prompt)
+            self.assertTrue(result.prompt.endswith("Assistant:"))
+
+    def test_messages_to_prompt_skips_unsafe_skill_location(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "skills" / "smart-search"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "secret.txt").write_text("SECRET CONTEXT", encoding="utf-8")
+
+            req_data = {
+                "messages": [{"role": "user", "content": "请用 smart-search 找今日资料"}],
+                "tools": [],
+                "_skill_catalog": {
+                    "smart-search": {"location": str(skill_dir / "secret.txt")}
+                },
+            }
+
+            with patch.dict(os.environ, {"QWEN2API_SKILL_ROOTS": str(root / "skills")}):
+                result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+            self.assertNotIn("SECRET CONTEXT", result.prompt)
+            self.assertIn("Human: 请用 smart-search 找今日资料", result.prompt)
+            self.assertNotIn("CURRENT TASK - TOP PRIORITY", result.prompt)
+            self.assertTrue(result.prompt.endswith("Assistant:"))
+
+    def test_messages_to_prompt_skips_skill_location_outside_trusted_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trusted_root = root / "trusted" / "skills"
+            trusted_root.mkdir(parents=True)
+            outside_skill_dir = root / "outside" / "skills" / "smart-search"
+            outside_skill_dir.mkdir(parents=True)
+            (outside_skill_dir / "SKILL.md").write_text("SECRET CONTEXT", encoding="utf-8")
+
+            req_data = {
+                "messages": [{"role": "user", "content": "请用 smart-search 找今日资料"}],
+                "tools": [],
+                "_skill_catalog": {"smart-search": {"location": str(outside_skill_dir / "SKILL.md")}},
+            }
+
+            with patch.dict(os.environ, {"QWEN2API_SKILL_ROOTS": str(trusted_root)}):
+                result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+            self.assertNotIn("SECRET CONTEXT", result.prompt)
+            self.assertIn("Human: 请用 smart-search 找今日资料", result.prompt)
+            self.assertNotIn("CURRENT TASK - TOP PRIORITY", result.prompt)
+            self.assertTrue(result.prompt.endswith("Assistant:"))
+
+    def test_messages_to_prompt_skips_non_utf8_skill_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "skills" / "smart-search"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_bytes(b"\xff\xfe")
+
+            req_data = {
+                "messages": [{"role": "user", "content": "请用 smart-search 找今日资料"}],
+                "tools": [],
+                "_skill_catalog": {"smart-search": {"location": str(skill_dir / "SKILL.md")}},
+            }
+
+            with patch.dict(os.environ, {"QWEN2API_SKILL_ROOTS": str(root / "skills")}):
+                result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+            self.assertIn("Human: 请用 smart-search 找今日资料", result.prompt)
+            self.assertNotIn("CURRENT TASK - TOP PRIORITY", result.prompt)
+            self.assertTrue(result.prompt.endswith("Assistant:"))
+
+    def test_messages_to_prompt_does_not_repeat_current_task_during_skill_tool_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "skills" / "smart-search"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("# smart-search\nUse web fetch.", encoding="utf-8")
+
+            req_data = {
+                "messages": [
+                    {"role": "user", "content": "请用 smart-search 读取 README"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "Read", "arguments": '{"file_path": "README.md"}'},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "README content"},
+                ],
+                "tools": [
+                    {
+                        "name": "Read",
+                        "description": "Read file contents",
+                        "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}},
+                    }
+                ],
+                "_skill_catalog": {
+                    "smart-search": {"location": str(skill_dir / "SKILL.md")}
+                },
+            }
+
+            with patch.dict(os.environ, {"QWEN2API_SKILL_ROOTS": str(root / "skills")}):
+                result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+            self.assertIn("# smart-search", result.prompt)
+            self.assertIn("[Tool Result] id=call_1\nREADME content\n[/Tool Result]", result.prompt)
+            self.assertNotIn("Human (CURRENT TASK - TOP PRIORITY): 请用 smart-search 读取 README", result.prompt)
+            self.assertTrue(result.prompt.endswith("Assistant:"))
+
+    def test_messages_to_prompt_leaves_prompt_unchanged_when_no_skill_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "smart-search"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text("# smart-search\nUse web fetch.", encoding="utf-8")
+
+            req_data = {
+                "messages": [{"role": "user", "content": "请总结当前项目的状态"}],
+                "tools": [],
+                "_skill_catalog": {
+                    "smart-search": {"location": str(skill_dir / "SKILL.md")}
+                },
+            }
+
+            result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+            self.assertNotIn("# smart-search", result.prompt)
+            self.assertNotIn("CURRENT TASK - TOP PRIORITY", result.prompt)
+            self.assertIn("Human: 请总结当前项目的状态", result.prompt)
+            self.assertTrue(result.prompt.endswith("Assistant:"))
 
     def test_messages_to_prompt_skips_untrusted_metadata_as_latest_task(self) -> None:
         req_data = {

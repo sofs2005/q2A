@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from backend.skills.adapters import extract_skill_catalog_from_messages
+from backend.skills.catalog import normalize_skill_catalog
 from backend.toolcore.prompt_contract import model_bridge_tool_name
 from backend.toolcore.types import (
     CanonicalToolCall,
@@ -24,6 +26,12 @@ __all__ = [
 
 def _dict_or_empty(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _normalize_skill_catalog(raw_skill_catalog: Any, messages: list[dict[str, Any]], client_profile: str) -> Any:
+    if raw_skill_catalog is not None:
+        return normalize_skill_catalog(raw_skill_catalog)
+    return extract_skill_catalog_from_messages(messages, client_profile=client_profile)
 
 
 def _normalize_messages(raw_messages: Any) -> list[dict[str, Any]]:
@@ -208,6 +216,7 @@ def to_prompt_payload(request: ToolCoreRequest, *, model: str, stream: bool = Fa
         "tool_choice": tool_choice,
         "stream": stream,
         "_tool_catalog": request.tool_catalog,
+        "_skill_catalog": request.skill_catalog,
     }
 
 
@@ -321,6 +330,8 @@ def normalize_chat_request(req_data: dict[str, Any], *, excluded_tool_names: set
         if str(message.get("role") or "").strip().lower() == "assistant":
             tool_calls.extend(_canonical_tool_call_from_assistant_message(message, declared_tool_names))
 
+    skill_catalog = _normalize_skill_catalog(req_data.get("_skill_catalog"), messages, str(req_data.get("client_profile") or ""))
+
     return ToolCoreRequest(
         messages=messages,
         tools=tools,
@@ -329,6 +340,7 @@ def normalize_chat_request(req_data: dict[str, Any], *, excluded_tool_names: set
         tool_calls=tool_calls,
         raw_tool_choice=raw_tool_choice,
         tool_catalog=tool_catalog,
+        skill_catalog=skill_catalog,
     )
 
 
@@ -348,6 +360,7 @@ def normalize_responses_request(req_data: dict[str, Any]) -> ToolCoreRequest:
             tool_calls.extend(_canonical_tool_call_from_assistant_message(message, declared_tool_names))
 
     tool_results = _normalize_function_call_output(req_data.get("function_call_output"))
+    skill_catalog = _normalize_skill_catalog(req_data.get("_skill_catalog"), messages, str(req_data.get("client_profile") or ""))
 
     return ToolCoreRequest(
         messages=messages,
@@ -358,6 +371,7 @@ def normalize_responses_request(req_data: dict[str, Any]) -> ToolCoreRequest:
         tool_results=tool_results,
         raw_tool_choice=raw_tool_choice,
         tool_catalog=tool_catalog,
+        skill_catalog=skill_catalog,
     )
 
 
@@ -371,6 +385,8 @@ def normalize_anthropic_request(req_data: dict[str, Any]) -> ToolCoreRequest:
     if raw_tool_choice is not None and not tools:
         raise ValueError("tool_choice provided but no tools declared")
 
+    skill_catalog = _normalize_skill_catalog(req_data.get("_skill_catalog"), messages, str(req_data.get("client_profile") or ""))
+
     return ToolCoreRequest(
         messages=messages,
         tools=tools,
@@ -378,6 +394,7 @@ def normalize_anthropic_request(req_data: dict[str, Any]) -> ToolCoreRequest:
         forced_tool_name=forced_tool_name,
         raw_tool_choice=raw_tool_choice,
         tool_catalog=tool_catalog,
+        skill_catalog=skill_catalog,
     )
 
 
@@ -392,6 +409,8 @@ def normalize_gemini_request(req_data: dict[str, Any], *, model: str, force_stre
         raise ValueError("tool_choice provided but no tools declared")
     policy, forced_tool_name = _parse_tool_choice(raw_tool_choice, declared_tool_names)
 
+    skill_catalog = _normalize_skill_catalog(req_data.get("_skill_catalog"), messages, str(req_data.get("client_profile") or ""))
+
     return ToolCoreRequest(
         messages=messages,
         tools=tools,
@@ -399,4 +418,5 @@ def normalize_gemini_request(req_data: dict[str, Any], *, model: str, force_stre
         forced_tool_name=forced_tool_name,
         raw_tool_choice=raw_tool_choice,
         tool_catalog=tool_catalog,
+        skill_catalog=skill_catalog,
     )

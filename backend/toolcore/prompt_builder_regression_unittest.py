@@ -4,6 +4,7 @@ import unittest
 
 from backend.services.client_profiles import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW_OPENAI_PROFILE
 from backend.toolcore.prompt_builder import messages_to_prompt
+from backend.toolcore.request_normalizer import normalize_chat_request, to_prompt_payload
 
 
 class ClientPresetPromptRegressionTest(unittest.TestCase):

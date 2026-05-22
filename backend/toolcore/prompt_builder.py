@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 
 from backend.adapter.standard_request import normalize_tool_choice
@@ -15,6 +16,7 @@ from backend.services.client_profiles import (
     sanitize_openclaw_user_text,
     user_role_system_text,
 )
+from backend.skills.integration import build_skill_context
 from backend.toolcore.prompt_contract import (
     build_tool_instruction_block,
     normalize_prompt_tools,
@@ -154,6 +156,27 @@ def _is_heavy_tool_profile(client_profile: str) -> bool:
     return client_profile in {CLAUDE_CODE_OPENAI_PROFILE, QWEN_CODE_OPENAI_PROFILE}
 
 
+def _tool_reference_rewrite_map(tool_catalog) -> dict[str, str]:
+    if tool_catalog is None or not hasattr(tool_catalog, "get_all_client_names"):
+        return {}
+    replacements: dict[str, str] = {}
+    for candidate in tool_catalog.get_all_client_names():
+        if not isinstance(candidate, str) or not candidate:
+            continue
+        model_name = tool_catalog.get_model_name(candidate) if hasattr(tool_catalog, "get_model_name") else None
+        if isinstance(model_name, str) and model_name and model_name != candidate:
+            replacements[candidate] = model_name
+    return replacements
+
+
+def _rewrite_tool_name_references(text: str, replacements: dict[str, str]) -> str:
+    if not text or not replacements:
+        return text
+    ordered_names = sorted(replacements, key=len, reverse=True)
+    pattern = re.compile(r"(?<![A-Za-z0-9_-])(" + "|".join(re.escape(name) for name in ordered_names) + r")(?![A-Za-z0-9_-])")
+    return pattern.sub(lambda match: replacements.get(match.group(1), match.group(1)), text)
+
+
 def _has_tool_continuation_after_latest_user(messages: list, client_profile: str) -> bool:
     latest_user_index = -1
     for index in range(len(messages) - 1, -1, -1):
@@ -189,8 +212,12 @@ def build_prompt_with_tools(
     tool_choice_mode: str = "auto",
     required_tool_name: str | None = None,
     tool_catalog=None,
+    skill_context: str = "",
 ) -> str:
-    sys_part = f"<system>\n{system_prompt}\n</system>" if system_prompt else ""
+    tool_reference_replacements = _tool_reference_rewrite_map(tool_catalog)
+    rendered_system_prompt = _rewrite_tool_name_references(system_prompt, tool_reference_replacements)
+    rendered_skill_context = _rewrite_tool_name_references(skill_context.strip(), tool_reference_replacements) if skill_context else ""
+    sys_part = f"<system>\n{rendered_system_prompt}\n</system>" if rendered_system_prompt else ""
     tools_part = ""
     if tools:
         tools_part = build_tool_instruction_block(
@@ -274,6 +301,8 @@ def build_prompt_with_tools(
             "[tool result" in lower_text or text.startswith("{") or '"results"' in text[:100]
         )
         is_tool_result_only_user_msg = role == "user" and not user_text_only.strip() and bool(text.strip())
+        if role in {"user", "system", "developer"} and not is_tool_result and not is_tool_result_only_user_msg:
+            text = _rewrite_tool_name_references(text, tool_reference_replacements)
         prefix = "" if is_tool_result_only_user_msg else {"user": "Human: ", "assistant": "Assistant: ", "system": "System: ", "developer": "System: "}.get(role, "")
         line = text if is_tool_result_only_user_msg else f"{prefix}{text}"
         history_parts.insert(0, line)
@@ -291,6 +320,7 @@ def build_prompt_with_tools(
         )
         if first_user:
             first_text = _extract_user_text_only(first_user.get("content", ""), client_profile=client_profile)
+            first_text = _rewrite_tool_name_references(first_text, tool_reference_replacements)
             first_short = first_text
             first_line = f"Human: {first_short}"
             if not history_parts or not history_parts[0].startswith(f"Human: {first_text[:60]}"):
@@ -300,7 +330,9 @@ def build_prompt_with_tools(
                 log.debug(f"[Prompt] Restored original task context ({len(first_short)} chars)")
 
     latest_user_line = ""
-    if tools and messages and not _has_tool_continuation_after_latest_user(messages, client_profile):
+    has_tool_continuation = _has_tool_continuation_after_latest_user(messages, client_profile) if messages else False
+    should_show_latest_user_line = not has_tool_continuation and (bool(rendered_skill_context) or bool(tools))
+    if messages and should_show_latest_user_line:
         latest_user = next(
             (
                 message for message in reversed(messages)
@@ -311,11 +343,12 @@ def build_prompt_with_tools(
         )
         if latest_user:
             latest_text = _extract_user_text_only(latest_user.get("content", ""), client_profile=client_profile).strip()
+            latest_text = _rewrite_tool_name_references(latest_text, tool_reference_replacements)
             if latest_text:
                 latest_short = latest_text
                 latest_user_line = f"Human (CURRENT TASK - TOP PRIORITY): {latest_short}"
 
-    if latest_user_line and len(history_parts) > 1:
+    if latest_user_line and (rendered_skill_context or len(history_parts) > 1):
         duplicate_latest_line = latest_user_line.replace("Human (CURRENT TASK - TOP PRIORITY): ", "Human: ", 1)
         for index in range(len(history_parts) - 1, -1, -1):
             if history_parts[index] == duplicate_latest_line:
@@ -355,6 +388,8 @@ def build_prompt_with_tools(
         parts.append(sys_part)
     if tools_part and not opencode_override:
         parts.append(tools_part)
+    if rendered_skill_context:
+        parts.append(rendered_skill_context)
     parts.extend(history_parts)
     if latest_user_line:
         parts.append(latest_user_line)
@@ -383,6 +418,7 @@ def messages_to_prompt(req_data: dict, *, client_profile: str = OPENCLAW_OPENAI_
     tool_enabled = bool(tools)
     tool_choice = normalize_tool_choice(req_data.get("tool_choice"))
     system_prompt = extract_system_prompt(req_data, client_profile=resolved_client_profile)
+    skill_context = build_skill_context(req_data, client_profile=resolved_client_profile)
     return PromptBuildResult(
         prompt=build_prompt_with_tools(
             system_prompt,
@@ -392,6 +428,7 @@ def messages_to_prompt(req_data: dict, *, client_profile: str = OPENCLAW_OPENAI_
             tool_choice_mode=tool_choice.mode,
             required_tool_name=tool_choice.required_tool_name,
             tool_catalog=tool_catalog,
+            skill_context=skill_context,
         ),
         tools=tools,
         tool_enabled=tool_enabled,

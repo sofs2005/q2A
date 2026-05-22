@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import unittest
 
 from backend.toolcore.request_normalizer import (
@@ -247,6 +249,33 @@ class CrossSurfaceNormalizationTests(unittest.TestCase):
         self.assertEqual([tool.name for tool in openai_chat.tools], [tool.name for tool in anthropic.tools])
         self.assertEqual(openai_chat.tool_choice_policy, anthropic.tool_choice_policy)
         self.assertEqual(openai_chat.forced_tool_name, anthropic.forced_tool_name)
+
+
+class SkillCatalogPropagationTests(unittest.TestCase):
+    def test_raw_skill_catalog_survives_normalization_into_prompt_payload(self) -> None:
+        request = normalize_chat_request(
+            {
+                "messages": [{"role": "user", "content": "read the file"}],
+                "_skill_catalog": {
+                    "agent-orchestrator": {
+                        "location": "~/.openclaw/workspace/skills/agent-orchestrator/SKILL.md",
+                        "description": "Coordinate multi-step work across tools.",
+                        "aliases": ["orchestrator"],
+                        "source": "openclaw",
+                    }
+                },
+            }
+        )
+
+        self.assertIsNotNone(request.skill_catalog)
+        assert request.skill_catalog is not None
+        self.assertEqual(request.skill_catalog.resolve("orchestrator").name, "agent-orchestrator")
+
+        payload = to_prompt_payload(request, model="gpt-4.1")
+
+        self.assertIn("_skill_catalog", payload)
+        self.assertIs(payload["_skill_catalog"], request.skill_catalog)
+        self.assertEqual(payload["_skill_catalog"].resolve("agent-orchestrator").location, "~/.openclaw/workspace/skills/agent-orchestrator/SKILL.md")
 
 
 if __name__ == "__main__":

@@ -47,3 +47,4 @@ class ToolCoreRequest:
     tool_results: list[CanonicalToolResult] = field(default_factory=list)
     raw_tool_choice: Any | None = None
     tool_catalog: Any | None = None
+    skill_catalog: Any | None = None
