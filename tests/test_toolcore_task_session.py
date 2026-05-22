@@ -44,9 +44,8 @@ class ToolCoreTaskSessionTests(unittest.TestCase):
             tool_catalog=catalog,
         )
 
-        self.assertIn('"name": "bridge-0"', rendered)
-        self.assertNotIn('"name": "Read"', rendered)
-        self.assertNotIn("<|DSML|", rendered)
+        self.assertIn('<|DSML|invoke name="bridge-0">', rendered)
+        self.assertNotIn('<|DSML|invoke name="Read">', rendered)
 
     def test_extract_session_history_entries_is_stable(self) -> None:
         messages = [{"role": "assistant", "content": "hello"}]

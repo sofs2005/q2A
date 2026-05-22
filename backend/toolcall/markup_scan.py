@@ -7,7 +7,7 @@ from typing import Optional
 
 @dataclass
 class ToolMarkupTag:
-    """Represents a tool markup tag found in text."""
+    """Represents a DSML/XML tool markup tag found in text."""
 
     name: str
     """Canonical tag name: tool_calls, invoke, or parameter."""
@@ -19,7 +19,7 @@ class ToolMarkupTag:
     """End index of the tag in the original text (exclusive)."""
 
     closing: bool
-    """True if this is a closing tag for a tool markup block."""
+    """True if this is a closing tag (e.g. </|DSML|tool_calls>)."""
 
     raw_name: str = ""
     """The original tag name as found in the text, before canonicalization."""
@@ -52,7 +52,7 @@ _FULLWIDTH_TABLE = str.maketrans({
 def _fold(text: str) -> str:
     """Fold fullwidth/CJK characters to their ASCII equivalents."""
     folded = text.translate(_FULLWIDTH_TABLE)
-    # STX (0x02) is also a legacy tool-markup separator — map it to pipe.
+    # STX (0x02) is also a DSML separator — map it to pipe.
     folded = folded.replace('\x02', '|')
     return folded
 
@@ -126,7 +126,7 @@ def _prefix_allows_canonical_suffix(value: str) -> bool:
 
 
 def _canonicalize_tag_name(raw_name: str) -> Optional[str]:
-    """Map a raw tag name to its canonical tool-markup form when recognised."""
+    """Map a raw tag name to its canonical DSML form when recognised."""
     token = raw_name.strip()
     if not token:
         return None
@@ -296,7 +296,7 @@ def _skip_ignored(pos: int, ignored: list[tuple[int, int]]) -> int:
 # ---------------------------------------------------------------------------
 
 def _parse_tag(text: str, pos: int) -> Optional[ToolMarkupTag]:
-    """Try to parse a tool markup tool tag starting at *pos* in the original text.
+    """Try to parse a DSML/XML tool tag starting at *pos* in the original text.
 
     Returns a ``ToolMarkupTag`` on success, or ``None`` if no valid tag
     starts at that position.
@@ -387,7 +387,7 @@ def _find_tag_outside_ignored_with_spans(
 def find_tool_markup_tag_outside_ignored(
     text: str, start: int = 0,
 ) -> Optional[ToolMarkupTag]:
-    """Find the first tool markup tool markup tag in *text* starting from *start*,
+    """Find the first DSML/XML tool markup tag in *text* starting from *start*,
     skipping any content inside ignored regions (markdown fences, inline code,
     CDATA, XML comments, and processing instructions).
 
@@ -433,7 +433,7 @@ def find_matching_tool_markup_close(
 
 
 def contains_tool_markup_syntax_outside_ignored(text: str) -> bool:
-    """Return ``True`` if *text* contains any tool markup tool markup syntax
+    """Return ``True`` if *text* contains any DSML/XML tool markup syntax
     outside of ignored regions (fenced code, inline code, CDATA,
     comments, PIs).
     """
@@ -474,7 +474,7 @@ def find_partial_tool_markup_start(text: str) -> int:
     code span).
 
     A partial tag is any plausible prefix of a recognised tool tag,
-    including plain XML forms (``<tool_ca``), legacy pipe-delimited forms
+    including plain XML forms (``<tool_ca``), DSML forms
     (``<|DSML|too``), and bare angle brackets at end-of-stream.
     """
     ignored = _find_ignored_spans(text)
