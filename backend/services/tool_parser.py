@@ -791,13 +791,15 @@ def inject_format_reminder(prompt: str, tool_name: str, *, client_profile: str =
     reminder = (
         f"[纠正/CORRECTION]: 你用错误的格式调用了 '{tool_name}'。\n"
         f"You called '{tool_name}' using the wrong tool-call format.\n"
-        f"你必须使用唯一允许的 ##TOOL_CALL## / ##END_CALL## 协议：\n"
-        f"You MUST use the only accepted ##TOOL_CALL## / ##END_CALL## protocol:\n"
-        f"##TOOL_CALL##\n"
-        f'{{"name": {json.dumps(tool_name)}, "input": {{...your args here...}}}}\n'
-        f"##END_CALL##\n"
-        f"不要输出纯 JSON，不要输出 XML，不要输出其它包装。\n"
-        f"Do NOT output raw JSON, XML, or any alternate wrapper.\n"
+        f"你必须使用唯一允许的 DSML/XML 协议：\n"
+        f"You MUST use the only accepted DSML/XML protocol:\n"
+        f"<|DSML|tool_calls>\n"
+        f'  <|DSML|invoke name="{tool_name}">\n'
+        f'    <|DSML|parameter name="param"><![CDATA[value]]></|DSML|parameter>\n'
+        f"  </|DSML|invoke>\n"
+        f"</|DSML|tool_calls>\n"
+        f"不要输出纯 JSON，不要输出其它包装。\n"
+        f"Do NOT output raw JSON or any alternate wrapper.\n"
     )
     prompt = prompt.rstrip()
     if prompt.endswith("Assistant:"):
@@ -823,9 +825,11 @@ def inject_format_reminder_for_allowed_tools(
             f"本轮只能使用请求里声明的工具名，下一次请改用 '{declared_tool_name}'。\n"
             f"You just emitted an undeclared tool name '{tool_name}'. "
             f"This turn must use only request-declared tool names. Use '{declared_tool_name}' on the next attempt.\n"
-            f"##TOOL_CALL##\n"
-            f'{{"name": {json.dumps(declared_tool_name)}, "input": {{...your args here...}}}}\n'
-            f"##END_CALL##\n"
+            f"<|DSML|tool_calls>\n"
+            f'  <|DSML|invoke name="{declared_tool_name}">\n'
+            f'    <|DSML|parameter name="param"><![CDATA[value]]></|DSML|parameter>\n'
+            f"  </|DSML|invoke>\n"
+            f"</|DSML|tool_calls>\n"
         )
         prompt = prompt.rstrip()
         if prompt.endswith("Assistant:"):
