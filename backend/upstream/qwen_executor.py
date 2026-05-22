@@ -12,8 +12,11 @@ from backend.upstream.sse_consumer import parse_sse_chunk
 log = logging.getLogger("qwen2api.executor")
 
 
-def _has_textual_tool_contract_marker(prompt: str) -> bool:
+def _has_tool_contract_marker(prompt: str) -> bool:
     return "##TOOL_CALL##" in prompt or "<|DSML|tool_calls>" in prompt
+
+
+_has_textual_tool_contract_marker = _has_tool_contract_marker
 
 
 class QwenExecutor:
@@ -117,10 +120,10 @@ class QwenExecutor:
 
         # Log the prompt content to debug tool interception
         prompt_content = payload.get("messages", [{}])[0].get("content", "")
-        if _has_textual_tool_contract_marker(prompt_content):
-            log.info("[Executor] prompt contains textual tool contract markers (expected)")
+        if _has_tool_contract_marker(prompt_content):
+            log.info("[Executor] prompt contains a tool contract marker (expected)")
         else:
-            log.warning("[Executor] prompt does NOT contain textual tool contract markers - this may cause interception")
+            log.warning("[Executor] prompt does NOT contain the safe JSON tool block marker or legacy markup - this may cause interception")
         # Log first 500 chars of prompt to see tool instruction format
         log.info(f"[Executor] prompt preview (first 500 chars): {prompt_content[:500]}")
 

@@ -33,7 +33,8 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
         rendered = _extract_text(content, client_profile=CLAUDE_CODE_OPENAI_PROFILE)
 
         self.assertIn("look here", rendered)
-        self.assertIn('<|DSML|tool_calls>\n  <|DSML|invoke name="Read">\n    <|DSML|parameter name="file_path"><![CDATA[README.md]]></|DSML|parameter>\n  </|DSML|invoke>\n</|DSML|tool_calls>', rendered)
+        self.assertIn('##TOOL_CALL##\n{"name": "Read", "input": {"file_path": "README.md"}}\n##END_CALL##', rendered)
+        self.assertNotIn("<|DSML|", rendered)
         self.assertIn("[Tool Result for call call_1]\ndone\n[/Tool Result]", rendered)
         self.assertIn("[Attachment file_id=file_1 filename=spec.md]", rendered)
         self.assertIn("[Attachment image file_id=img_1 mime=image/png]", rendered)
@@ -224,8 +225,9 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
         result = build_chat_standard_request(req_data, default_model="gpt-4.1", surface="openai")
 
         self.assertIn("bridge-0", result.prompt)
-        self.assertIn('<|DSML|invoke name="bridge-0">', result.prompt)
-        self.assertNotIn('<|DSML|invoke name="exec">', result.prompt)
+        self.assertIn('"name": "bridge-0"', result.prompt)
+        self.assertNotIn('"name": "exec"', result.prompt)
+        self.assertNotIn("<|DSML|", result.prompt)
         self.assertEqual(result.tool_names, ["bridge-0"])
 
     def test_messages_to_prompt_preserves_openclaw_runtime_system_prose(self) -> None:

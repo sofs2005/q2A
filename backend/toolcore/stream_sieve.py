@@ -182,7 +182,7 @@ class ToolStreamSieve:
                     events.append({"type": "tool_calls", "calls": calls})
                 if suffix:
                     events.append({"type": "content", "text": suffix})
-            elif not self._is_dsml_capture(self.capture):
+            elif not self._is_tool_markup_capture(self.capture):
                 events.append({"type": "content", "text": self.capture})
             self.capture = ""
             self.capturing = False
@@ -191,7 +191,7 @@ class ToolStreamSieve:
             self.pending = ""
         return events
 
-    def _is_dsml_capture(self, text: str) -> bool:
+    def _is_tool_markup_capture(self, text: str) -> bool:
         return "<|DSML|" in text or "＜！DSML！" in text
 
     def _find_tool_start(self, text: str) -> int:

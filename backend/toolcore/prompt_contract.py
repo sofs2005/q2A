@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import html
 import json
-import re
 from typing import Any
 
 from backend.services.client_profiles import (
@@ -35,48 +33,11 @@ def compact_history_tool_input(name: str, input_data: dict[str, Any], client_pro
     return compact
 
 
-def _cdata(value: str) -> str:
-    return "<![CDATA[" + value.replace("]]>", "]]]]><![CDATA[>") + "]]>"
-
-
-def _is_xmlish_name(value: str) -> bool:
-    return re.fullmatch(r"[A-Za-z_][A-Za-z0-9_:-]*", value) is not None
-
-
-def _render_dsml_value(value: Any) -> str:
-    if isinstance(value, str):
-        return _cdata(value)
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if value is None:
-        return "null"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, list):
-        if not value:
-            return _cdata("[]")
-        return "".join(f"<item>{_render_dsml_value(item)}</item>" for item in value)
-    if isinstance(value, dict):
-        if not value or not all(_is_xmlish_name(str(key)) for key in value):
-            return _cdata(json.dumps(value, ensure_ascii=False))
-        parts = []
-        for key, item in value.items():
-            safe_key = html.escape(str(key), quote=True)
-            parts.append(f"<{safe_key}>{_render_dsml_value(item)}</{safe_key}>")
-        return "".join(parts)
-    return _cdata(str(value))
-
 
 def render_history_tool_call(name: str, input_data: dict[str, Any], client_profile: str) -> str:
     compact = compact_history_tool_input(name, input_data, client_profile)
-    safe_name = html.escape(str(name), quote=True)
-    lines = ["<|DSML|tool_calls>", f'  <|DSML|invoke name="{safe_name}">']
-    for key, value in compact.items():
-        safe_key = html.escape(str(key), quote=True)
-        lines.append(f'    <|DSML|parameter name="{safe_key}">{_render_dsml_value(value)}</|DSML|parameter>')
-    lines.append("  </|DSML|invoke>")
-    lines.append("</|DSML|tool_calls>")
-    return "\n".join(lines)
+    payload = {"name": str(name), "input": compact}
+    return "##TOOL_CALL##\n" + json.dumps(payload, ensure_ascii=False) + "\n##END_CALL##"
 
 
 def model_bridge_tool_name(index: int) -> str:
@@ -169,34 +130,29 @@ def build_tool_instruction_block(
         "=== MANDATORY TOOL CALL INSTRUCTIONS ===",
         "This gateway-injected block only defines how to serialize tool calls for the bridge.",
         "These are gateway bridge tools, not upstream/native Qwen tools; do not invoke the platform's built-in tool system.",
-        f"If you need a tool, output the DSML text block directly; never answer with platform errors such as `Tool {native_error_example} does not exists.`",
+        f"If you need a tool, output the safe JSON text block directly; never answer with platform errors such as `Tool {native_error_example} does not exists.`",
         "Follow the client's system/developer instructions for persona, style, language, and normal response format.",
         f"Bridge-call slots available: {', '.join(names)}",
         "",
         "TOOL CALL FORMAT — FOLLOW EXACTLY:",
-        "<|DSML|tool_calls>",
-        '  <|DSML|invoke name="TOOL_NAME_HERE">',
-        '    <|DSML|parameter name="PARAMETER_NAME"><![CDATA[PARAMETER_VALUE]]></|DSML|parameter>',
-        "  </|DSML|invoke>",
-        "</|DSML|tool_calls>",
+        "##TOOL_CALL##",
+        '{"name": "TOOL_NAME_HERE", "input": {"PARAMETER_NAME": "PARAMETER_VALUE"}}',
+        "##END_CALL##",
         "",
         "Rules:",
-        "- Use one <|DSML|tool_calls> root when calling tools.",
-        "- Put one or more <|DSML|invoke> entries under the root.",
-        "- Use the exact bridge slot id from the list above in the invoke name attribute.",
-        "- Every top-level argument must be a <|DSML|parameter name=\"ARG_NAME\"> node.",
-        "- Use <![CDATA[...]]> for string values, including code, paths, prompts, and file contents.",
-        "- Objects use nested XML elements inside the parameter body. Arrays may repeat <item> children.",
-        "- Numbers, booleans, and null stay plain text.",
+        "- Use exactly one JSON object between ##TOOL_CALL## and ##END_CALL## when calling one tool.",
+        "- Put the exact bridge slot id from the list above in the JSON name field.",
+        "- Put every top-level argument under the JSON input object.",
+        "- Strings, objects, arrays, numbers, booleans, and null must be valid JSON values.",
         "- Do not emit placeholder, blank, or whitespace-only parameters.",
         "- If a required parameter value is unknown, ask the user or answer normally instead of outputting an empty tool call.",
-        "- Do NOT wrap XML in markdown fences. Do NOT output explanations, role markers, or internal monologue around the tool block.",
-        "- If you call a tool, the first non-whitespace characters of that tool block must be exactly <|DSML|tool_calls>.",
-        "- Compatibility note: legacy output formats may be parsed, but the model-facing format is DSML/XML only.",
+        "- Do NOT wrap the block in markdown fences. Do NOT output explanations, role markers, or internal monologue around the tool block.",
+        "- If you call a tool, the first non-whitespace characters of that tool block must be exactly ##TOOL_CALL##.",
+        "- Compatibility note: XML-like formats may be parsed, but the model-facing format is the safe JSON block only.",
         "",
         *force_constraint_lines,
         *([""] if force_constraint_lines else []),
-        "Available bridge slots (copy the slot id exactly into DSML invoke name):"
+        "Available bridge slots (copy the slot id exactly into the JSON name field):"
     ]
     for tool in tools:
         lines.append(
