@@ -19,6 +19,7 @@ from backend.services.response_formatters import build_openai_completion_payload
 from backend.services.token_calc import calculate_usage
 from backend.services.qwen_client import QwenClient
 from backend.services.standard_request_builder import build_chat_standard_request
+from backend.toolcore.request_singleflight import RequestSingleflight
 from backend.toolcore.task_session import (
     build_openai_assistant_history_message,
     clear_invalidated_session_chat,
@@ -31,6 +32,9 @@ from backend.runtime.execution import RuntimeAttemptState, RuntimeToolDirective,
 log = logging.getLogger("qwen2api.chat")
 router = APIRouter()
 OpenAIDeltaHandler = Callable[[dict[str, Any], str | None, list[dict[str, Any]] | None], Awaitable[None]]
+_openai_json_singleflight = RequestSingleflight(
+    result_ttl_seconds=settings.OPENAI_JSON_SINGLEFLIGHT_RESULT_TTL_SECONDS,
+)
 
 
 def _stream_usage(result, prompt: str) -> dict[str, int]:
@@ -51,6 +55,37 @@ def _detect_openai_client_profile(request: Request, req_data: dict) -> str:
 
 def _short_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _build_openai_json_singleflight_key(
+    *,
+    session_key: str,
+    standard_request: StandardRequest,
+    diagnostics: dict[str, Any],
+) -> tuple[Any, ...] | None:
+    if standard_request.stream:
+        return None
+    prompt_hash = str(diagnostics.get("prompt_hash") or "")
+    latest_user_hash = str(diagnostics.get("latest_user_hash") or "")
+    if not session_key or not prompt_hash or not latest_user_hash:
+        return None
+    return (
+        "openai-json",
+        session_key,
+        standard_request.client_profile,
+        standard_request.response_model,
+        standard_request.resolved_model,
+        tuple(standard_request.tool_names or []),
+        standard_request.tool_choice_mode,
+        standard_request.required_tool_name or "",
+        _stable_json(standard_request.tool_choice_raw),
+        prompt_hash,
+        latest_user_hash,
+    )
 
 
 def _text_from_message_content(content: Any) -> str:
@@ -863,7 +898,56 @@ async def chat_completions(request: Request):
             prompt=early_standard_request.prompt,
         ))
 
-    context_prepared = await prepare_context_attachments(app=app, payload=req_data, surface="openai", auth_token=token, client_profile=client_profile, existing_attachments=(preprocessed.attachments if preprocessed is not None else None))
+    singleflight_key = None
+    singleflight_owner = False
+    if settings.OPENAI_JSON_SINGLEFLIGHT_ENABLED and not early_standard_request.stream:
+        singleflight_key = _build_openai_json_singleflight_key(
+            session_key=session_key,
+            standard_request=early_standard_request,
+            diagnostics=early_diagnostics,
+        )
+        if singleflight_key is not None:
+            entry, singleflight_owner, cached_payload = await _openai_json_singleflight.start_or_join(
+                singleflight_key,
+                owner_id=req_id,
+            )
+            if cached_payload is not None:
+                log.warning(
+                    "[OAI] duplicate_json_request_cache_hit req_id=%s completion_id=%s session=%s prompt_hash=%s latest_user_hash=%s",
+                    req_id,
+                    completion_id,
+                    session_key,
+                    early_diagnostics["prompt_hash"],
+                    early_diagnostics["latest_user_hash"],
+                )
+                return JSONResponse(cached_payload)
+            if not singleflight_owner and entry is not None:
+                age_seconds = max(0.0, _openai_json_singleflight.now() - entry.created_at)
+                log.warning(
+                    "[OAI] duplicate_json_request_join req_id=%s owner_req_id=%s completion_id=%s session=%s prompt_hash=%s latest_user_hash=%s age=%.3f",
+                    req_id,
+                    entry.owner_id,
+                    completion_id,
+                    session_key,
+                    early_diagnostics["prompt_hash"],
+                    early_diagnostics["latest_user_hash"],
+                    age_seconds,
+                )
+                try:
+                    payload = await asyncio.wait_for(
+                        asyncio.shield(entry.future),
+                        timeout=settings.OPENAI_JSON_SINGLEFLIGHT_WAIT_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise HTTPException(status_code=504, detail="Timed out waiting for original duplicate request") from exc
+                return JSONResponse(payload)
+
+    try:
+        context_prepared = await prepare_context_attachments(app=app, payload=req_data, surface="openai", auth_token=token, client_profile=client_profile, existing_attachments=(preprocessed.attachments if preprocessed is not None else None))
+    except Exception as e:
+        if singleflight_owner and singleflight_key is not None:
+            await _openai_json_singleflight.fail(singleflight_key, e)
+        raise
     req_data = context_prepared["payload"]
     standard_request = _build_standard_request(req_data, client_profile=client_profile)
     if preprocessed is not None:
@@ -984,13 +1068,16 @@ async def chat_completions(request: Request):
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
-            return JSONResponse(_build_openai_text_payload(
+            payload = _build_openai_text_payload(
                 completion_id=completion_id,
                 created=created,
                 model_name=model_name,
                 content=notice,
                 prompt=prompt,
-            ))
+            )
+            if singleflight_owner and singleflight_key is not None:
+                await _openai_json_singleflight.complete(singleflight_key, payload)
+            return JSONResponse(payload)
 
         if standard_request.stream:
             async def generate():
@@ -1352,14 +1439,19 @@ async def chat_completions(request: Request):
                     len(execution.state.answer_text or ""),
                 )
 
-                return JSONResponse(build_openai_completion_payload(
+                payload = build_openai_completion_payload(
                     completion_id=completion_id,
                     created=created,
                     model_name=model_name,
                     prompt=result.prompt,
                     execution=execution,
                     standard_request=standard_request,
-                ))
+                )
+                if singleflight_owner and singleflight_key is not None:
+                    await _openai_json_singleflight.complete(singleflight_key, payload)
+                return JSONResponse(payload)
         except Exception as e:
+            if singleflight_owner and singleflight_key is not None:
+                await _openai_json_singleflight.fail(singleflight_key, e)
             await clear_invalidated_session_chat(app=app, request=standard_request)
             raise HTTPException(status_code=500, detail=str(e))
