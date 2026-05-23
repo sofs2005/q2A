@@ -116,10 +116,12 @@ MODEL_MAP = {
     "gemini-2.5-pro":    "qwen3.6-plus",
     "gemini-2.5-flash":  "qwen3.5-flash",
     # Qwen aliases
-    "qwen":              "qwen3.6-plus",
-    "qwen-max":          "qwen3.6-plus",
-    "qwen-plus":         "qwen3.6-plus",
-    "qwen-turbo":        "qwen3.5-flash",
+    "qwen":                  "qwen3.6-plus",
+    "qwen-max":              "qwen3.6-plus",
+    "qwen-plus":             "qwen3.6-plus",
+    "qwen-turbo":            "qwen3.5-flash",
+    "qwen3.7-max":           "qwen3.7-max",
+    "qwen3.7-plus-preview":  "qwen-latest-series-invite-beta-v16",
     # DeepSeek
     "deepseek-chat":     "qwen3.6-plus",
     "deepseek-reasoner": "qwen3.6-plus",
