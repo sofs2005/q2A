@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import { Button } from "../components/ui/button"
-import { Trash2, Plus, RefreshCw, Bot, ShieldCheck, MailWarning, X } from "lucide-react"
+import { Trash2, Plus, RefreshCw, Bot, ShieldCheck, MailWarning, X, Settings } from "lucide-react"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
@@ -687,10 +687,9 @@ export default function AccountsPage() {
             variant="outline"
             onClick={openBatchPersonalization}
             disabled={personalizationLoading || personalizationBusy || clearableSelectedEmails.length === 0}
-            className="border-red-500/30 text-red-600 hover:bg-red-500/10 hover:text-red-700 dark:text-red-400"
             title={clearableSelectedEmails.length > 0 ? "管理所选账号的设置" : "请先勾选可设置的账号"}
           >
-            <Trash2 className="mr-2 h-4 w-4" /> {`批量账号设置 (${clearableSelectedEmails.length})`}
+            <Settings className="mr-2 h-4 w-4" /> {`批量账号设置 (${clearableSelectedEmails.length})`}
           </Button>
           <Button variant="outline" onClick={() => { fetchAccounts(); toast.success("账号列表已刷新") }}>
             <RefreshCw className="mr-2 h-4 w-4" /> {"刷新状态"}
@@ -807,10 +806,9 @@ export default function AccountsPage() {
                         size="sm"
                         onClick={() => openSinglePersonalization(acc.email)}
                         disabled={personalizationBusy || personalizationLoading || clearDisabled}
-                        className="text-red-600 dark:text-red-400 border-red-500/30 hover:bg-red-500/10 hover:text-red-700"
                         title={clearDisabled ? "缺少 cookies 和 token，无法设置" : "管理该账号的设置"}
                       >
-                        <Trash2 className="h-4 w-4 mr-1" /> {"账号设置"}
+                        <Settings className="h-4 w-4 mr-1" /> {"账号设置"}
                       </Button>
                       {acc.status_code !== "valid" && acc.status_code !== "rate_limited" && acc.status_code !== "banned" && (
                         <Button variant="outline" size="sm" onClick={() => handleActivate(acc.email)} className="text-orange-600 dark:text-orange-400 border-orange-500/30 hover:bg-orange-500/10 font-medium">
