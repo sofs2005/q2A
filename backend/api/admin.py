@@ -1,9 +1,13 @@
+import logging
+import secrets
+
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from pydantic import BaseModel
 from backend.core.config import settings
 from backend.core.database import AsyncJsonDB
 from backend.core.account_pool import AccountPool, Account
-import secrets
+
+logger = logging.getLogger("backend.api.admin")
 
 router = APIRouter()
 
@@ -28,6 +32,18 @@ class User(BaseModel):
     name: str
     quota: int
     used_tokens: int
+
+
+def _get_account_by_email(pool: AccountPool, email: str):
+    return next((account for account in pool.accounts if account.email == email), None)
+
+
+async def _clear_single_account_chats(client, account):
+    if not getattr(account, "cookies", "") and not getattr(account, "token", ""):
+        return {"email": account.email, "status": "skipped", "reason": "missing_credentials"}
+
+    return await client.clear_all_chats(account)
+
 
 @router.get("/status", dependencies=[Depends(verify_admin)])
 async def get_system_status(request: Request):
@@ -181,6 +197,50 @@ async def verify_account(email: str, request: Request):
     await pool.save() # 直接保存，不调用 mark_invalid 以免熔断影响正常测试
 
     return {"email": acc.email, "valid": is_valid}
+
+@router.delete("/accounts/chats", dependencies=[Depends(verify_admin)])
+async def clear_all_upstream_chats(request: Request):
+    from backend.services.qwen_client import QwenClient
+
+    pool: AccountPool = request.app.state.account_pool
+    client: QwenClient = request.app.state.qwen_client
+
+    results = []
+    summary = {"success": 0, "failed": 0, "skipped": 0}
+
+    for acc in pool.accounts:
+        if not acc.is_available():
+            result = {"email": acc.email, "status": "skipped", "reason": "unavailable"}
+        else:
+            try:
+                result = await _clear_single_account_chats(client, acc)
+            except Exception as exc:
+                logger.exception("Failed to clear upstream chats in batch", extra={"email": acc.email})
+                result = {"email": acc.email, "status": "failed", "error": str(exc)}
+
+        results.append(result)
+        status = result.get("status")
+        if status in summary:
+            summary[status] += 1
+        else:
+            summary["failed"] += 1
+
+    return {"ok": True, "summary": summary, "results": results}
+
+
+@router.delete("/accounts/{email}/chats", dependencies=[Depends(verify_admin)])
+async def clear_upstream_chats_for_account(email: str, request: Request):
+    from backend.services.qwen_client import QwenClient
+
+    pool: AccountPool = request.app.state.account_pool
+    client: QwenClient = request.app.state.qwen_client
+
+    acc = _get_account_by_email(pool, email)
+    if not acc:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    return await _clear_single_account_chats(client, acc)
+
 
 @router.delete("/accounts/{email}", dependencies=[Depends(verify_admin)])
 async def delete_account(email: str, request: Request):

@@ -1,5 +1,7 @@
 import json
 import logging
+import time
+import uuid
 from typing import AsyncIterator
 
 import httpx
@@ -32,6 +34,104 @@ class QwenClient:
             "Connection": "keep-alive",
             "Content-Type": "application/json",
         }
+
+    @staticmethod
+    def _build_chat_clear_headers(*, token: str | None = None, cookies: str | None = None) -> dict[str, str]:
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": f"{BASE_URL}/settings/chats",
+            "Origin": BASE_URL,
+            "Connection": "keep-alive",
+            "Content-Type": "application/json",
+            "Version": "0.2.57",
+            "source": "web",
+            "X-Request-Id": str(uuid.uuid4()),
+            "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT%z", time.localtime()),
+        }
+        if cookies:
+            headers["Cookie"] = cookies
+        elif token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    @staticmethod
+    def _looks_like_upstream_auth_failure(status: int, body: str) -> bool:
+        body_lower = (body or "").lower()
+        return (
+            status in {401, 403}
+            or "unauthorized" in body_lower
+            or "forbidden" in body_lower
+            or "token" in body_lower
+            or "login" in body_lower
+            or "expired" in body_lower
+        )
+
+    async def _request_raw_json(
+        self,
+        method: str,
+        path: str,
+        headers: dict[str, str],
+        body: dict | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        request_timeout = timeout if timeout is not None else settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS
+        async with httpx.AsyncClient(timeout=request_timeout, follow_redirects=True) as hc:
+            resp = await hc.request(
+                method,
+                f"{BASE_URL}{path}",
+                headers=headers,
+                json=body,
+            )
+        return {"status": resp.status_code, "body": resp.text}
+
+    async def clear_all_chats(self, account) -> dict:
+        email = getattr(account, "email", "")
+        cookie_value = str(getattr(account, "cookies", "") or "").strip()
+        token_value = str(getattr(account, "token", "") or "").strip()
+
+        if not cookie_value and not token_value:
+            return {"email": email, "status": "skipped", "reason": "missing_credentials"}
+
+        path = "/api/v2/chats/"
+
+        if cookie_value:
+            cookie_res = await self._request_raw_json(
+                "DELETE",
+                path,
+                self._build_chat_clear_headers(cookies=cookie_value),
+                timeout=20.0,
+            )
+            if cookie_res["status"] in (200, 204):
+                return {"email": email, "status": "success", "transport": "cookie", "http_status": cookie_res["status"]}
+            if not self._looks_like_upstream_auth_failure(cookie_res["status"], cookie_res["body"]):
+                return {
+                    "email": email,
+                    "status": "failed",
+                    "transport": "cookie",
+                    "http_status": cookie_res["status"],
+                    "error": f"HTTP {cookie_res['status']}: {cookie_res['body'][:120]}",
+                }
+
+        if token_value:
+            token_res = await self._request_raw_json(
+                "DELETE",
+                path,
+                self._build_chat_clear_headers(token=token_value),
+                timeout=20.0,
+            )
+            if token_res["status"] in (200, 204):
+                return {"email": email, "status": "success", "transport": "token", "http_status": token_res["status"]}
+            return {
+                "email": email,
+                "status": "failed",
+                "transport": "token",
+                "http_status": token_res["status"],
+                "error": f"HTTP {token_res['status']}: {token_res['body'][:120]}",
+            }
+
+        return {"email": email, "status": "skipped", "reason": "missing_credentials"}
 
     async def _request_json(
         self,
