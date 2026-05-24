@@ -34,6 +34,37 @@ class User(BaseModel):
     used_tokens: int
 
 
+class ChatClearBatchRequest(BaseModel):
+    emails: list[str]
+
+
+def _normalize_selected_emails(emails: list[str]) -> list[str]:
+    normalized_emails: list[str] = []
+    seen: set[str] = set()
+
+    for email in emails:
+        if not email:
+            continue
+        normalized_email = email.strip()
+        if not normalized_email or normalized_email in seen:
+            continue
+        normalized_emails.append(normalized_email)
+        seen.add(normalized_email)
+
+    return normalized_emails
+
+
+def _summarize_clear_results(results: list[dict]) -> dict:
+    summary = {"success": 0, "failed": 0, "skipped": 0}
+    for item in results:
+        status = item.get("status", "failed")
+        if status in summary:
+            summary[status] += 1
+        else:
+            summary["failed"] += 1
+    return summary
+
+
 def _get_account_by_email(pool: AccountPool, email: str):
     return next((account for account in pool.accounts if account.email == email), None)
 
@@ -199,33 +230,32 @@ async def verify_account(email: str, request: Request):
     return {"email": acc.email, "valid": is_valid}
 
 @router.delete("/accounts/chats", dependencies=[Depends(verify_admin)])
-async def clear_all_upstream_chats(request: Request):
+async def clear_all_upstream_chats(payload: ChatClearBatchRequest, request: Request):
     from backend.services.qwen_client import QwenClient
 
     pool: AccountPool = request.app.state.account_pool
     client: QwenClient = request.app.state.qwen_client
 
-    results = []
-    summary = {"success": 0, "failed": 0, "skipped": 0}
+    requested_emails = _normalize_selected_emails(getattr(payload, "emails", []))
+    if not requested_emails:
+        raise HTTPException(status_code=400, detail="emails are required")
 
-    for acc in pool.accounts:
-        if not acc.is_available():
-            result = {"email": acc.email, "status": "skipped", "reason": "unavailable"}
-        else:
-            try:
-                result = await _clear_single_account_chats(client, acc)
-            except Exception as exc:
-                logger.exception("Failed to clear upstream chats in batch", extra={"email": acc.email})
-                result = {"email": acc.email, "status": "failed", "error": str(exc)}
+    accounts_by_email = {acc.email: acc for acc in pool.accounts}
+    results: list[dict] = []
 
-        results.append(result)
-        status = result.get("status")
-        if status in summary:
-            summary[status] += 1
-        else:
-            summary["failed"] += 1
+    for email in requested_emails:
+        acc = accounts_by_email.get(email)
+        if not acc:
+            results.append({"email": email, "status": "skipped", "reason": "missing_account"})
+            continue
 
-    return {"ok": True, "summary": summary, "results": results}
+        try:
+            results.append(await _clear_single_account_chats(client, acc))
+        except Exception as exc:
+            logger.exception("Failed to clear upstream chats in batch", extra={"email": email})
+            results.append({"email": email, "status": "failed", "error": str(exc)})
+
+    return {"ok": True, "summary": _summarize_clear_results(results), "results": results}
 
 
 @router.delete("/accounts/{email}/chats", dependencies=[Depends(verify_admin)])

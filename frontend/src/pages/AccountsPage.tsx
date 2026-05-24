@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { Button } from "../components/ui/button"
 import { Trash2, Plus, RefreshCw, Bot, ShieldCheck, MailWarning, X } from "lucide-react"
 import { toast } from "sonner"
@@ -22,10 +22,18 @@ type AccountItem = {
 }
 
 type ClearTarget =
-  | { kind: "batch" }
   | { kind: "single"; email: string }
+  | { kind: "batch"; emails: string[] }
 
 const CLEAR_CONFIRM_TEXT = "清空上游记录"
+const CLEAR_MODAL_TITLE_ID = "accounts-clear-modal-title"
+const CLEAR_MODAL_DESCRIPTION_ID = "accounts-clear-modal-description"
+const CLEAR_MODAL_CONFIRM_INPUT_ID = "accounts-clear-confirm-input"
+const CLEAR_MODAL_CONFIRM_HELP_ID = "accounts-clear-confirm-help"
+
+function canClearChats(acc: AccountItem) {
+  return Boolean(acc.cookies || acc.token)
+}
 
 function statusStyle(code?: string) {
   switch (code) {
@@ -104,9 +112,12 @@ export default function AccountsPage() {
   const [registerUnlocked, setRegisterUnlocked] = useState(false)
   const [verifying, setVerifying] = useState<string | null>(null)
   const [verifyingAll, setVerifyingAll] = useState(false)
+  const [selectedEmails, setSelectedEmails] = useState<string[]>([])
   const [clearTarget, setClearTarget] = useState<ClearTarget | null>(null)
   const [clearPhrase, setClearPhrase] = useState("")
   const [clearing, setClearing] = useState(false)
+  const clearModalRef = useRef<HTMLDivElement | null>(null)
+  const clearReturnFocusRef = useRef<HTMLElement | null>(null)
 
   // 邮箱+密码字段同时匹配时解锁注册功能
   useEffect(() => {
@@ -127,7 +138,11 @@ export default function AccountsPage() {
         if (!res.ok) throw new Error("unauthorized")
         return res.json()
       })
-      .then(data => setAccounts(data.accounts || []))
+      .then(data => {
+        const nextAccounts = data.accounts || []
+        setAccounts(nextAccounts)
+        setSelectedEmails(prev => prev.filter(email => nextAccounts.some((acc: AccountItem) => acc.email === email && canClearChats(acc))))
+      })
       .catch(() => toast.error("刷新账号列表失败，请检查会话密钥"))
   }
 
@@ -149,6 +164,82 @@ export default function AccountsPage() {
     return result
   }, [accounts])
 
+  const clearableSelectedEmails = useMemo(() => {
+    const clearableEmailSet = new Set(accounts.filter(canClearChats).map(acc => acc.email))
+    return selectedEmails.filter(email => clearableEmailSet.has(email))
+  }, [accounts, selectedEmails])
+
+  useEffect(() => {
+    if (!clearTarget) return
+
+    clearReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+
+    return () => {
+      clearReturnFocusRef.current?.focus()
+      clearReturnFocusRef.current = null
+    }
+  }, [clearTarget])
+
+  useEffect(() => {
+    if (!clearTarget) return
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !clearing) {
+        setClearTarget(null)
+        setClearPhrase("")
+        return
+      }
+
+      if (event.key !== "Tab") return
+
+      const modal = clearModalRef.current
+      if (!modal) return
+
+      const focusableElements = Array.from(
+        modal.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter(element => !element.getAttribute("aria-hidden"))
+
+      if (focusableElements.length === 0) {
+        event.preventDefault()
+        return
+      }
+
+      const firstElement = focusableElements[0]
+      const lastElement = focusableElements[focusableElements.length - 1]
+      const activeElement = document.activeElement
+
+      if (event.shiftKey && (!activeElement || activeElement === firstElement || !modal.contains(activeElement))) {
+        event.preventDefault()
+        lastElement.focus()
+      } else if (!event.shiftKey && activeElement === lastElement) {
+        event.preventDefault()
+        firstElement.focus()
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown)
+    return () => window.removeEventListener("keydown", handleKeyDown)
+  }, [clearTarget, clearing])
+
+  const toggleSelectedEmail = (email: string) => {
+    setSelectedEmails(prev =>
+      prev.includes(email) ? prev.filter(item => item !== email) : [...prev, email],
+    )
+  }
+
+  const openSingleClear = (email: string) => {
+    setClearTarget({ kind: "single", email })
+    setClearPhrase("")
+  }
+
+  const openBatchClear = () => {
+    if (clearableSelectedEmails.length === 0) return
+    setClearTarget({ kind: "batch", emails: clearableSelectedEmails })
+    setClearPhrase("")
+  }
+
   const closeClearModal = () => {
     if (clearing) return
     setClearTarget(null)
@@ -158,8 +249,21 @@ export default function AccountsPage() {
   const runClearRequest = async () => {
     if (!clearTarget || clearPhrase !== CLEAR_CONFIRM_TEXT || clearing) return
 
+    const batchEmails =
+      clearTarget.kind === "batch"
+        ? clearTarget.emails.filter(email => accounts.some(acc => acc.email === email && canClearChats(acc)))
+        : []
+
+    if (clearTarget.kind === "batch" && batchEmails.length === 0) {
+      toast.error("所选账号缺少可用凭证，无法清理聊天记录")
+      setClearTarget(null)
+      setClearPhrase("")
+      setSelectedEmails(clearableSelectedEmails)
+      return
+    }
+
     setClearing(true)
-    const id = toast.loading("正在清理上游聊天记录...")
+    const id = toast.loading(clearTarget.kind === "batch" ? "正在清理所选账号..." : `正在清理 ${clearTarget.email}...`)
 
     try {
       const url =
@@ -167,15 +271,24 @@ export default function AccountsPage() {
           ? `${API_BASE}/api/admin/accounts/chats`
           : `${API_BASE}/api/admin/accounts/${encodeURIComponent(clearTarget.email)}/chats`
 
-      const res = await fetch(url, {
-        method: "DELETE",
-        headers: getAuthHeader(),
-      })
+      const requestInit =
+        clearTarget.kind === "batch"
+          ? {
+              method: "DELETE",
+              headers: { "Content-Type": "application/json", ...getAuthHeader() },
+              body: JSON.stringify({ emails: batchEmails }),
+            }
+          : {
+              method: "DELETE",
+              headers: getAuthHeader(),
+            }
+
+      const res = await fetch(url, requestInit)
       const { data, rawText } = await readClearResponse(res)
 
-      if (!res.ok) {
+      if (!res.ok || (data && typeof data === "object" && data.ok === false)) {
         const errorMessage =
-          (data && typeof data === "object" ? (data.error || data.reason || data.message) : null) ||
+          (data && typeof data === "object" ? (data.detail || data.error || data.reason || data.message) : null) ||
           (rawText ? rawText.trim() : "") ||
           res.statusText ||
           "请求失败"
@@ -184,12 +297,8 @@ export default function AccountsPage() {
 
       if (clearTarget.kind === "batch") {
         const summary = (data && typeof data === "object" ? data.summary : null) || {}
-        const message = `批量清理完成：成功 ${summary.success || 0}，失败 ${summary.failed || 0}，跳过 ${summary.skipped || 0}`
-        if (data && typeof data === "object" && data.ok) {
-          toast.success(message, { id, duration: 8000 })
-        } else {
-          toast.error(message, { id, duration: 8000 })
-        }
+        toast.success(`批量清理完成：成功 ${summary.success || 0}，失败 ${summary.failed || 0}，跳过 ${summary.skipped || 0}`, { id, duration: 8000 })
+        setSelectedEmails([])
       } else {
         if (data && typeof data === "object" && data.status === "success") {
           toast.success(`已清理 ${data.email}`, { id, duration: 8000 })
@@ -204,9 +313,9 @@ export default function AccountsPage() {
       fetchAccounts()
       setClearTarget(null)
       setClearPhrase("")
-    } catch {
-      toast.error(clearTarget.kind === "batch" ? "批量清理请求失败" : "清理请求失败", { id, duration: 8000 })
-      fetchAccounts()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : (clearTarget.kind === "batch" ? "批量清理请求失败" : "清理请求失败")
+      toast.error(message, { id, duration: 8000 })
     } finally {
       setClearing(false)
     }
@@ -333,11 +442,6 @@ export default function AccountsPage() {
       .catch(() => toast.error("激活请求失败", { id }))
   }
 
-  const availableAccountCount = useMemo(
-    () => accounts.filter(acc => Boolean(acc.cookies || acc.token)).length,
-    [accounts]
-  )
-
   return (
     <div className="space-y-6 relative">
       <div className="flex justify-between items-center">
@@ -351,12 +455,12 @@ export default function AccountsPage() {
           </Button>
           <Button
             variant="outline"
-            onClick={() => setClearTarget({ kind: "batch" })}
-            disabled={clearing || availableAccountCount === 0}
+            onClick={openBatchClear}
+            disabled={clearing || clearableSelectedEmails.length === 0}
             className="border-red-500/30 text-red-600 hover:bg-red-500/10 hover:text-red-700 dark:text-red-400"
-            title={availableAccountCount > 0 ? "清理所有可用账号的上游聊天记录" : "当前没有可清理的可用账号"}
+            title={clearableSelectedEmails.length > 0 ? "清理所选账号的上游聊天记录" : "请先勾选可清理的账号"}
           >
-            <Trash2 className="mr-2 h-4 w-4" /> {"批量清理聊天记录"}
+            <Trash2 className="mr-2 h-4 w-4" /> {`清理所选聊天记录 (${clearableSelectedEmails.length})`}
           </Button>
           <Button variant="outline" onClick={() => { fetchAccounts(); toast.success("账号列表已刷新") }}>
             <RefreshCw className="mr-2 h-4 w-4" /> {"刷新状态"}
@@ -414,6 +518,7 @@ export default function AccountsPage() {
         <table className="w-full text-sm text-left">
           <thead className="bg-muted/30 border-b text-muted-foreground text-xs uppercase tracking-wider font-semibold">
             <tr>
+              <th className="h-12 px-6 align-middle w-12">{"选择"}</th>
               <th className="h-12 px-6 align-middle">{"账号"}</th>
               <th className="h-12 px-6 align-middle">{"状态"}</th>
               <th className="h-12 px-6 align-middle">{"并发负载"}</th>
@@ -424,14 +529,24 @@ export default function AccountsPage() {
           <tbody className="divide-y divide-border/50">
             {accounts.length === 0 && (
               <tr>
-                <td colSpan={5} className="px-6 py-12 text-center text-muted-foreground">{"暂无账号，请手动注入或一键获取新号。"}</td>
+                <td colSpan={6} className="px-6 py-12 text-center text-muted-foreground">{"暂无账号，请手动注入或一键获取新号。"}</td>
               </tr>
             )}
             {accounts.map(acc => {
-              const clearDisabled = !acc.cookies && !acc.token
+              const clearDisabled = !canClearChats(acc)
 
               return (
                 <tr key={acc.email} className="transition-colors hover:bg-black/5 dark:hover:bg-white/5">
+                  <td className="px-6 py-4 align-middle">
+                    <input
+                      type="checkbox"
+                      checked={selectedEmails.includes(acc.email)}
+                      onChange={() => toggleSelectedEmail(acc.email)}
+                      aria-label={`选择 ${acc.email}`}
+                      disabled={clearDisabled || clearing}
+                      className="h-4 w-4 rounded border-input"
+                    />
+                  </td>
                   <td className="px-6 py-4 align-middle font-medium font-mono text-foreground/90">{acc.email}</td>
                   <td className="px-6 py-4 align-middle">
                     <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-bold ring-1 ${statusStyle(acc.status_code)}`}>
@@ -451,7 +566,7 @@ export default function AccountsPage() {
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() => setClearTarget({ kind: "single", email: acc.email })}
+                        onClick={() => openSingleClear(acc.email)}
                         disabled={clearing || clearDisabled}
                         className="text-red-600 dark:text-red-400 border-red-500/30 hover:bg-red-500/10 hover:text-red-700"
                         title={clearDisabled ? "缺少 cookies 和 token，无法清理" : "清理该账号的上游聊天记录"}
@@ -463,10 +578,24 @@ export default function AccountsPage() {
                           <MailWarning className="h-4 w-4 mr-1" /> {"激活"}
                         </Button>
                       )}
-                      <Button variant="outline" size="sm" onClick={() => handleVerify(acc.email)} disabled={verifying === acc.email} title={"单独验证"}>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleVerify(acc.email)}
+                        disabled={verifying === acc.email}
+                        title={"单独验证"}
+                        aria-label={`验证账号 ${acc.email}`}
+                      >
                         {verifying === acc.email ? <RefreshCw className="h-4 w-4 animate-spin text-blue-500" /> : <ShieldCheck className="h-4 w-4" />}
                       </Button>
-                      <Button variant="ghost" size="sm" onClick={() => handleDelete(acc.email)} className="text-destructive hover:bg-destructive/10 hover:text-destructive" title={"删除账号"}>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleDelete(acc.email)}
+                        className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                        title={"删除账号"}
+                        aria-label={`删除账号 ${acc.email}`}
+                      >
                         <Trash2 className="h-4 w-4" />
                       </Button>
                     </div>
@@ -480,32 +609,46 @@ export default function AccountsPage() {
 
       {clearTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4" onClick={closeClearModal}>
-          <div className="w-full max-w-lg rounded-2xl border bg-background p-6 shadow-2xl" onClick={e => e.stopPropagation()}>
+          <div
+            ref={clearModalRef}
+            className="w-full max-w-lg rounded-2xl border bg-background p-6 shadow-2xl"
+            onClick={e => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={CLEAR_MODAL_TITLE_ID}
+            aria-describedby={CLEAR_MODAL_DESCRIPTION_ID}
+          >
             <div className="flex items-start justify-between gap-4">
               <div>
-                <h4 className="text-lg font-bold">{clearTarget.kind === "batch" ? "批量清理上游聊天记录" : "清理账号上游聊天记录"}</h4>
-                <p className="mt-1 text-sm text-muted-foreground">
+                <h4 id={CLEAR_MODAL_TITLE_ID} className="text-lg font-bold">{clearTarget.kind === "batch" ? `清理所选 ${clearTarget.emails.length} 个账号上游聊天记录` : "清理账号上游聊天记录"}</h4>
+                <p id={CLEAR_MODAL_DESCRIPTION_ID} className="mt-1 text-sm text-muted-foreground">
                   {clearTarget.kind === "batch"
-                    ? `将仅处理所有可用账号，当前可用账号数：${availableAccountCount}`
+                    ? `将仅处理所选账号，当前选中 ${clearTarget.emails.length} 个账号。`
                     : `目标账号：${clearTarget.email}`}
                 </p>
               </div>
-              <Button variant="ghost" size="sm" onClick={closeClearModal} disabled={clearing}>
+              <Button variant="ghost" size="sm" onClick={closeClearModal} disabled={clearing} aria-label="关闭清理确认弹窗">
                 <X className="h-4 w-4" />
               </Button>
             </div>
 
             <div className="mt-5 rounded-xl border border-red-500/20 bg-red-500/5 p-4">
-              <p className="text-sm font-medium text-red-700 dark:text-red-300">
+              <label
+                htmlFor={CLEAR_MODAL_CONFIRM_INPUT_ID}
+                id={CLEAR_MODAL_CONFIRM_HELP_ID}
+                className="text-sm font-medium text-red-700 dark:text-red-300"
+              >
                 {`请输入「${CLEAR_CONFIRM_TEXT}」以确认执行清理操作。`}
-              </p>
+              </label>
               <input
+                id={CLEAR_MODAL_CONFIRM_INPUT_ID}
                 autoFocus
                 value={clearPhrase}
                 onChange={e => setClearPhrase(e.target.value)}
                 disabled={clearing}
                 className="mt-3 flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                 placeholder={CLEAR_CONFIRM_TEXT}
+                aria-describedby={CLEAR_MODAL_CONFIRM_HELP_ID}
               />
             </div>
 
