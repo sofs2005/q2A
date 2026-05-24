@@ -166,33 +166,6 @@ function createDefaultPersonalizationSettings(): PersonalizationSettings {
   }
 }
 
-function normalizePersonalizationSettings(raw: unknown): PersonalizationSettings {
-  const fallback = createDefaultPersonalizationSettings()
-
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    return fallback
-  }
-
-  const source = raw as Record<string, unknown>
-  const memorySource = source.memory && typeof source.memory === "object" && !Array.isArray(source.memory)
-    ? (source.memory as Record<string, unknown>)
-    : {}
-  const toolsSource = source.tools_enabled && typeof source.tools_enabled === "object" && !Array.isArray(source.tools_enabled)
-    ? (source.tools_enabled as Record<string, unknown>)
-    : {}
-
-  return {
-    memory: {
-      enable_memory: Boolean(memorySource.enable_memory),
-      enable_history_memory: Boolean(memorySource.enable_history_memory),
-    },
-    tools_enabled: PERSONALIZATION_TOOL_OPTIONS.reduce((acc, option) => {
-      acc[option.key] = Boolean(toolsSource[option.key] ?? option.defaultOn)
-      return acc
-    }, {} as Record<string, boolean>),
-  }
-}
-
 function buildPersonalizationPayload(settings: PersonalizationSettings): PersonalizationSettings {
   return {
     memory: {
@@ -243,7 +216,7 @@ export default function AccountsPage() {
   const [personalizationTarget, setPersonalizationTarget] = useState<PersonalizationTarget | null>(null)
   const [personalizationSettings, setPersonalizationSettings] = useState<PersonalizationSettings>(createDefaultPersonalizationSettings())
   const [personalizationPhrase, setPersonalizationPhrase] = useState("")
-  const [personalizationLoading, setPersonalizationLoading] = useState(false)
+  const personalizationLoading = false
   const [personalizationSaving, setPersonalizationSaving] = useState(false)
   const [personalizationClearing, setPersonalizationClearing] = useState(false)
   const personalizationModalRef = useRef<HTMLDivElement | null>(null)
@@ -378,41 +351,13 @@ export default function AccountsPage() {
     setPersonalizationPhrase("")
   }
 
-  const openSinglePersonalization = async (targetEmail: string) => {
+  const openSinglePersonalization = (targetEmail: string) => {
     if (personalizationLoading || personalizationSaving || personalizationClearing) return
 
     personalizationReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
-    setPersonalizationLoading(true)
-    const id = toast.loading(`正在读取 ${targetEmail} 的个性化设置...`)
-
-    try {
-      const res = await fetch(`${API_BASE}/api/admin/accounts/${encodeURIComponent(targetEmail)}/personalization`, {
-        headers: getAuthHeader(),
-      })
-      const { data, rawText } = await readClearResponse(res)
-
-      if (!res.ok || (data && typeof data === "object" && data.ok === false)) {
-        const errorMessage =
-          (data && typeof data === "object" ? (data.detail || data.error || data.reason || data.message) : null) ||
-          (rawText ? rawText.trim() : "") ||
-          res.statusText ||
-          "请求失败"
-        throw new Error(localizeError(String(errorMessage)))
-      }
-
-      const normalizedSettings = normalizePersonalizationSettings(data)
-      setPersonalizationSettings(normalizedSettings)
-      setPersonalizationTarget({ kind: "single", email: targetEmail })
-      setPersonalizationPhrase("")
-      toast.dismiss(id)
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "读取个性化设置失败"
-      toast.error(message, { id, duration: 8000 })
-      personalizationReturnFocusRef.current?.focus()
-      personalizationReturnFocusRef.current = null
-    } finally {
-      setPersonalizationLoading(false)
-    }
+    setPersonalizationTarget({ kind: "single", email: targetEmail })
+    setPersonalizationSettings(createDefaultPersonalizationSettings())
+    setPersonalizationPhrase("")
   }
 
   const closePersonalizationModal = () => {
@@ -699,9 +644,9 @@ export default function AccountsPage() {
             onClick={openBatchPersonalization}
             disabled={personalizationLoading || personalizationBusy || clearableSelectedEmails.length === 0}
             className="border-red-500/30 text-red-600 hover:bg-red-500/10 hover:text-red-700 dark:text-red-400"
-            title={clearableSelectedEmails.length > 0 ? "管理所选账号的个性化设置并清理聊天记录" : "请先勾选可清理的账号"}
+            title={clearableSelectedEmails.length > 0 ? "管理所选账号的设置" : "请先勾选可设置的账号"}
           >
-            <Trash2 className="mr-2 h-4 w-4" /> {`清理所选聊天记录 (${clearableSelectedEmails.length})`}
+            <Trash2 className="mr-2 h-4 w-4" /> {`批量账号设置 (${clearableSelectedEmails.length})`}
           </Button>
           <Button variant="outline" onClick={() => { fetchAccounts(); toast.success("账号列表已刷新") }}>
             <RefreshCw className="mr-2 h-4 w-4" /> {"刷新状态"}
@@ -810,9 +755,9 @@ export default function AccountsPage() {
                         onClick={() => openSinglePersonalization(acc.email)}
                         disabled={personalizationBusy || personalizationLoading || clearDisabled}
                         className="text-red-600 dark:text-red-400 border-red-500/30 hover:bg-red-500/10 hover:text-red-700"
-                        title={clearDisabled ? "缺少 cookies 和 token，无法清理" : "管理该账号的个性化设置并清理上游聊天记录"}
+                        title={clearDisabled ? "缺少 cookies 和 token，无法设置" : "管理该账号的设置"}
                       >
-                        <Trash2 className="h-4 w-4 mr-1" /> {"清理聊天记录"}
+                        <Trash2 className="h-4 w-4 mr-1" /> {"账号设置"}
                       </Button>
                       {acc.status_code !== "valid" && acc.status_code !== "rate_limited" && acc.status_code !== "banned" && (
                         <Button variant="outline" size="sm" onClick={() => handleActivate(acc.email)} className="text-orange-600 dark:text-orange-400 border-orange-500/30 hover:bg-orange-500/10 font-medium">
