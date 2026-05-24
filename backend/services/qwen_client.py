@@ -68,6 +68,103 @@ class QwenClient:
             or "expired" in body_lower
         )
 
+    @staticmethod
+    def _build_personalization_headers(*, token: str | None = None, cookies: str | None = None) -> dict[str, str]:
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": f"{BASE_URL}/settings/personalization",
+            "Origin": BASE_URL,
+            "Connection": "keep-alive",
+            "Content-Type": "application/json",
+            "Version": "0.2.57",
+            "source": "web",
+            "X-Request-Id": str(uuid.uuid4()),
+            "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT%z", time.localtime()),
+        }
+        if cookies:
+            headers["Cookie"] = cookies
+        elif token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    async def _request_personalization_raw_json(
+        self,
+        method: str,
+        path: str,
+        account,
+        body: dict | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        email = getattr(account, "email", "")
+        cookie_value = str(getattr(account, "cookies", "") or "").strip()
+        token_value = str(getattr(account, "token", "") or "").strip()
+
+        if not cookie_value and not token_value:
+            return {"email": email, "status": "skipped", "reason": "missing_credentials"}
+
+        request_timeout = timeout if timeout is not None else settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS
+
+        if cookie_value:
+            cookie_res = await self._request_raw_json(
+                method,
+                path,
+                self._build_personalization_headers(cookies=cookie_value),
+                body,
+                timeout=request_timeout,
+            )
+            if cookie_res["status"] in (200, 204):
+                return {
+                    "email": email,
+                    "status": "success",
+                    "transport": "cookie",
+                    "http_status": cookie_res["status"],
+                    "body": cookie_res["body"],
+                }
+            if not self._looks_like_upstream_auth_failure(cookie_res["status"], cookie_res["body"]):
+                return {
+                    "email": email,
+                    "status": "failed",
+                    "transport": "cookie",
+                    "http_status": cookie_res["status"],
+                    "error": f"HTTP {cookie_res['status']}: {cookie_res['body'][:120]}",
+                }
+            if not token_value:
+                return {
+                    "email": email,
+                    "status": "failed",
+                    "transport": "cookie",
+                    "http_status": cookie_res["status"],
+                    "error": f"HTTP {cookie_res['status']}: {cookie_res['body'][:120]}",
+                }
+
+        if token_value:
+            token_res = await self._request_raw_json(
+                method,
+                path,
+                self._build_personalization_headers(token=token_value),
+                body,
+                timeout=request_timeout,
+            )
+            if token_res["status"] in (200, 204):
+                return {
+                    "email": email,
+                    "status": "success",
+                    "transport": "token",
+                    "http_status": token_res["status"],
+                    "body": token_res["body"],
+                }
+            return {
+                "email": email,
+                "status": "failed",
+                "transport": "token",
+                "http_status": token_res["status"],
+                "error": f"HTTP {token_res['status']}: {token_res['body'][:120]}",
+            }
+
+        return {"email": email, "status": "skipped", "reason": "missing_credentials"}
+
     async def _request_raw_json(
         self,
         method: str,
@@ -169,6 +266,23 @@ class QwenClient:
             return []
         chats = data.get("data", [])
         return chats if isinstance(chats, list) else []
+
+    async def get_personalization_settings(self, account) -> dict:
+        return await self._request_personalization_raw_json(
+            "GET",
+            "/api/v2/configs/setting-config",
+            account,
+            timeout=20.0,
+        )
+
+    async def update_personalization_settings(self, account, payload: dict) -> dict:
+        return await self._request_personalization_raw_json(
+            "POST",
+            "/api/v2/users/user/settings/update",
+            account,
+            body=payload,
+            timeout=20.0,
+        )
 
     async def verify_token(self, token: str) -> bool:
         """Verify token validity via direct HTTP (no browser page needed)."""

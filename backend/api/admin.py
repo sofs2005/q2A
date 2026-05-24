@@ -1,3 +1,4 @@
+import json
 import logging
 import secrets
 
@@ -74,6 +75,64 @@ async def _clear_single_account_chats(client, account):
         return {"email": account.email, "status": "skipped", "reason": "missing_credentials"}
 
     return await client.clear_all_chats(account)
+
+
+_PERSONALIZATION_MEMORY_KEYS = ("enable_memory", "enable_history_memory")
+
+
+def _payload_get_value(payload, key: str, default=None):
+    if isinstance(payload, dict):
+        return payload.get(key, default)
+    return getattr(payload, key, default)
+
+
+def _normalize_personalization_update_payload(payload) -> dict:
+    memory_payload = _payload_get_value(payload, "memory")
+    tools_payload = _payload_get_value(payload, "tools_enabled")
+
+    if not isinstance(memory_payload, dict):
+        raise HTTPException(status_code=400, detail="memory block is required")
+    if not isinstance(tools_payload, dict):
+        raise HTTPException(status_code=400, detail="tools_enabled block is required")
+
+    normalized_memory = {
+        "enable_memory": bool(memory_payload.get("enable_memory", False)),
+        "enable_history_memory": bool(memory_payload.get("enable_history_memory", False)),
+    }
+    normalized_tools = {str(key): bool(value) for key, value in tools_payload.items() if str(key)}
+    if len(normalized_tools) != 9:
+        raise HTTPException(status_code=400, detail="tools_enabled must contain 9 flags")
+
+    return {"memory": normalized_memory, "tools_enabled": normalized_tools}
+
+
+def _extract_requested_emails(payload) -> list[str]:
+    emails = _payload_get_value(payload, "emails", [])
+    if not isinstance(emails, list):
+        raise HTTPException(status_code=400, detail="emails must be a list")
+    return _normalize_selected_emails(emails)
+
+
+def _extract_personalization_view(body_text: str) -> dict:
+    try:
+        parsed = json.loads(body_text or "{}")
+    except Exception:
+        parsed = {}
+
+    source = parsed.get("data") if isinstance(parsed, dict) and isinstance(parsed.get("data"), dict) else parsed
+    if not isinstance(source, dict):
+        source = {}
+
+    memory_source = source.get("memory") if isinstance(source.get("memory"), dict) else {}
+    tools_source = source.get("tools_enabled") if isinstance(source.get("tools_enabled"), dict) else {}
+
+    return {
+        "memory": {
+            "enable_memory": bool(memory_source.get("enable_memory", False)),
+            "enable_history_memory": bool(memory_source.get("enable_history_memory", False)),
+        },
+        "tools_enabled": {str(key): bool(value) for key, value in tools_source.items() if str(key)},
+    }
 
 
 @router.get("/status", dependencies=[Depends(verify_admin)])
@@ -270,6 +329,129 @@ async def clear_upstream_chats_for_account(email: str, request: Request):
         raise HTTPException(status_code=404, detail="Account not found")
 
     return await _clear_single_account_chats(client, acc)
+
+
+@router.get("/accounts/{email}/personalization", dependencies=[Depends(verify_admin)])
+async def get_account_personalization(email: str, request: Request):
+    from backend.services.qwen_client import QwenClient
+
+    pool: AccountPool = request.app.state.account_pool
+    client: QwenClient = request.app.state.qwen_client
+
+    acc = _get_account_by_email(pool, email)
+    if not acc:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if not getattr(acc, "cookies", "") and not getattr(acc, "token", ""):
+        raise HTTPException(status_code=400, detail="missing_credentials")
+
+    upstream = await client.get_personalization_settings(acc)
+    if upstream.get("status") == "skipped":
+        raise HTTPException(status_code=400, detail=upstream.get("reason", "missing_credentials"))
+    if upstream.get("status") != "success":
+        return {
+            "ok": False,
+            "email": email,
+            "status": upstream.get("status", "failed"),
+            "error": upstream.get("error", "upstream request failed"),
+        }
+
+    view = _extract_personalization_view(upstream.get("body", ""))
+    return {
+        "ok": True,
+        "email": email,
+        "status": "success",
+        "transport": upstream.get("transport"),
+        "http_status": upstream.get("http_status"),
+        **view,
+    }
+
+
+@router.put("/accounts/{email}/personalization", dependencies=[Depends(verify_admin)])
+async def update_account_personalization(email: str, payload: dict, request: Request):
+    from backend.services.qwen_client import QwenClient
+
+    pool: AccountPool = request.app.state.account_pool
+    client: QwenClient = request.app.state.qwen_client
+
+    acc = _get_account_by_email(pool, email)
+    if not acc:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if not getattr(acc, "cookies", "") and not getattr(acc, "token", ""):
+        raise HTTPException(status_code=400, detail="missing_credentials")
+
+    normalized_payload = _normalize_personalization_update_payload(payload)
+    upstream = await client.update_personalization_settings(acc, normalized_payload)
+    if upstream.get("status") == "skipped":
+        raise HTTPException(status_code=400, detail=upstream.get("reason", "missing_credentials"))
+    if upstream.get("status") != "success":
+        return {
+            "ok": False,
+            "email": email,
+            "status": upstream.get("status", "failed"),
+            "error": upstream.get("error", "upstream request failed"),
+        }
+
+    return {
+        "ok": True,
+        "email": email,
+        "status": "success",
+        "transport": upstream.get("transport"),
+        "http_status": upstream.get("http_status"),
+    }
+
+
+@router.put("/accounts/personalization", dependencies=[Depends(verify_admin)])
+async def update_accounts_personalization(payload: dict, request: Request):
+    from backend.services.qwen_client import QwenClient
+
+    pool: AccountPool = request.app.state.account_pool
+    client: QwenClient = request.app.state.qwen_client
+
+    requested_emails = _extract_requested_emails(payload)
+    if not requested_emails:
+        raise HTTPException(status_code=400, detail="emails are required")
+
+    normalized_payload = _normalize_personalization_update_payload(payload)
+    accounts_by_email = {acc.email: acc for acc in pool.accounts}
+    results: list[dict] = []
+
+    for email in requested_emails:
+        acc = accounts_by_email.get(email)
+        if not acc:
+            results.append({"email": email, "status": "skipped", "reason": "missing_account"})
+            continue
+        if not getattr(acc, "cookies", "") and not getattr(acc, "token", ""):
+            results.append({"email": email, "status": "skipped", "reason": "missing_credentials"})
+            continue
+
+        try:
+            upstream = await client.update_personalization_settings(acc, normalized_payload)
+            if upstream.get("status") == "success":
+                results.append(
+                    {
+                        "email": email,
+                        "status": "success",
+                        "transport": upstream.get("transport"),
+                        "http_status": upstream.get("http_status"),
+                    }
+                )
+            elif upstream.get("status") == "skipped":
+                results.append({"email": email, "status": "skipped", "reason": upstream.get("reason", "missing_credentials")})
+            else:
+                results.append(
+                    {
+                        "email": email,
+                        "status": "failed",
+                        "transport": upstream.get("transport"),
+                        "http_status": upstream.get("http_status"),
+                        "error": upstream.get("error", "upstream request failed"),
+                    }
+                )
+        except Exception as exc:
+            logger.exception("Failed to update upstream personalization in batch", extra={"email": email})
+            results.append({"email": email, "status": "failed", "error": str(exc)})
+
+    return {"ok": True, "summary": _summarize_clear_results(results), "results": results}
 
 
 @router.delete("/accounts/{email}", dependencies=[Depends(verify_admin)])

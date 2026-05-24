@@ -21,15 +21,82 @@ type AccountItem = {
   last_error?: string
 }
 
-type ClearTarget =
+type PersonalizationMemory = {
+  enable_memory: boolean
+  enable_history_memory: boolean
+}
+
+type PersonalizationSettings = {
+  memory: PersonalizationMemory
+  tools_enabled: Record<string, boolean>
+}
+
+type PersonalizationTarget =
   | { kind: "single"; email: string }
   | { kind: "batch"; emails: string[] }
 
 const CLEAR_CONFIRM_TEXT = "清空上游记录"
-const CLEAR_MODAL_TITLE_ID = "accounts-clear-modal-title"
-const CLEAR_MODAL_DESCRIPTION_ID = "accounts-clear-modal-description"
-const CLEAR_MODAL_CONFIRM_INPUT_ID = "accounts-clear-confirm-input"
-const CLEAR_MODAL_CONFIRM_HELP_ID = "accounts-clear-confirm-help"
+const PERSONALIZATION_MODAL_TITLE_ID = "accounts-personalization-modal-title"
+const PERSONALIZATION_MODAL_DESCRIPTION_ID = "accounts-personalization-modal-description"
+const PERSONALIZATION_MODAL_CONFIRM_INPUT_ID = "accounts-personalization-confirm-input"
+const PERSONALIZATION_MODAL_CONFIRM_HELP_ID = "accounts-personalization-confirm-help"
+
+const PERSONALIZATION_TOOL_OPTIONS = [
+  {
+    key: "web_extractor",
+    label: "网页提取",
+    description: "专门用于访问指定的网页链接，并从中提取、总结或分析特定内容，忽略无关的页面元素。",
+    defaultOn: false,
+  },
+  {
+    key: "web_search_image",
+    label: "图片搜索",
+    description: "用于在互联网上查找与特定关键词相关的图片资源，返回图片、来源链接及描述信息等。",
+    defaultOn: false,
+  },
+  {
+    key: "web_search",
+    label: "网络搜索",
+    description: "用于在互联网上检索最新的文本信息、新闻、数据或特定知识，帮助用户获取实时的外部资讯。",
+    defaultOn: false,
+  },
+  {
+    key: "image_gen_tool",
+    label: "图像生成",
+    description: "根据用户的文字描述（提示词），从零开始创作并生成全新的、符合描述的图像。",
+    defaultOn: true,
+  },
+  {
+    key: "code_interpreter",
+    label: "代码解释器",
+    description: "一个内置的编程运行环境，可执行代码以进行复杂计算、数据分析、图表绘制或文件处理。",
+    defaultOn: false,
+  },
+  {
+    key: "history_retriever",
+    label: "检索历史记忆",
+    description: "用于在非当前的对话历史中快速查找、回顾或提取之前提及过的关键信息、上下文或用户指令。",
+    defaultOn: false,
+  },
+  {
+    key: "image_edit_tool",
+    label: "图像编辑",
+    description: "对现有图像进行修改操作，例如添加/移除物体、改变风格、调整局部细节或进行图像合成。",
+    defaultOn: true,
+  },
+  {
+    key: "bio",
+    label: "更新记忆",
+    description: "用于记录、更新或管理用户的个人偏好、关键事实及长期背景信息，确保 Qwen 在后续对话中能记住您的特定需求并保持上下文的一致性。",
+    defaultOn: false,
+  },
+  {
+    key: "image_zoom_in_tool",
+    label: "图像局部放大",
+    description: "用于对图像的特定区域进行高分辨率放大或聚焦，以便观察细节或为后续处理提供更清晰的局部视图。",
+    defaultOn: true,
+  },
+] as const
 
 function canClearChats(acc: AccountItem) {
   return Boolean(acc.cookies || acc.token)
@@ -54,12 +121,18 @@ function statusStyle(code?: string) {
 
 function statusText(acc: AccountItem) {
   switch (acc.status_code) {
-    case "valid": return "可用"
-    case "pending_activation": return "未激活"
-    case "rate_limited": return "限流"
-    case "banned": return "封禁"
-    case "auth_error": return "认证失效"
-    default: return acc.valid ? "可用" : "失效"
+    case "valid":
+      return "可用"
+    case "pending_activation":
+      return "未激活"
+    case "rate_limited":
+      return "限流"
+    case "banned":
+      return "封禁"
+    case "auth_error":
+      return "认证失效"
+    default:
+      return acc.valid ? "可用" : "失效"
   }
 }
 
@@ -78,6 +151,59 @@ function localizeError(error?: string) {
   if (lower.includes("activation link or token not found")) return "激活链接或 Token 获取失败"
   if (lower.includes("token invalid") || lower.includes("token") || lower.includes("auth")) return "Token 无效或认证失败"
   return error
+}
+
+function createDefaultPersonalizationSettings(): PersonalizationSettings {
+  return {
+    memory: {
+      enable_memory: false,
+      enable_history_memory: false,
+    },
+    tools_enabled: PERSONALIZATION_TOOL_OPTIONS.reduce((acc, option) => {
+      acc[option.key] = option.defaultOn
+      return acc
+    }, {} as Record<string, boolean>),
+  }
+}
+
+function normalizePersonalizationSettings(raw: unknown): PersonalizationSettings {
+  const fallback = createDefaultPersonalizationSettings()
+
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return fallback
+  }
+
+  const source = raw as Record<string, unknown>
+  const memorySource = source.memory && typeof source.memory === "object" && !Array.isArray(source.memory)
+    ? (source.memory as Record<string, unknown>)
+    : {}
+  const toolsSource = source.tools_enabled && typeof source.tools_enabled === "object" && !Array.isArray(source.tools_enabled)
+    ? (source.tools_enabled as Record<string, unknown>)
+    : {}
+
+  return {
+    memory: {
+      enable_memory: Boolean(memorySource.enable_memory),
+      enable_history_memory: Boolean(memorySource.enable_history_memory),
+    },
+    tools_enabled: PERSONALIZATION_TOOL_OPTIONS.reduce((acc, option) => {
+      acc[option.key] = Boolean(toolsSource[option.key] ?? option.defaultOn)
+      return acc
+    }, {} as Record<string, boolean>),
+  }
+}
+
+function buildPersonalizationPayload(settings: PersonalizationSettings): PersonalizationSettings {
+  return {
+    memory: {
+      enable_memory: Boolean(settings.memory.enable_memory),
+      enable_history_memory: Boolean(settings.memory.enable_history_memory),
+    },
+    tools_enabled: PERSONALIZATION_TOOL_OPTIONS.reduce((acc, option) => {
+      acc[option.key] = Boolean(settings.tools_enabled[option.key] ?? option.defaultOn)
+      return acc
+    }, {} as Record<string, boolean>),
+  }
 }
 
 async function readClearResponse(res: Response) {
@@ -113,11 +239,15 @@ export default function AccountsPage() {
   const [verifying, setVerifying] = useState<string | null>(null)
   const [verifyingAll, setVerifyingAll] = useState(false)
   const [selectedEmails, setSelectedEmails] = useState<string[]>([])
-  const [clearTarget, setClearTarget] = useState<ClearTarget | null>(null)
-  const [clearPhrase, setClearPhrase] = useState("")
-  const [clearing, setClearing] = useState(false)
-  const clearModalRef = useRef<HTMLDivElement | null>(null)
-  const clearReturnFocusRef = useRef<HTMLElement | null>(null)
+
+  const [personalizationTarget, setPersonalizationTarget] = useState<PersonalizationTarget | null>(null)
+  const [personalizationSettings, setPersonalizationSettings] = useState<PersonalizationSettings>(createDefaultPersonalizationSettings())
+  const [personalizationPhrase, setPersonalizationPhrase] = useState("")
+  const [personalizationLoading, setPersonalizationLoading] = useState(false)
+  const [personalizationSaving, setPersonalizationSaving] = useState(false)
+  const [personalizationClearing, setPersonalizationClearing] = useState(false)
+  const personalizationModalRef = useRef<HTMLDivElement | null>(null)
+  const personalizationReturnFocusRef = useRef<HTMLElement | null>(null)
 
   // 邮箱+密码字段同时匹配时解锁注册功能
   useEffect(() => {
@@ -154,11 +284,21 @@ export default function AccountsPage() {
     const result = { valid: 0, pending: 0, rateLimited: 0, banned: 0, invalid: 0 }
     for (const acc of accounts) {
       switch (acc.status_code) {
-        case "valid": result.valid += 1; break
-        case "pending_activation": result.pending += 1; break
-        case "rate_limited": result.rateLimited += 1; break
-        case "banned": result.banned += 1; break
-        default: result.invalid += 1; break
+        case "valid":
+          result.valid += 1
+          break
+        case "pending_activation":
+          result.pending += 1
+          break
+        case "rate_limited":
+          result.rateLimited += 1
+          break
+        case "banned":
+          result.banned += 1
+          break
+        default:
+          result.invalid += 1
+          break
       }
     }
     return result
@@ -170,29 +310,29 @@ export default function AccountsPage() {
   }, [accounts, selectedEmails])
 
   useEffect(() => {
-    if (!clearTarget) return
+    if (!personalizationTarget) return
 
-    clearReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    personalizationReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
 
     return () => {
-      clearReturnFocusRef.current?.focus()
-      clearReturnFocusRef.current = null
+      personalizationReturnFocusRef.current?.focus()
+      personalizationReturnFocusRef.current = null
     }
-  }, [clearTarget])
+  }, [personalizationTarget])
 
   useEffect(() => {
-    if (!clearTarget) return
+    if (!personalizationTarget) return
 
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !clearing) {
-        setClearTarget(null)
-        setClearPhrase("")
+      if (event.key === "Escape" && !(personalizationSaving || personalizationClearing)) {
+        setPersonalizationTarget(null)
+        setPersonalizationPhrase("")
         return
       }
 
       if (event.key !== "Tab") return
 
-      const modal = clearModalRef.current
+      const modal = personalizationModalRef.current
       if (!modal) return
 
       const focusableElements = Array.from(
@@ -221,7 +361,7 @@ export default function AccountsPage() {
 
     window.addEventListener("keydown", handleKeyDown)
     return () => window.removeEventListener("keydown", handleKeyDown)
-  }, [clearTarget, clearing])
+  }, [personalizationTarget, personalizationSaving, personalizationClearing])
 
   const toggleSelectedEmail = (email: string) => {
     setSelectedEmails(prev =>
@@ -229,50 +369,149 @@ export default function AccountsPage() {
     )
   }
 
-  const openSingleClear = (email: string) => {
-    setClearTarget({ kind: "single", email })
-    setClearPhrase("")
-  }
-
-  const openBatchClear = () => {
+  const openBatchPersonalization = () => {
     if (clearableSelectedEmails.length === 0) return
-    setClearTarget({ kind: "batch", emails: clearableSelectedEmails })
-    setClearPhrase("")
+
+    personalizationReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    setPersonalizationTarget({ kind: "batch", emails: clearableSelectedEmails })
+    setPersonalizationSettings(createDefaultPersonalizationSettings())
+    setPersonalizationPhrase("")
   }
 
-  const closeClearModal = () => {
-    if (clearing) return
-    setClearTarget(null)
-    setClearPhrase("")
+  const openSinglePersonalization = async (targetEmail: string) => {
+    if (personalizationLoading || personalizationSaving || personalizationClearing) return
+
+    personalizationReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    setPersonalizationLoading(true)
+    const id = toast.loading(`正在读取 ${targetEmail} 的个性化设置...`)
+
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/accounts/${encodeURIComponent(targetEmail)}/personalization`, {
+        headers: getAuthHeader(),
+      })
+      const { data, rawText } = await readClearResponse(res)
+
+      if (!res.ok || (data && typeof data === "object" && data.ok === false)) {
+        const errorMessage =
+          (data && typeof data === "object" ? (data.detail || data.error || data.reason || data.message) : null) ||
+          (rawText ? rawText.trim() : "") ||
+          res.statusText ||
+          "请求失败"
+        throw new Error(localizeError(String(errorMessage)))
+      }
+
+      const normalizedSettings = normalizePersonalizationSettings(data)
+      setPersonalizationSettings(normalizedSettings)
+      setPersonalizationTarget({ kind: "single", email: targetEmail })
+      setPersonalizationPhrase("")
+      toast.dismiss(id)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "读取个性化设置失败"
+      toast.error(message, { id, duration: 8000 })
+      personalizationReturnFocusRef.current?.focus()
+      personalizationReturnFocusRef.current = null
+    } finally {
+      setPersonalizationLoading(false)
+    }
   }
 
-  const runClearRequest = async () => {
-    if (!clearTarget || clearPhrase !== CLEAR_CONFIRM_TEXT || clearing) return
+  const closePersonalizationModal = () => {
+    if (personalizationSaving || personalizationClearing) return
+    setPersonalizationTarget(null)
+    setPersonalizationPhrase("")
+  }
+
+  const runPersonalizationSave = async () => {
+    if (!personalizationTarget || personalizationSaving || personalizationClearing) return
+
+    const payload = buildPersonalizationPayload(personalizationSettings)
+    const targetEmails = personalizationTarget.kind === "batch" ? personalizationTarget.emails : [personalizationTarget.email]
+
+    if (targetEmails.length === 0) {
+      toast.error("没有可保存的账号")
+      return
+    }
+
+    setPersonalizationSaving(true)
+    const id = toast.loading(personalizationTarget.kind === "batch" ? "正在保存所选账号个性化设置..." : `正在保存 ${personalizationTarget.email} 的个性化设置...`)
+
+    try {
+      const url =
+        personalizationTarget.kind === "batch"
+          ? `${API_BASE}/api/admin/accounts/personalization`
+          : `${API_BASE}/api/admin/accounts/${encodeURIComponent(personalizationTarget.email)}/personalization`
+
+      const body =
+        personalizationTarget.kind === "batch"
+          ? { emails: targetEmails, ...payload }
+          : payload
+
+      const res = await fetch(url, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", ...getAuthHeader() },
+        body: JSON.stringify(body),
+      })
+      const { data, rawText } = await readClearResponse(res)
+
+      if (!res.ok || (data && typeof data === "object" && data.ok === false)) {
+        const errorMessage =
+          (data && typeof data === "object" ? (data.detail || data.error || data.reason || data.message) : null) ||
+          (rawText ? rawText.trim() : "") ||
+          res.statusText ||
+          "请求失败"
+        throw new Error(localizeError(String(errorMessage)))
+      }
+
+      if (personalizationTarget.kind === "batch") {
+        const summary = (data && typeof data === "object" ? data.summary : null) || {}
+        const message = `批量保存完成：成功 ${summary.success || 0}，失败 ${summary.failed || 0}，跳过 ${summary.skipped || 0}`
+        if ((summary.failed || 0) > 0 || (summary.skipped || 0) > 0) {
+          toast.warning(message, { id, duration: 8000 })
+        } else {
+          toast.success(message, { id, duration: 8000 })
+        }
+      } else {
+        toast.success(`已保存 ${personalizationTarget.email} 的个性化设置`, { id, duration: 8000 })
+      }
+
+      fetchAccounts()
+      setPersonalizationTarget(null)
+      setPersonalizationPhrase("")
+    } catch (error) {
+      const message = error instanceof Error ? error.message : (personalizationTarget.kind === "batch" ? "批量保存请求失败" : "保存请求失败")
+      toast.error(message, { id, duration: 8000 })
+    } finally {
+      setPersonalizationSaving(false)
+    }
+  }
+
+  const runPersonalizationClear = async () => {
+    if (!personalizationTarget || personalizationPhrase !== CLEAR_CONFIRM_TEXT || personalizationClearing || personalizationSaving) return
 
     const batchEmails =
-      clearTarget.kind === "batch"
-        ? clearTarget.emails.filter(email => accounts.some(acc => acc.email === email && canClearChats(acc)))
+      personalizationTarget.kind === "batch"
+        ? personalizationTarget.emails.filter(email => accounts.some(acc => acc.email === email && canClearChats(acc)))
         : []
 
-    if (clearTarget.kind === "batch" && batchEmails.length === 0) {
+    if (personalizationTarget.kind === "batch" && batchEmails.length === 0) {
       toast.error("所选账号缺少可用凭证，无法清理聊天记录")
-      setClearTarget(null)
-      setClearPhrase("")
+      setPersonalizationTarget(null)
+      setPersonalizationPhrase("")
       setSelectedEmails(clearableSelectedEmails)
       return
     }
 
-    setClearing(true)
-    const id = toast.loading(clearTarget.kind === "batch" ? "正在清理所选账号..." : `正在清理 ${clearTarget.email}...`)
+    setPersonalizationClearing(true)
+    const id = toast.loading(personalizationTarget.kind === "batch" ? "正在清理所选账号..." : `正在清理 ${personalizationTarget.email}...`)
 
     try {
       const url =
-        clearTarget.kind === "batch"
+        personalizationTarget.kind === "batch"
           ? `${API_BASE}/api/admin/accounts/chats`
-          : `${API_BASE}/api/admin/accounts/${encodeURIComponent(clearTarget.email)}/chats`
+          : `${API_BASE}/api/admin/accounts/${encodeURIComponent(personalizationTarget.email)}/chats`
 
       const requestInit =
-        clearTarget.kind === "batch"
+        personalizationTarget.kind === "batch"
           ? {
               method: "DELETE",
               headers: { "Content-Type": "application/json", ...getAuthHeader() },
@@ -295,7 +534,7 @@ export default function AccountsPage() {
         throw new Error(localizeError(String(errorMessage)))
       }
 
-      if (clearTarget.kind === "batch") {
+      if (personalizationTarget.kind === "batch") {
         const summary = (data && typeof data === "object" ? data.summary : null) || {}
         toast.success(`批量清理完成：成功 ${summary.success || 0}，失败 ${summary.failed || 0}，跳过 ${summary.skipped || 0}`, { id, duration: 8000 })
         setSelectedEmails([])
@@ -311,13 +550,13 @@ export default function AccountsPage() {
       }
 
       fetchAccounts()
-      setClearTarget(null)
-      setClearPhrase("")
+      setPersonalizationTarget(null)
+      setPersonalizationPhrase("")
     } catch (error) {
-      const message = error instanceof Error ? error.message : (clearTarget.kind === "batch" ? "批量清理请求失败" : "清理请求失败")
+      const message = error instanceof Error ? error.message : (personalizationTarget.kind === "batch" ? "批量清理请求失败" : "清理请求失败")
       toast.error(message, { id, duration: 8000 })
     } finally {
-      setClearing(false)
+      setPersonalizationClearing(false)
     }
   }
 
@@ -442,6 +681,8 @@ export default function AccountsPage() {
       .catch(() => toast.error("激活请求失败", { id }))
   }
 
+  const personalizationBusy = personalizationSaving || personalizationClearing
+
   return (
     <div className="space-y-6 relative">
       <div className="flex justify-between items-center">
@@ -455,10 +696,10 @@ export default function AccountsPage() {
           </Button>
           <Button
             variant="outline"
-            onClick={openBatchClear}
-            disabled={clearing || clearableSelectedEmails.length === 0}
+            onClick={openBatchPersonalization}
+            disabled={personalizationLoading || personalizationBusy || clearableSelectedEmails.length === 0}
             className="border-red-500/30 text-red-600 hover:bg-red-500/10 hover:text-red-700 dark:text-red-400"
-            title={clearableSelectedEmails.length > 0 ? "清理所选账号的上游聊天记录" : "请先勾选可清理的账号"}
+            title={clearableSelectedEmails.length > 0 ? "管理所选账号的个性化设置并清理聊天记录" : "请先勾选可清理的账号"}
           >
             <Trash2 className="mr-2 h-4 w-4" /> {`清理所选聊天记录 (${clearableSelectedEmails.length})`}
           </Button>
@@ -543,7 +784,7 @@ export default function AccountsPage() {
                       checked={selectedEmails.includes(acc.email)}
                       onChange={() => toggleSelectedEmail(acc.email)}
                       aria-label={`选择 ${acc.email}`}
-                      disabled={clearDisabled || clearing}
+                      disabled={clearDisabled || personalizationLoading || personalizationBusy}
                       className="h-4 w-4 rounded border-input"
                     />
                   </td>
@@ -566,10 +807,10 @@ export default function AccountsPage() {
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() => openSingleClear(acc.email)}
-                        disabled={clearing || clearDisabled}
+                        onClick={() => openSinglePersonalization(acc.email)}
+                        disabled={personalizationBusy || personalizationLoading || clearDisabled}
                         className="text-red-600 dark:text-red-400 border-red-500/30 hover:bg-red-500/10 hover:text-red-700"
-                        title={clearDisabled ? "缺少 cookies 和 token，无法清理" : "清理该账号的上游聊天记录"}
+                        title={clearDisabled ? "缺少 cookies 和 token，无法清理" : "管理该账号的个性化设置并清理上游聊天记录"}
                       >
                         <Trash2 className="h-4 w-4 mr-1" /> {"清理聊天记录"}
                       </Button>
@@ -607,62 +848,152 @@ export default function AccountsPage() {
         </table>
       </div>
 
-      {clearTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4" onClick={closeClearModal}>
+      {personalizationTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4" onClick={closePersonalizationModal}>
           <div
-            ref={clearModalRef}
-            className="w-full max-w-lg rounded-2xl border bg-background p-6 shadow-2xl"
+            ref={personalizationModalRef}
+            className="w-full max-w-3xl rounded-2xl border bg-background p-6 shadow-2xl max-h-[90vh] overflow-y-auto"
             onClick={e => e.stopPropagation()}
             role="dialog"
             aria-modal="true"
-            aria-labelledby={CLEAR_MODAL_TITLE_ID}
-            aria-describedby={CLEAR_MODAL_DESCRIPTION_ID}
+            aria-labelledby={PERSONALIZATION_MODAL_TITLE_ID}
+            aria-describedby={PERSONALIZATION_MODAL_DESCRIPTION_ID}
           >
             <div className="flex items-start justify-between gap-4">
               <div>
-                <h4 id={CLEAR_MODAL_TITLE_ID} className="text-lg font-bold">{clearTarget.kind === "batch" ? `清理所选 ${clearTarget.emails.length} 个账号上游聊天记录` : "清理账号上游聊天记录"}</h4>
-                <p id={CLEAR_MODAL_DESCRIPTION_ID} className="mt-1 text-sm text-muted-foreground">
-                  {clearTarget.kind === "batch"
-                    ? `将仅处理所选账号，当前选中 ${clearTarget.emails.length} 个账号。`
-                    : `目标账号：${clearTarget.email}`}
+                <h4 id={PERSONALIZATION_MODAL_TITLE_ID} className="text-lg font-bold">
+                  {personalizationTarget.kind === "batch"
+                    ? `管理所选 ${personalizationTarget.emails.length} 个账号的个性化设置`
+                    : `管理 ${personalizationTarget.email} 的个性化设置`}
+                </h4>
+                <p id={PERSONALIZATION_MODAL_DESCRIPTION_ID} className="mt-1 text-sm text-muted-foreground">
+                  {personalizationTarget.kind === "batch"
+                    ? `当前选中 ${personalizationTarget.emails.length} 个账号，保存后会把同一份设置应用到这些账号。`
+                    : `目标账号：${personalizationTarget.email}`}
                 </p>
               </div>
-              <Button variant="ghost" size="sm" onClick={closeClearModal} disabled={clearing} aria-label="关闭清理确认弹窗">
+              <Button variant="ghost" size="sm" onClick={closePersonalizationModal} disabled={personalizationBusy} aria-label="关闭个性化设置弹窗">
                 <X className="h-4 w-4" />
               </Button>
             </div>
 
-            <div className="mt-5 rounded-xl border border-red-500/20 bg-red-500/5 p-4">
-              <label
-                htmlFor={CLEAR_MODAL_CONFIRM_INPUT_ID}
-                id={CLEAR_MODAL_CONFIRM_HELP_ID}
-                className="text-sm font-medium text-red-700 dark:text-red-300"
-              >
-                {`请输入「${CLEAR_CONFIRM_TEXT}」以确认执行清理操作。`}
-              </label>
-              <input
-                id={CLEAR_MODAL_CONFIRM_INPUT_ID}
-                autoFocus
-                value={clearPhrase}
-                onChange={e => setClearPhrase(e.target.value)}
-                disabled={clearing}
-                className="mt-3 flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                placeholder={CLEAR_CONFIRM_TEXT}
-                aria-describedby={CLEAR_MODAL_CONFIRM_HELP_ID}
-              />
+            <div className="mt-5 space-y-4">
+              <section className="rounded-xl border bg-muted/20 p-4">
+                <h5 className="text-sm font-semibold">{"记忆设置"}</h5>
+                <div className="mt-3 space-y-3">
+                  <label className="flex items-center justify-between gap-4 rounded-lg border bg-background px-3 py-2 text-sm">
+                    <span>
+                      <span className="font-medium">{"启用记忆"}</span>
+                      <span className="ml-2 text-xs text-muted-foreground">{"让账号保留长期记忆"}</span>
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={personalizationSettings.memory.enable_memory}
+                      onChange={e => setPersonalizationSettings(prev => ({
+                        ...prev,
+                        memory: {
+                          ...prev.memory,
+                          enable_memory: e.target.checked,
+                        },
+                      }))}
+                      disabled={personalizationBusy}
+                      className="h-4 w-4 rounded border-input"
+                    />
+                  </label>
+                  <label className="flex items-center justify-between gap-4 rounded-lg border bg-background px-3 py-2 text-sm">
+                    <span>
+                      <span className="font-medium">{"启用历史记忆"}</span>
+                      <span className="ml-2 text-xs text-muted-foreground">{"让账号保留历史上下文记忆"}</span>
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={personalizationSettings.memory.enable_history_memory}
+                      onChange={e => setPersonalizationSettings(prev => ({
+                        ...prev,
+                        memory: {
+                          ...prev.memory,
+                          enable_history_memory: e.target.checked,
+                        },
+                      }))}
+                      disabled={personalizationBusy}
+                      className="h-4 w-4 rounded border-input"
+                    />
+                  </label>
+                </div>
+              </section>
+
+              <section className="rounded-xl border bg-muted/20 p-4">
+                <h5 className="text-sm font-semibold">{"工具设置"}</h5>
+                <p className="mt-1 text-xs text-muted-foreground">{"共 9 个工具开关，保存时会按当前勾选状态同步到目标账号。"}</p>
+                <div className="mt-3 grid gap-3 md:grid-cols-2">
+                  {PERSONALIZATION_TOOL_OPTIONS.map(option => (
+                    <label key={option.key} className="flex items-center justify-between gap-4 rounded-lg border bg-background px-3 py-2 text-sm">
+                      <span className="min-w-0">
+                        <span className="block font-medium">{option.label}</span>
+                        <span className="block text-xs text-muted-foreground">{option.description}</span>
+                        <span className="block truncate text-[11px] font-mono text-muted-foreground/70">{option.key}</span>
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(personalizationSettings.tools_enabled[option.key])}
+                        onChange={e => setPersonalizationSettings(prev => ({
+                          ...prev,
+                          tools_enabled: {
+                            ...prev.tools_enabled,
+                            [option.key]: e.target.checked,
+                          },
+                        }))}
+                        disabled={personalizationBusy}
+                        className="h-4 w-4 rounded border-input"
+                      />
+                    </label>
+                  ))}
+                </div>
+              </section>
+
+              <section className="rounded-xl border border-red-500/20 bg-red-500/5 p-4">
+                <h5 className="text-sm font-semibold text-red-700 dark:text-red-300">{"清空上游记录"}</h5>
+                <p className="mt-1 text-xs text-red-700/80 dark:text-red-200/80">
+                  {personalizationTarget.kind === "batch"
+                    ? `如需清理所选 ${personalizationTarget.emails.length} 个账号的上游聊天记录，请输入确认短语。`
+                    : `如需清理 ${personalizationTarget.email} 的上游聊天记录，请输入确认短语。`}
+                </p>
+                <label
+                  htmlFor={PERSONALIZATION_MODAL_CONFIRM_INPUT_ID}
+                  id={PERSONALIZATION_MODAL_CONFIRM_HELP_ID}
+                  className="mt-3 block text-sm font-medium text-red-700 dark:text-red-300"
+                >
+                  {`请输入「${CLEAR_CONFIRM_TEXT}」以确认执行清理操作。`}
+                </label>
+                <input
+                  id={PERSONALIZATION_MODAL_CONFIRM_INPUT_ID}
+                  autoFocus
+                  value={personalizationPhrase}
+                  onChange={e => setPersonalizationPhrase(e.target.value)}
+                  disabled={personalizationBusy}
+                  className="mt-3 flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  placeholder={CLEAR_CONFIRM_TEXT}
+                  aria-describedby={PERSONALIZATION_MODAL_CONFIRM_HELP_ID}
+                />
+              </section>
             </div>
 
-            <div className="mt-6 flex justify-end gap-2">
-              <Button variant="outline" onClick={closeClearModal} disabled={clearing}>
-                取消
-              </Button>
+            <div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:items-center sm:justify-between">
               <Button
                 variant="destructive"
-                onClick={runClearRequest}
-                disabled={clearing || clearPhrase !== CLEAR_CONFIRM_TEXT}
+                onClick={runPersonalizationClear}
+                disabled={personalizationBusy || personalizationPhrase !== CLEAR_CONFIRM_TEXT}
               >
-                {clearing ? "清理中..." : "确认清理"}
+                {personalizationClearing ? "清理中..." : "确认清理"}
               </Button>
+              <div className="flex gap-2 sm:justify-end">
+                <Button variant="outline" onClick={closePersonalizationModal} disabled={personalizationBusy}>
+                  取消
+                </Button>
+                <Button variant="default" onClick={runPersonalizationSave} disabled={personalizationBusy || personalizationLoading}>
+                  {personalizationSaving ? "保存中..." : (personalizationTarget.kind === "batch" ? "批量保存" : "保存设置")}
+                </Button>
+              </div>
             </div>
           </div>
         </div>
