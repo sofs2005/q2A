@@ -36,6 +36,7 @@ type PersonalizationTarget =
   | { kind: "batch"; emails: string[] }
 
 const CLEAR_CONFIRM_TEXT = "清空上游记录"
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100] as const
 const PERSONALIZATION_MODAL_TITLE_ID = "accounts-personalization-modal-title"
 const PERSONALIZATION_MODAL_DESCRIPTION_ID = "accounts-personalization-modal-description"
 const PERSONALIZATION_MODAL_CONFIRM_INPUT_ID = "accounts-personalization-confirm-input"
@@ -136,14 +137,6 @@ function statusText(acc: AccountItem) {
   }
 }
 
-function statusNote(acc: AccountItem) {
-  if ((acc.rate_limited_until || 0) > Date.now() / 1000) {
-    const seconds = Math.max(0, Math.ceil((acc.rate_limited_until! - Date.now() / 1000)))
-    return `预计 ${seconds} 秒后恢复`
-  }
-  return acc.last_error || ""
-}
-
 function localizeError(error?: string) {
   if (!error) return "未知错误"
   const lower = error.toLowerCase()
@@ -212,6 +205,8 @@ export default function AccountsPage() {
   const [verifying, setVerifying] = useState<string | null>(null)
   const [verifyingAll, setVerifyingAll] = useState(false)
   const [selectedEmails, setSelectedEmails] = useState<string[]>([])
+  const [currentPage, setCurrentPage] = useState(1)
+  const [pageSize, setPageSize] = useState<(typeof PAGE_SIZE_OPTIONS)[number]>(10)
 
   const [personalizationTarget, setPersonalizationTarget] = useState<PersonalizationTarget | null>(null)
   const [personalizationSettings, setPersonalizationSettings] = useState<PersonalizationSettings>(createDefaultPersonalizationSettings())
@@ -219,6 +214,7 @@ export default function AccountsPage() {
   const personalizationLoading = false
   const [personalizationSaving, setPersonalizationSaving] = useState(false)
   const [personalizationClearing, setPersonalizationClearing] = useState(false)
+  const pageSelectAllRef = useRef<HTMLInputElement | null>(null)
   const personalizationModalRef = useRef<HTMLDivElement | null>(null)
   const personalizationReturnFocusRef = useRef<HTMLElement | null>(null)
 
@@ -277,10 +273,39 @@ export default function AccountsPage() {
     return result
   }, [accounts])
 
+  const totalPages = Math.max(1, Math.ceil(accounts.length / pageSize))
+  const safeCurrentPage = Math.min(currentPage, totalPages)
+  const pageStartIndex = (safeCurrentPage - 1) * pageSize
+  const pagedAccounts = useMemo(
+    () => accounts.slice(pageStartIndex, pageStartIndex + pageSize),
+    [accounts, pageStartIndex, pageSize],
+  )
+  const pageEndIndex = Math.min(pageStartIndex + pagedAccounts.length, accounts.length)
+  const currentPageClearableEmails = useMemo(
+    () => pagedAccounts.filter(canClearChats).map(acc => acc.email),
+    [pagedAccounts],
+  )
+  const currentPageSelectedCount = currentPageClearableEmails.filter(email => selectedEmails.includes(email)).length
+  const isCurrentPageAllSelected = currentPageClearableEmails.length > 0 && currentPageSelectedCount === currentPageClearableEmails.length
+  const isCurrentPagePartiallySelected = currentPageSelectedCount > 0 && !isCurrentPageAllSelected
+
   const clearableSelectedEmails = useMemo(() => {
     const clearableEmailSet = new Set(accounts.filter(canClearChats).map(acc => acc.email))
     return selectedEmails.filter(email => clearableEmailSet.has(email))
   }, [accounts, selectedEmails])
+
+  useEffect(() => {
+    if (currentPage > totalPages) {
+      setSelectedEmails([])
+      setCurrentPage(totalPages)
+    }
+  }, [currentPage, totalPages])
+
+  useEffect(() => {
+    if (pageSelectAllRef.current) {
+      pageSelectAllRef.current.indeterminate = isCurrentPagePartiallySelected
+    }
+  }, [isCurrentPagePartiallySelected])
 
   useEffect(() => {
     if (!personalizationTarget) return
@@ -340,6 +365,25 @@ export default function AccountsPage() {
     setSelectedEmails(prev =>
       prev.includes(email) ? prev.filter(item => item !== email) : [...prev, email],
     )
+  }
+
+  const toggleCurrentPageSelection = () => {
+    if (currentPageClearableEmails.length === 0) return
+    setSelectedEmails(isCurrentPageAllSelected ? [] : currentPageClearableEmails)
+  }
+
+  const goToPage = (page: number) => {
+    const nextPage = Math.min(Math.max(page, 1), totalPages)
+    if (nextPage === safeCurrentPage) return
+    setSelectedEmails([])
+    setCurrentPage(nextPage)
+  }
+
+  const changePageSize = (nextPageSize: number) => {
+    if (!PAGE_SIZE_OPTIONS.includes(nextPageSize as (typeof PAGE_SIZE_OPTIONS)[number])) return
+    setSelectedEmails([])
+    setCurrentPage(1)
+    setPageSize(nextPageSize as (typeof PAGE_SIZE_OPTIONS)[number])
   }
 
   const openBatchPersonalization = () => {
@@ -704,11 +748,21 @@ export default function AccountsPage() {
         <table className="w-full text-sm text-left">
           <thead className="bg-muted/30 border-b text-muted-foreground text-xs uppercase tracking-wider font-semibold">
             <tr>
-              <th className="h-12 px-6 align-middle w-12">{"选择"}</th>
+              <th className="h-12 px-6 align-middle w-12">
+                <input
+                  ref={pageSelectAllRef}
+                  type="checkbox"
+                  checked={isCurrentPageAllSelected}
+                  onChange={toggleCurrentPageSelection}
+                  aria-label="选择当前页账号"
+                  disabled={currentPageClearableEmails.length === 0 || personalizationLoading || personalizationBusy}
+                  className="h-4 w-4 rounded border-input"
+                />
+              </th>
+              <th className="h-12 px-6 align-middle w-20">{"序号"}</th>
               <th className="h-12 px-6 align-middle">{"账号"}</th>
               <th className="h-12 px-6 align-middle">{"状态"}</th>
               <th className="h-12 px-6 align-middle">{"并发负载"}</th>
-              <th className="h-12 px-6 align-middle">{"说明"}</th>
               <th className="h-12 px-6 align-middle text-right">{"操作"}</th>
             </tr>
           </thead>
@@ -718,8 +772,9 @@ export default function AccountsPage() {
                 <td colSpan={6} className="px-6 py-12 text-center text-muted-foreground">{"暂无账号，请手动注入或一键获取新号。"}</td>
               </tr>
             )}
-            {accounts.map(acc => {
+            {pagedAccounts.map((acc, index) => {
               const clearDisabled = !canClearChats(acc)
+              const rowNumber = pageStartIndex + index + 1
 
               return (
                 <tr key={acc.email} className="transition-colors hover:bg-black/5 dark:hover:bg-white/5">
@@ -733,6 +788,7 @@ export default function AccountsPage() {
                       className="h-4 w-4 rounded border-input"
                     />
                   </td>
+                  <td className="px-6 py-4 align-middle font-mono text-muted-foreground">{rowNumber}</td>
                   <td className="px-6 py-4 align-middle font-medium font-mono text-foreground/90">{acc.email}</td>
                   <td className="px-6 py-4 align-middle">
                     <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-bold ring-1 ${statusStyle(acc.status_code)}`}>
@@ -743,9 +799,6 @@ export default function AccountsPage() {
                     <span className="inline-flex items-center justify-center bg-muted/50 px-2 py-1 rounded text-xs border">
                       {acc.inflight || 0} {"线程"}
                     </span>
-                  </td>
-                  <td className="px-6 py-4 align-middle text-muted-foreground max-w-[420px] truncate" title={statusNote(acc)}>
-                    {statusNote(acc) || "-"}
                   </td>
                   <td className="px-6 py-4 align-middle text-right">
                     <div className="flex items-center justify-end gap-2">
@@ -791,6 +844,40 @@ export default function AccountsPage() {
             })}
           </tbody>
         </table>
+        <div className="flex flex-col gap-3 border-t bg-muted/10 px-6 py-4 text-sm text-muted-foreground md:flex-row md:items-center md:justify-between">
+          <div>
+            {accounts.length > 0
+              ? `显示第 ${pageStartIndex + 1}-${pageEndIndex} 条，共 ${accounts.length} 条`
+              : "共 0 条账号"}
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="flex items-center gap-2">
+              <span>{"每页"}</span>
+              <select
+                value={pageSize}
+                onChange={event => changePageSize(Number(event.target.value))}
+                className="h-9 rounded-md border border-input bg-background px-2 text-sm text-foreground"
+                aria-label="每页账号数量"
+              >
+                {PAGE_SIZE_OPTIONS.map(option => (
+                  <option key={option} value={option}>{option}</option>
+                ))}
+              </select>
+              <span>{"条"}</span>
+            </label>
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" onClick={() => goToPage(safeCurrentPage - 1)} disabled={safeCurrentPage <= 1}>
+                上一页
+              </Button>
+              <span className="min-w-20 text-center text-foreground">
+                {safeCurrentPage} / {totalPages}
+              </span>
+              <Button variant="outline" size="sm" onClick={() => goToPage(safeCurrentPage + 1)} disabled={safeCurrentPage >= totalPages}>
+                下一页
+              </Button>
+            </div>
+          </div>
+        </div>
       </div>
 
       {personalizationTarget && (
