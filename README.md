@@ -1,17 +1,19 @@
 # qwen2API Enterprise Gateway
 
-[![License](https://img.shields.io/github/license/YuJunZhiXue/qwen2API?style=flat-square)](https://github.com/YuJunZhiXue/qwen2API/blob/main/LICENSE)
-[![Stars](https://img.shields.io/github/stars/YuJunZhiXue/qwen2API?style=flat-square)](https://github.com/YuJunZhiXue/qwen2API/stargazers)
-[![Forks](https://img.shields.io/github/forks/YuJunZhiXue/qwen2API?style=flat-square)](https://github.com/YuJunZhiXue/qwen2API/network/members)
-[![Release](https://img.shields.io/github/v/release/YuJunZhiXue/qwen2API?style=flat-square)](https://github.com/YuJunZhiXue/qwen2API/releases)
-[![Docker Pulls](https://img.shields.io/docker/pulls/yujunzhixue/qwen2api?style=flat-square)](https://hub.docker.com/r/yujunzhixue/qwen2api)
+[![License](https://img.shields.io/github/license/sofs2005/qwen2API?style=flat-square)](https://github.com/sofs2005/qwen2API/blob/main/LICENSE)
+[![Stars](https://img.shields.io/github/stars/sofs2005/qwen2API?style=flat-square)](https://github.com/sofs2005/qwen2API/stargazers)
+[![Forks](https://img.shields.io/github/forks/sofs2005/qwen2API?style=flat-square)](https://github.com/sofs2005/qwen2API/network/members)
+[![Release](https://img.shields.io/github/v/release/sofs2005/qwen2API?style=flat-square)](https://github.com/sofs2005/qwen2API/releases)
+[![Docker Pulls](https://img.shields.io/docker/pulls/softs2005/qwen2api?style=flat-square)](https://hub.docker.com/r/softs2005/qwen2api)
 
 [![Deploy on Zeabur](https://zeabur.com/button.svg)](https://zeabur.com/templates/qwen2api)
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FYuJunZhiXue%2Fqwen2API)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsofs2005%2Fqwen2API)
 
 语言 / Language: [中文](./README.md) | [English](./README.en.md)
 
 qwen2API 用于将通义千问（chat.qwen.ai）网页版能力转换为 OpenAI、Anthropic Claude 与 Gemini 兼容接口。项目后端基于 FastAPI，前端基于 React + Vite，内置管理台、账号池、工具调用解析、图片生成链路与多种部署方式。
+
+原始项目作者：YuJunZhiXue；当前仓库由 sofs2005 维护。
 
 ---
 
@@ -240,7 +242,7 @@ mkdir -p data logs
 ```yaml
 services:
   qwen2api:
-    image: yujunzhixue/qwen2api:latest
+    image: softs2005/qwen2api:latest
     container_name: qwen2api
     restart: unless-stopped
     env_file:
@@ -313,7 +315,7 @@ UPLOADED_FILES_FILE=/workspace/data/uploaded_files.json
 
 | 配置项 | 说明 | 建议修改 |
 |--------|------|----------|
-| `image` | 预构建镜像地址，支持 amd64/arm64 | 保持默认 `yujunzhixue/qwen2api:latest` |
+| `image` | 预构建镜像地址，支持 amd64/arm64 | 保持默认 `softs2005/qwen2api:latest` |
 | `ports` | 端口映射，格式：`宿主机端口:容器端口` | 如 7860 被占用，改为 `"8080:7860"` |
 | `volumes` | 数据持久化挂载 | **必须保留**，否则重启后数据丢失 |
 | `shm_size` | 浏览器共享内存 | 浏览器崩溃时改为 `"512m"` |
@@ -355,7 +357,7 @@ docker compose up -d
 #### 步骤
 
 ```bash
-git clone https://github.com/YuJunZhiXue/qwen2API.git
+git clone https://github.com/sofs2005/qwen2API.git
 cd qwen2API
 python start.py
 ```
@@ -419,7 +421,7 @@ python start.py
 ```yaml
 services:
   qwen2api:
-    image: yujunzhixue/qwen2api:latest
+    image: softs2005/qwen2api:latest
     container_name: qwen2api
     restart: unless-stopped
     env_file:
