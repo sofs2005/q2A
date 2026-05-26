@@ -113,6 +113,8 @@ function statusStyle(code?: string) {
       return "bg-yellow-500/10 text-yellow-700 dark:text-yellow-300 ring-yellow-500/20"
     case "banned":
       return "bg-red-500/10 text-red-700 dark:text-red-400 ring-red-500/20"
+    case "disabled":
+      return "bg-slate-500/10 text-slate-700 dark:text-slate-300 ring-slate-500/20"
     case "auth_error":
       return "bg-slate-500/10 text-slate-700 dark:text-slate-300 ring-slate-500/20"
     default:
@@ -130,6 +132,8 @@ function statusText(acc: AccountItem) {
       return "限流"
     case "banned":
       return "封禁"
+    case "disabled":
+      return "已禁用"
     case "auth_error":
       return "认证失效"
     default:
@@ -214,6 +218,9 @@ export default function AccountsPage() {
   const personalizationLoading = false
   const [personalizationSaving, setPersonalizationSaving] = useState(false)
   const [personalizationClearing, setPersonalizationClearing] = useState(false)
+  const [statusChangingEmail, setStatusChangingEmail] = useState<string | null>(null)
+  const [statusChangingAction, setStatusChangingAction] = useState<"disable" | "enable" | null>(null)
+  const [statusBatchAction, setStatusBatchAction] = useState<"disable" | "enable" | null>(null)
   const pageSelectAllRef = useRef<HTMLInputElement | null>(null)
   const personalizationModalRef = useRef<HTMLDivElement | null>(null)
   const personalizationReturnFocusRef = useRef<HTMLElement | null>(null)
@@ -240,7 +247,7 @@ export default function AccountsPage() {
       .then(data => {
         const nextAccounts = data.accounts || []
         setAccounts(nextAccounts)
-        setSelectedEmails(prev => prev.filter(email => nextAccounts.some((acc: AccountItem) => acc.email === email && canClearChats(acc))))
+        setSelectedEmails(prev => prev.filter(email => nextAccounts.some((acc: AccountItem) => acc.email === email)))
       })
       .catch(() => toast.error("刷新账号列表失败，请检查会话密钥"))
   }
@@ -250,7 +257,7 @@ export default function AccountsPage() {
   }, [])
 
   const stats = useMemo(() => {
-    const result = { valid: 0, pending: 0, rateLimited: 0, banned: 0, invalid: 0 }
+    const result = { valid: 0, pending: 0, rateLimited: 0, banned: 0, disabled: 0, invalid: 0 }
     for (const acc of accounts) {
       switch (acc.status_code) {
         case "valid":
@@ -264,6 +271,9 @@ export default function AccountsPage() {
           break
         case "banned":
           result.banned += 1
+          break
+        case "disabled":
+          result.disabled += 1
           break
         default:
           result.invalid += 1
@@ -281,17 +291,25 @@ export default function AccountsPage() {
     [accounts, pageStartIndex, pageSize],
   )
   const pageEndIndex = Math.min(pageStartIndex + pagedAccounts.length, accounts.length)
-  const currentPageClearableEmails = useMemo(
-    () => pagedAccounts.filter(canClearChats).map(acc => acc.email),
+  const currentPageEmails = useMemo(
+    () => pagedAccounts.map(acc => acc.email),
     [pagedAccounts],
   )
-  const currentPageSelectedCount = currentPageClearableEmails.filter(email => selectedEmails.includes(email)).length
-  const isCurrentPageAllSelected = currentPageClearableEmails.length > 0 && currentPageSelectedCount === currentPageClearableEmails.length
+  const currentPageSelectedCount = currentPageEmails.filter(email => selectedEmails.includes(email)).length
+  const isCurrentPageAllSelected = currentPageEmails.length > 0 && currentPageSelectedCount === currentPageEmails.length
   const isCurrentPagePartiallySelected = currentPageSelectedCount > 0 && !isCurrentPageAllSelected
 
   const clearableSelectedEmails = useMemo(() => {
     const clearableEmailSet = new Set(accounts.filter(canClearChats).map(acc => acc.email))
     return selectedEmails.filter(email => clearableEmailSet.has(email))
+  }, [accounts, selectedEmails])
+  const disabledSelectedEmails = useMemo(() => {
+    const disabledEmailSet = new Set(accounts.filter(acc => acc.status_code === "disabled").map(acc => acc.email))
+    return selectedEmails.filter(email => disabledEmailSet.has(email))
+  }, [accounts, selectedEmails])
+  const enabledSelectedEmails = useMemo(() => {
+    const enabledEmailSet = new Set(accounts.filter(acc => acc.status_code !== "disabled").map(acc => acc.email))
+    return selectedEmails.filter(email => enabledEmailSet.has(email))
   }, [accounts, selectedEmails])
 
   useEffect(() => {
@@ -368,8 +386,8 @@ export default function AccountsPage() {
   }
 
   const toggleCurrentPageSelection = () => {
-    if (currentPageClearableEmails.length === 0) return
-    setSelectedEmails(isCurrentPageAllSelected ? [] : currentPageClearableEmails)
+    if (currentPageEmails.length === 0) return
+    setSelectedEmails(isCurrentPageAllSelected ? [] : currentPageEmails)
   }
 
   const goToPage = (page: number) => {
@@ -549,6 +567,75 @@ export default function AccountsPage() {
     }
   }
 
+  const runAccountStatusChange = async (action: "disable" | "enable", targetEmail?: string) => {
+    const isBatch = !targetEmail
+    const targetEmails = isBatch ? selectedEmails : [targetEmail]
+    const normalizedEmails = targetEmails.filter((email): email is string => Boolean(email))
+
+    if (normalizedEmails.length === 0) {
+      toast.error("没有可操作的账号")
+      return
+    }
+
+    if (isBatch) {
+      setStatusBatchAction(action)
+    } else {
+      setStatusChangingEmail(targetEmail ?? null)
+      setStatusChangingAction(action)
+    }
+
+    const actionLabel = action === "disable" ? "禁用" : "启用"
+    const id = toast.loading(isBatch ? `正在批量${actionLabel}所选账号...` : `正在${actionLabel} ${targetEmail}...`)
+
+    try {
+      const url = isBatch
+        ? `${API_BASE}/api/admin/accounts/${action}`
+        : `${API_BASE}/api/admin/accounts/${encodeURIComponent(targetEmail as string)}/${action}`
+      const requestInit = isBatch
+        ? {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...getAuthHeader() },
+            body: JSON.stringify({ emails: normalizedEmails }),
+          }
+        : {
+            method: "POST",
+            headers: getAuthHeader(),
+          }
+
+      const res = await fetch(url, requestInit)
+      const { data, rawText } = await readClearResponse(res)
+
+      if (!res.ok || (data && typeof data === "object" && data.ok === false)) {
+        const errorMessage =
+          (data && typeof data === "object" ? (data.detail || data.error || data.reason || data.message) : null) ||
+          (rawText ? rawText.trim() : "") ||
+          res.statusText ||
+          "请求失败"
+        throw new Error(localizeError(String(errorMessage)))
+      }
+
+      if (isBatch) {
+        const summary = (data && typeof data === "object" ? data.summary : null) || {}
+        toast.success(`批量${actionLabel}完成：成功 ${summary.success || 0}，失败 ${summary.failed || 0}，跳过 ${summary.skipped || 0}`, { id, duration: 8000 })
+        setSelectedEmails([])
+      } else {
+        toast.success(`已${actionLabel} ${targetEmail}`, { id, duration: 6000 })
+      }
+
+      fetchAccounts()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : (isBatch ? `批量${actionLabel}请求失败` : `${actionLabel}请求失败`)
+      toast.error(message, { id, duration: 8000 })
+    } finally {
+      if (isBatch) {
+        setStatusBatchAction(null)
+      } else {
+        setStatusChangingEmail(null)
+        setStatusChangingAction(null)
+      }
+    }
+  }
+
   const handleAdd = () => {
     if (!token.trim()) {
       toast.error("请先填写 Token")
@@ -671,13 +758,15 @@ export default function AccountsPage() {
   }
 
   const personalizationBusy = personalizationSaving || personalizationClearing
+  const statusActionBusy = statusChangingEmail !== null || statusBatchAction !== null
+  const actionsBusy = personalizationBusy || statusActionBusy
 
   return (
     <div className="space-y-6 relative">
       <div className="flex justify-between items-center">
         <div>
           <h2 className="text-3xl font-extrabold tracking-tight">{"账号管理"}</h2>
-          <p className="text-muted-foreground mt-1">{"统一管理上游账号池，并区分未激活、限流、封禁与失效状态。"}</p>
+          <p className="text-muted-foreground mt-1">{"统一管理上游账号池，并区分未激活、限流、封禁、已禁用与失效状态。"}</p>
         </div>
         <div className="flex gap-2 flex-wrap justify-end">
           <Button variant="secondary" onClick={handleVerifyAll} disabled={verifyingAll}>
@@ -685,8 +774,24 @@ export default function AccountsPage() {
           </Button>
           <Button
             variant="outline"
+            onClick={() => runAccountStatusChange("disable")}
+            disabled={actionsBusy || enabledSelectedEmails.length === 0}
+            title={enabledSelectedEmails.length > 0 ? "批量禁用所选账号" : "请先勾选至少一个未禁用账号"}
+          >
+            <X className="mr-2 h-4 w-4" /> {`批量禁用 (${enabledSelectedEmails.length})`}
+          </Button>
+          <Button
+            variant="outline"
+            onClick={() => runAccountStatusChange("enable")}
+            disabled={actionsBusy || disabledSelectedEmails.length === 0}
+            title={disabledSelectedEmails.length > 0 ? "批量启用所选账号" : "请先勾选至少一个已禁用账号"}
+          >
+            <ShieldCheck className="mr-2 h-4 w-4" /> {`批量启用 (${disabledSelectedEmails.length})`}
+          </Button>
+          <Button
+            variant="outline"
             onClick={openBatchPersonalization}
-            disabled={personalizationLoading || personalizationBusy || clearableSelectedEmails.length === 0}
+            disabled={personalizationLoading || personalizationBusy || statusActionBusy || clearableSelectedEmails.length === 0}
             title={clearableSelectedEmails.length > 0 ? "管理所选账号的设置" : "请先勾选可设置的账号"}
           >
             <Settings className="mr-2 h-4 w-4" /> {`批量账号设置 (${clearableSelectedEmails.length})`}
@@ -703,11 +808,12 @@ export default function AccountsPage() {
         </div>
       </div>
 
-      <div className="grid gap-3 md:grid-cols-5">
+      <div className="grid gap-3 md:grid-cols-6">
         <div className="rounded-xl border bg-card p-4"><div className="text-sm text-muted-foreground">{"可用"}</div><div className="text-2xl font-bold">{stats.valid}</div></div>
         <div className="rounded-xl border bg-card p-4"><div className="text-sm text-muted-foreground">{"未激活"}</div><div className="text-2xl font-bold">{stats.pending}</div></div>
         <div className="rounded-xl border bg-card p-4"><div className="text-sm text-muted-foreground">{"限流"}</div><div className="text-2xl font-bold">{stats.rateLimited}</div></div>
         <div className="rounded-xl border bg-card p-4"><div className="text-sm text-muted-foreground">{"封禁"}</div><div className="text-2xl font-bold">{stats.banned}</div></div>
+        <div className="rounded-xl border bg-card p-4"><div className="text-sm text-muted-foreground">{"已禁用"}</div><div className="text-2xl font-bold">{stats.disabled}</div></div>
         <div className="rounded-xl border bg-card p-4"><div className="text-sm text-muted-foreground">{"其他失效"}</div><div className="text-2xl font-bold">{stats.invalid}</div></div>
       </div>
 
@@ -754,7 +860,7 @@ export default function AccountsPage() {
                   checked={isCurrentPageAllSelected}
                   onChange={toggleCurrentPageSelection}
                   aria-label="选择当前页账号"
-                  disabled={currentPageClearableEmails.length === 0 || personalizationLoading || personalizationBusy}
+                  disabled={currentPageEmails.length === 0 || actionsBusy}
                   className="h-4 w-4 rounded border-input"
                 />
               </th>
@@ -783,7 +889,7 @@ export default function AccountsPage() {
                       checked={selectedEmails.includes(acc.email)}
                       onChange={() => toggleSelectedEmail(acc.email)}
                       aria-label={`选择 ${acc.email}`}
-                      disabled={clearDisabled || personalizationLoading || personalizationBusy}
+                      disabled={actionsBusy}
                       className="h-4 w-4 rounded border-input"
                     />
                   </td>
@@ -805,12 +911,39 @@ export default function AccountsPage() {
                         variant="outline"
                         size="sm"
                         onClick={() => openSinglePersonalization(acc.email)}
-                        disabled={personalizationBusy || personalizationLoading || clearDisabled}
+                        disabled={personalizationBusy || personalizationLoading || actionsBusy || clearDisabled}
                         title={clearDisabled ? "缺少 cookies 和 token，无法设置" : "管理该账号的设置"}
                       >
                         <Settings className="h-4 w-4 mr-1" /> {"账号设置"}
                       </Button>
-                      {acc.status_code !== "valid" && acc.status_code !== "rate_limited" && acc.status_code !== "banned" && (
+                      {acc.status_code === "disabled" ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => runAccountStatusChange("enable", acc.email)}
+                          disabled={actionsBusy}
+                          className="text-slate-700 dark:text-slate-300 border-slate-500/30 hover:bg-slate-500/10 font-medium"
+                        >
+                          {statusChangingEmail === acc.email && statusChangingAction === "enable"
+                            ? <RefreshCw className="h-4 w-4 mr-1 animate-spin" />
+                            : <ShieldCheck className="h-4 w-4 mr-1" />}
+                          {"启用"}
+                        </Button>
+                      ) : (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => runAccountStatusChange("disable", acc.email)}
+                          disabled={actionsBusy}
+                          className="text-slate-700 dark:text-slate-300 border-slate-500/30 hover:bg-slate-500/10 font-medium"
+                        >
+                          {statusChangingEmail === acc.email && statusChangingAction === "disable"
+                            ? <RefreshCw className="h-4 w-4 mr-1 animate-spin" />
+                            : <X className="h-4 w-4 mr-1" />}
+                          {"禁用"}
+                        </Button>
+                      )}
+                      {acc.status_code !== "disabled" && acc.status_code !== "valid" && acc.status_code !== "rate_limited" && acc.status_code !== "banned" && (
                         <Button variant="outline" size="sm" onClick={() => handleActivate(acc.email)} className="text-orange-600 dark:text-orange-400 border-orange-500/30 hover:bg-orange-500/10 font-medium">
                           <MailWarning className="h-4 w-4 mr-1" /> {"激活"}
                         </Button>
@@ -819,7 +952,7 @@ export default function AccountsPage() {
                         variant="outline"
                         size="sm"
                         onClick={() => handleVerify(acc.email)}
-                        disabled={verifying === acc.email}
+                        disabled={verifying === acc.email || actionsBusy}
                         title={"单独验证"}
                         aria-label={`验证账号 ${acc.email}`}
                       >

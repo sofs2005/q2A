@@ -1,5 +1,17 @@
+import sys
+import types
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+if "pydantic_settings" not in sys.modules:
+    fake_pydantic_settings = types.ModuleType("pydantic_settings")
+
+    class BaseSettings:
+        pass
+
+    fake_pydantic_settings.BaseSettings = BaseSettings
+    sys.modules["pydantic_settings"] = fake_pydantic_settings
 
 from backend.core.account_pool import Account, AccountPool
 from backend.core.config import settings
@@ -160,6 +172,40 @@ class AccountPoolDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(selected, stale)
         self.assertEqual(stale.inflight, 1)
         self.assertEqual(pool.last_acquire_diagnostics["selected_email"], "stale@example.com")
+
+    async def test_disabled_account_is_not_acquired(self) -> None:
+        disabled = Account(email="disabled@example.com")
+        fallback = Account(email="fallback@example.com")
+        pool = self._pool(disabled, fallback)
+        pool.db = SimpleNamespace(save=AsyncMock())
+
+        await pool.disable_accounts(["disabled@example.com"])
+
+        with patch("backend.core.account_pool.time.time", return_value=100.0), patch("backend.core.account_pool._jitter_seconds", return_value=0.0):
+            selected = await pool.acquire()
+
+        self.assertEqual(disabled.get_status_code(), "disabled")
+        self.assertFalse(disabled.valid)
+        self.assertEqual(selected.email, "fallback@example.com")
+        self.assertEqual(pool.last_acquire_diagnostics["blocked_reasons"], {"disabled": 1})
+
+    async def test_enabled_account_returns_to_valid_and_can_be_acquired(self) -> None:
+        account = Account(email="disabled@example.com")
+        account.valid = False
+        account.status_code = "disabled"
+        account.activation_pending = True
+        pool = self._pool(account)
+        pool.db = SimpleNamespace(save=AsyncMock())
+
+        await pool.enable_accounts(["disabled@example.com"])
+
+        with patch("backend.core.account_pool.time.time", return_value=100.0), patch("backend.core.account_pool._jitter_seconds", return_value=0.0):
+            selected = await pool.acquire()
+
+        self.assertEqual(account.get_status_code(), "valid")
+        self.assertTrue(account.valid)
+        self.assertFalse(account.activation_pending)
+        self.assertIs(selected, account)
 
 
 if __name__ == "__main__":

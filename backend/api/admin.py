@@ -39,6 +39,10 @@ class ChatClearBatchRequest(BaseModel):
     emails: list[str]
 
 
+class AccountStatusBatchRequest(BaseModel):
+    emails: list[str]
+
+
 def _normalize_selected_emails(emails: list[str]) -> list[str]:
     normalized_emails: list[str] = []
     seen: set[str] = set()
@@ -252,6 +256,50 @@ async def verify_all_accounts(request: Request):
 
     await pool.save() # 直接保存全部状态，不调用 mark_invalid 以免熔断影响测试
     return {"ok": True, "results": results}
+
+@router.post("/accounts/disable", dependencies=[Depends(verify_admin)])
+async def disable_accounts(payload: AccountStatusBatchRequest, request: Request):
+    pool: AccountPool = request.app.state.account_pool
+    requested_emails = _normalize_selected_emails(getattr(payload, "emails", []))
+    if not requested_emails:
+        raise HTTPException(status_code=400, detail="emails are required")
+
+    results = await pool.disable_accounts(requested_emails)
+    return {"ok": True, "summary": _summarize_clear_results(results), "results": results}
+
+
+@router.post("/accounts/enable", dependencies=[Depends(verify_admin)])
+async def enable_accounts(payload: AccountStatusBatchRequest, request: Request):
+    pool: AccountPool = request.app.state.account_pool
+    requested_emails = _normalize_selected_emails(getattr(payload, "emails", []))
+    if not requested_emails:
+        raise HTTPException(status_code=400, detail="emails are required")
+
+    results = await pool.enable_accounts(requested_emails)
+    return {"ok": True, "summary": _summarize_clear_results(results), "results": results}
+
+
+@router.post("/accounts/{email}/disable", dependencies=[Depends(verify_admin)])
+async def disable_account(email: str, request: Request):
+    pool: AccountPool = request.app.state.account_pool
+    account = _get_account_by_email(pool, email)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    await pool.disable_accounts([email])
+    return {"ok": True, "email": email, "status": "disabled"}
+
+
+@router.post("/accounts/{email}/enable", dependencies=[Depends(verify_admin)])
+async def enable_account(email: str, request: Request):
+    pool: AccountPool = request.app.state.account_pool
+    account = _get_account_by_email(pool, email)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    await pool.enable_accounts([email])
+    return {"ok": True, "email": email, "status": "valid"}
+
 
 @router.post("/accounts/{email}/activate", dependencies=[Depends(verify_admin)])
 async def activate_account(email: str, request: Request):

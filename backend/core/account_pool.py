@@ -34,7 +34,8 @@ class Account:
         self.cookies = cookies
         self.username = username
         self.activation_pending = activation_pending
-        self.valid = not activation_pending
+        stored_valid = kwargs.get("valid")
+        self.valid = bool(stored_valid) if stored_valid is not None else not activation_pending and status_code not in ("disabled", "banned", "auth_error", "invalid")
         self.last_used = 0.0
         self.inflight = 0
         self.rate_limited_until = 0.0
@@ -57,6 +58,8 @@ class Account:
         return max(self.rate_limited_until, self.last_request_started + min_interval)
 
     def get_status_code(self) -> str:
+        if self.status_code == "disabled":
+            return "disabled"
         if self.activation_pending:
             return "pending_activation"
         if self.is_rate_limited():
@@ -76,6 +79,7 @@ class Account:
             "rate_limited": "限流",
             "banned": "封禁",
             "auth_error": "鉴权失败",
+            "disabled": "已禁用",
             "invalid": "失效",
             "unknown": "未知",
         }
@@ -89,6 +93,7 @@ class Account:
             "cookies": self.cookies,
             "username": self.username,
             "activation_pending": self.activation_pending,
+            "valid": self.valid,
             "status_code": self.status_code,
             "last_error": self.last_error,
             "last_request_started": self.last_request_started,
@@ -134,6 +139,61 @@ class AccountPool:
     def get_by_email(self, email: str) -> Optional[Account]:
         return next((a for a in self.accounts if a.email == email), None)
 
+    async def disable_accounts(self, emails: list[str]) -> list[dict]:
+        results: list[dict] = []
+        changed = False
+
+        async with self._lock:
+            accounts_by_email = {account.email: account for account in self.accounts}
+            for email in emails:
+                account = accounts_by_email.get(email)
+                if not account:
+                    results.append({"email": email, "status": "skipped", "reason": "missing_account"})
+                    continue
+                if account.get_status_code() == "disabled":
+                    results.append({"email": email, "status": "skipped", "reason": "already_disabled"})
+                    continue
+
+                account.valid = False
+                account.activation_pending = False
+                account.status_code = "disabled"
+                account.last_error = ""
+                if self._sticky_email == account.email:
+                    self._sticky_email = None
+                results.append({"email": email, "status": "success", "account_status": "disabled"})
+                changed = True
+
+        if changed:
+            await self.save()
+        return results
+
+    async def enable_accounts(self, emails: list[str]) -> list[dict]:
+        results: list[dict] = []
+        changed = False
+
+        async with self._lock:
+            accounts_by_email = {account.email: account for account in self.accounts}
+            for email in emails:
+                account = accounts_by_email.get(email)
+                if not account:
+                    results.append({"email": email, "status": "skipped", "reason": "missing_account"})
+                    continue
+                if account.get_status_code() != "disabled":
+                    results.append({"email": email, "status": "skipped", "reason": "already_enabled"})
+                    continue
+
+                account.valid = True
+                account.activation_pending = False
+                account.status_code = "valid"
+                account.rate_limited_until = 0.0
+                account.last_error = ""
+                results.append({"email": email, "status": "success", "account_status": "valid"})
+                changed = True
+
+        if changed:
+            await self.save()
+        return results
+
     def _reclaim_stale_inflight(self, now: float) -> None:
         timeout = max(0.0, float(getattr(settings, "ACCOUNT_BUSY_TIMEOUT_SECONDS", 0) or 0))
         if timeout <= 0:
@@ -164,6 +224,8 @@ class AccountPool:
 
         if is_excluded:
             reason = "excluded"
+        elif acc.get_status_code() == "disabled":
+            reason = "disabled"
         elif acc.activation_pending:
             reason = "pending_activation"
         elif not acc.valid:
@@ -449,7 +511,8 @@ class AccountPool:
     def status(self):
         available = [a for a in self.accounts if a.is_available()]
         rate_limited = [a for a in self.accounts if a.get_status_code() == "rate_limited"]
-        invalid = [a for a in self.accounts if a.get_status_code() not in ("valid", "rate_limited")]
+        disabled = [a for a in self.accounts if a.get_status_code() == "disabled"]
+        invalid = [a for a in self.accounts if a.get_status_code() not in ("valid", "rate_limited", "disabled")]
         activation_pending = [a for a in self.accounts if a.get_status_code() == "pending_activation"]
         banned = [a for a in self.accounts if a.get_status_code() == "banned"]
         now = time.time()
@@ -461,6 +524,7 @@ class AccountPool:
             "blocked": snapshot["blocked"],
             "blocked_reasons": snapshot["blocked_reasons"],
             "rate_limited": len(rate_limited),
+            "disabled": len(disabled),
             "invalid": len(invalid),
             "activation_pending": len(activation_pending),
             "banned": len(banned),
