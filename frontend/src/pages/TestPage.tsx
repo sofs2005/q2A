@@ -49,7 +49,10 @@ export default function TestPage() {
   const [messages, setMessages] = useState<{ role: string; content: string; error?: boolean }[]>([])
   const [input, setInput] = useState("")
   const [loading, setLoading] = useState(false)
-  const [model, setModel] = useState("qwen3.6-plus")
+  const [models, setModels] = useState<string[]>([])
+  const [model, setModel] = useState("")
+  const [modelsLoading, setModelsLoading] = useState(true)
+  const [modelsError, setModelsError] = useState<string | null>(null)
   const [stream, setStream] = useState(true)
   const bottomRef = useRef<HTMLDivElement>(null)
 
@@ -57,8 +60,67 @@ export default function TestPage() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages])
 
+  useEffect(() => {
+    let alive = true
+
+    const loadModels = async () => {
+      setModelsLoading(true)
+      setModelsError(null)
+
+      try {
+        const res = await fetch(`${API_BASE}/v1/models`, {
+          headers: getAuthHeader(),
+        })
+        const text = await res.text()
+        let data: unknown = null
+
+        if (text) {
+          try {
+            data = JSON.parse(text)
+          } catch {
+            data = text
+          }
+        }
+
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`)
+        }
+
+        const nextModels = Array.isArray((data as { data?: unknown } | null)?.data)
+          ? ((data as { data?: Array<{ id?: unknown }> }).data || [])
+              .map(item => (typeof item?.id === "string" ? item.id : ""))
+              .filter((id): id is string => id.length > 0)
+          : []
+
+        if (!alive) return
+
+        setModels(nextModels)
+        setModel(prev => {
+          if (prev && nextModels.includes(prev)) return prev
+          return nextModels[0] ?? ""
+        })
+
+        if (nextModels.length === 0) {
+          setModelsError("暂无可用模型")
+        }
+      } catch {
+        if (!alive) return
+        setModels([])
+        setModel("")
+        setModelsError("模型列表加载失败")
+      } finally {
+        if (alive) setModelsLoading(false)
+      }
+    }
+
+    loadModels()
+    return () => {
+      alive = false
+    }
+  }, [])
+
   const handleSend = async () => {
-    if (!input.trim() || loading) return
+    if (!input.trim() || loading || modelsLoading || !model) return
     const userMsg = { role: "user", content: input }
     setMessages(prev => [...prev, userMsg])
     setInput("")
@@ -161,13 +223,29 @@ export default function TestPage() {
           <p className="text-muted-foreground">在此测试您的 API 分发是否正常工作。</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <div className="flex items-center gap-2 text-sm bg-card border px-3 py-1.5 rounded-md">
-            <span className="font-medium text-muted-foreground">模型:</span>
-            <select value={model} onChange={e => setModel(e.target.value)} className="bg-transparent font-mono outline-none">
-              <option value="qwen3.6-plus">qwen3.6-plus</option>
-              <option value="qwen-max">qwen-max</option>
-              <option value="qwen-turbo">qwen-turbo</option>
-            </select>
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center gap-2 text-sm bg-card border px-3 py-1.5 rounded-md">
+              <span className="font-medium text-muted-foreground">模型:</span>
+              <select
+                value={model}
+                onChange={e => setModel(e.target.value)}
+                className="bg-transparent font-mono outline-none"
+                disabled={modelsLoading || models.length === 0}
+              >
+                {modelsLoading ? (
+                  <option value="">加载模型中...</option>
+                ) : models.length > 0 ? (
+                  models.map(item => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))
+                ) : (
+                  <option value="">暂无可用模型</option>
+                )}
+              </select>
+            </div>
+            {modelsError && <p className="text-xs text-red-500">{modelsError}</p>}
           </div>
           <div
             className="flex items-center gap-2 text-sm bg-card border px-3 py-1.5 rounded-md cursor-pointer"
@@ -187,7 +265,11 @@ export default function TestPage() {
           {messages.length === 0 && (
             <div className="h-full flex flex-col items-center justify-center text-muted-foreground space-y-4">
               <Bot className="h-12 w-12 text-muted-foreground/30" />
-              <p className="text-sm">发送一条消息以开始测试，系统将通过 /v1/chat/completions 进行调用。</p>
+              <p className="text-sm">
+                {modelsError
+                  ? "当前没有可用模型，请先检查 /v1/models 返回值。"
+                  : "发送一条消息以开始测试，系统将通过 /v1/chat/completions 进行调用。"}
+              </p>
             </div>
           )}
           {messages.map((msg, i) => (
@@ -223,7 +305,7 @@ export default function TestPage() {
             placeholder="输入测试消息..."
             disabled={loading}
           />
-          <Button onClick={handleSend} disabled={loading || !input.trim()} className="h-12 px-6">
+          <Button onClick={handleSend} disabled={loading || !input.trim() || !model || modelsLoading} className="h-12 px-6">
             {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
           </Button>
         </div>
