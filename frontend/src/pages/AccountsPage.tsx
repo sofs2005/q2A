@@ -221,6 +221,7 @@ export default function AccountsPage() {
   const [statusChangingEmail, setStatusChangingEmail] = useState<string | null>(null)
   const [statusChangingAction, setStatusChangingAction] = useState<"disable" | "enable" | null>(null)
   const [statusBatchAction, setStatusBatchAction] = useState<"disable" | "enable" | null>(null)
+  const [statusBatchMenuOpen, setStatusBatchMenuOpen] = useState(false)
   const pageSelectAllRef = useRef<HTMLInputElement | null>(null)
   const personalizationModalRef = useRef<HTMLDivElement | null>(null)
   const personalizationReturnFocusRef = useRef<HTMLElement | null>(null)
@@ -578,6 +579,7 @@ export default function AccountsPage() {
     }
 
     if (isBatch) {
+      setStatusBatchMenuOpen(false)
       setStatusBatchAction(action)
     } else {
       setStatusChangingEmail(targetEmail ?? null)
@@ -760,6 +762,7 @@ export default function AccountsPage() {
   const personalizationBusy = personalizationSaving || personalizationClearing
   const statusActionBusy = statusChangingEmail !== null || statusBatchAction !== null
   const actionsBusy = personalizationBusy || statusActionBusy
+  const selectedCount = selectedEmails.length
 
   return (
     <div className="space-y-6 relative">
@@ -772,22 +775,42 @@ export default function AccountsPage() {
           <Button variant="secondary" onClick={handleVerifyAll} disabled={verifyingAll}>
             <ShieldCheck className={`mr-2 h-4 w-4 ${verifyingAll ? 'animate-pulse' : ''}`} /> {"全量巡检"}
           </Button>
-          <Button
-            variant="outline"
-            onClick={() => runAccountStatusChange("disable")}
-            disabled={actionsBusy || enabledSelectedEmails.length === 0}
-            title={enabledSelectedEmails.length > 0 ? "批量禁用所选账号" : "请先勾选至少一个未禁用账号"}
-          >
-            <X className="mr-2 h-4 w-4" /> {`批量禁用 (${enabledSelectedEmails.length})`}
-          </Button>
-          <Button
-            variant="outline"
-            onClick={() => runAccountStatusChange("enable")}
-            disabled={actionsBusy || disabledSelectedEmails.length === 0}
-            title={disabledSelectedEmails.length > 0 ? "批量启用所选账号" : "请先勾选至少一个已禁用账号"}
-          >
-            <ShieldCheck className="mr-2 h-4 w-4" /> {`批量启用 (${disabledSelectedEmails.length})`}
-          </Button>
+          <div className="relative">
+            <Button
+              variant="outline"
+              onClick={() => setStatusBatchMenuOpen(prev => !prev)}
+              disabled={actionsBusy || selectedCount === 0}
+              title={selectedCount > 0 ? "展开批量启停操作" : "请先勾选账号"}
+              aria-haspopup="menu"
+              aria-expanded={statusBatchMenuOpen}
+            >
+              <ShieldCheck className="mr-2 h-4 w-4" /> {`批量启停 (${selectedCount})`}
+            </Button>
+            {statusBatchMenuOpen && (
+              <div className="absolute right-0 z-20 mt-2 w-44 rounded-xl border bg-background p-2 shadow-lg">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="w-full justify-start"
+                  onClick={() => runAccountStatusChange("enable")}
+                  disabled={disabledSelectedEmails.length === 0}
+                  title={disabledSelectedEmails.length > 0 ? "批量启用所选账号" : "所选账号中没有已禁用账号"}
+                >
+                  <ShieldCheck className="mr-2 h-4 w-4" /> {`批量启用 (${disabledSelectedEmails.length})`}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="w-full justify-start"
+                  onClick={() => runAccountStatusChange("disable")}
+                  disabled={enabledSelectedEmails.length === 0}
+                  title={enabledSelectedEmails.length > 0 ? "批量禁用所选账号" : "所选账号中没有未禁用账号"}
+                >
+                  <X className="mr-2 h-4 w-4" /> {`批量禁用 (${enabledSelectedEmails.length})`}
+                </Button>
+              </div>
+            )}
+          </div>
           <Button
             variant="outline"
             onClick={openBatchPersonalization}
