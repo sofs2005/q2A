@@ -163,8 +163,8 @@ export default function SettingsPage() {
     }'`
 
   return (
-    <div className="space-y-6 max-w-4xl">
-      <div className="flex justify-between items-center">
+    <div className="w-full space-y-6">
+      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
         <div>
           <h2 className="text-2xl font-bold tracking-tight">系统设置</h2>
           <p className="text-muted-foreground">管理控制台认证与网关运行时配置。</p>

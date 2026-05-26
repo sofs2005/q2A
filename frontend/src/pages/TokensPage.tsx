@@ -61,13 +61,13 @@ export default function TokensPage() {
   }
 
   return (
-    <div className="space-y-6 max-w-4xl">
-      <div className="flex justify-between items-center">
+    <div className="w-full space-y-6">
+      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
         <div>
           <h2 className="text-2xl font-bold tracking-tight">API Key 分发</h2>
           <p className="text-muted-foreground">管理可以访问此网关的下游凭证。</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <Button variant="outline" onClick={() => { fetchKeys(); toast.success("已刷新"); }}>
             <RefreshCw className="mr-2 h-4 w-4" /> 刷新
           </Button>

@@ -56,15 +56,15 @@ export default function AdminLayout() {
         </nav>
       </aside>
 
-      <main className="flex-1 flex flex-col overflow-hidden relative">
+      <main className="flex-1 flex flex-col overflow-hidden relative min-w-0">
         <header className="h-16 flex items-center justify-between px-6 border-b border-border/40 bg-card/80 backdrop-blur-xl md:hidden z-10 shadow-sm">
            <div className="font-extrabold text-lg bg-gradient-to-br from-indigo-500 to-purple-500 bg-clip-text text-transparent">qwen2API</div>
            <button className="text-muted-foreground hover:text-foreground transition-colors" onClick={() => setMobileOpen(true)}>
              <Menu className="h-6 w-6" />
            </button>
         </header>
-        <div className="flex-1 p-6 md:p-8 overflow-y-auto z-0">
-          <div className="max-w-6xl mx-auto animate-fade-in-up">
+        <div className="flex-1 p-6 md:p-8 overflow-y-auto z-0 min-w-0">
+          <div className="w-full max-w-7xl mx-auto animate-fade-in-up">
             <Outlet />
           </div>
         </div>

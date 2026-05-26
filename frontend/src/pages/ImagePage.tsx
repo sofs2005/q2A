@@ -89,7 +89,7 @@ export default function ImagePage() {
   }
 
   return (
-    <div className="space-y-6 max-w-5xl">
+    <div className="w-full space-y-6">
       <div>
         <h2 className="text-2xl font-bold tracking-tight">图片生成</h2>
         <p className="text-muted-foreground">通过 Qwen3.6-Plus 生成 AI 图片，支持多种比例。</p>

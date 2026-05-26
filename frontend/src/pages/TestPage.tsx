@@ -129,7 +129,9 @@ export default function TestPage() {
                     return msgs
                   })
                 }
-              } catch (_) { /* skip */ }
+              } catch {
+                /* skip */
+              }
             }
           }
         }
@@ -142,22 +144,23 @@ export default function TestPage() {
           })
         }
       }
-    } catch (err: any) {
-      toast.error(`网络错误: ${err.message}`)
-      setMessages(prev => [...prev, { role: "assistant", content: `❌ 网络错误: ${err.message}`, error: true }])
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "未知网络错误"
+      toast.error(`网络错误: ${message}`)
+      setMessages(prev => [...prev, { role: "assistant", content: `❌ 网络错误: ${message}`, error: true }])
     } finally {
       setLoading(false)
     }
   }
 
   return (
-    <div className="flex flex-col h-[calc(100vh-10rem)] space-y-4 max-w-5xl mx-auto">
-      <div className="flex justify-between items-center">
+    <div className="w-full space-y-6">
+      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
         <div>
           <h2 className="text-2xl font-bold tracking-tight">接口测试</h2>
           <p className="text-muted-foreground">在此测试您的 API 分发是否正常工作。</p>
         </div>
-        <div className="flex gap-4 items-center">
+        <div className="flex flex-wrap items-center gap-2">
           <div className="flex items-center gap-2 text-sm bg-card border px-3 py-1.5 rounded-md">
             <span className="font-medium text-muted-foreground">模型:</span>
             <select value={model} onChange={e => setModel(e.target.value)} className="bg-transparent font-mono outline-none">
@@ -179,7 +182,7 @@ export default function TestPage() {
         </div>
       </div>
 
-      <div className="flex-1 rounded-xl border bg-card overflow-hidden flex flex-col shadow-sm">
+      <div className="flex h-[calc(100vh-10rem)] flex-col overflow-hidden rounded-xl border bg-card shadow-sm">
         <div className="flex-1 overflow-y-auto p-6 space-y-6 flex flex-col">
           {messages.length === 0 && (
             <div className="h-full flex flex-col items-center justify-center text-muted-foreground space-y-4">
