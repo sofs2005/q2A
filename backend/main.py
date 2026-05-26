@@ -6,7 +6,6 @@ import sys
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 import os
 import sys
 
@@ -21,6 +20,7 @@ from backend.core.upstream_file_cache import UpstreamFileCache
 from backend.core.session_lock import SessionLockRegistry
 from backend.core.request_logging import configure_logging, request_context
 from backend.core.diagnostics import install_stack_dump_handler
+from backend.core.spa_static_files import SPAStaticFiles
 from backend.services.qwen_client import QwenClient
 from backend.services.file_store import LocalFileStore
 from backend.toolcore.context_offload import ContextOffloader
@@ -111,7 +111,7 @@ async def root():
 # 托管前端构建产物
 FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend", "dist")
 if os.path.exists(FRONTEND_DIST):
-    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+    app.mount("/", SPAStaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
 else:
     log.warning(f"未找到前端构建目录: {FRONTEND_DIST}，WebUI 将不可用。")
 
