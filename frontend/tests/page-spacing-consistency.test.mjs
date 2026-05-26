@@ -33,6 +33,9 @@ test("Tokens, Settings, and Test pages share the same page rhythm", () => {
     assert.match(rootClasses, /(?:^|\s)w-full(?:\s|$)/)
     assert.match(rootClasses, /(?:^|\s)space-y-6(?:\s|$)/)
     assert.doesNotMatch(rootClasses, /max-w-/)
+    if (path === "pages/SettingsPage.tsx") {
+      assert.match(source, /className="grid grid-cols-1 gap-6"/)
+    }
 
     const barClasses = topBarClass(source)
     assert.match(barClasses, /flex/)

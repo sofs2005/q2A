@@ -174,9 +174,9 @@ export default function SettingsPage() {
         </Button>
       </div>
 
-      <div className="grid gap-6">
+      <div className="grid grid-cols-1 gap-6">
         {/* Session Key */}
-        <div className="rounded-xl border bg-card text-card-foreground shadow-sm">
+        <div className="w-full min-w-0 rounded-xl border bg-card text-card-foreground shadow-sm">
           <div className="flex flex-col space-y-1.5 p-6 border-b bg-muted/30">
             <div className="flex items-center gap-2">
               <KeyRound className="h-5 w-5 text-primary" />
@@ -200,7 +200,7 @@ export default function SettingsPage() {
         </div>
 
         {/* Connection Info */}
-        <div className="rounded-xl border bg-card text-card-foreground shadow-sm">
+        <div className="w-full min-w-0 rounded-xl border bg-card text-card-foreground shadow-sm">
           <div className="flex flex-col space-y-1.5 p-6 border-b bg-muted/30">
             <div className="flex items-center gap-2">
               <ServerCrash className="h-5 w-5 text-primary" />
@@ -216,7 +216,7 @@ export default function SettingsPage() {
         </div>
 
         {/* Core Settings */}
-        <div className="rounded-xl border bg-card text-card-foreground shadow-sm">
+        <div className="w-full min-w-0 rounded-xl border bg-card text-card-foreground shadow-sm">
           <div className="flex flex-col space-y-1.5 p-6 border-b bg-muted/30">
             <div className="flex items-center gap-2">
               <Settings2 className="h-5 w-5 text-primary" />
@@ -252,7 +252,7 @@ export default function SettingsPage() {
         </div>
 
         {/* Model Mapping */}
-        <div className="rounded-xl border bg-card text-card-foreground shadow-sm">
+        <div className="w-full min-w-0 rounded-xl border bg-card text-card-foreground shadow-sm">
           <div className="flex flex-col space-y-1.5 p-6 border-b bg-muted/30">
             <h3 className="font-semibold leading-none tracking-tight">自动模型映射规则 (Model Aliases)</h3>
             <p className="text-sm text-muted-foreground">下游传入的模型名称将被网关自动路由至以下千问实际模型。请使用标准 JSON 格式编辑。</p>
@@ -271,7 +271,7 @@ export default function SettingsPage() {
         </div>
 
         {/* Usage Example */}
-        <div className="rounded-xl border bg-card text-card-foreground shadow-sm">
+        <div className="w-full min-w-0 rounded-xl border bg-card text-card-foreground shadow-sm">
           <div className="flex flex-col space-y-1.5 p-6 border-b bg-muted/30">
             <div className="flex items-center gap-2">
               <Code className="h-5 w-5 text-primary" />
