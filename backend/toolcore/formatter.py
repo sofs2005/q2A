@@ -5,6 +5,7 @@ import uuid
 from typing import Any
 
 from backend.services.token_calc import calculate_usage, completion_text_for_usage, count_tokens
+from backend.toolcall.markup_scan import find_tool_markup_tag_outside_ignored
 
 
 def _client_tool_name(name: str, tool_catalog=None) -> str:
@@ -127,14 +128,42 @@ def build_canonical_anthropic_message(*, msg_id: str, model_name: str, prompt: s
     }
 
 
-def build_canonical_gemini_payload(*, answer_text: str) -> dict[str, Any]:
+def _strip_dsml_markup(text: str) -> str:
+    if not text or "<|DSML|" not in text:
+        return text
+    tag = find_tool_markup_tag_outside_ignored(text, 0)
+    while tag is not None:
+        if tag.name in {"tool_calls", "invoke"}:
+            return text[:tag.start].rstrip()
+        tag = find_tool_markup_tag_outside_ignored(text, tag.end)
+    return text
+
+
+def build_canonical_gemini_payload(*, answer_text: str, tool_calls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    if tool_calls:
+        parts = [
+            {
+                "functionCall": {
+                    "name": call.get("name", ""),
+                    "args": call.get("input", {}),
+                }
+            }
+            for call in tool_calls
+            if call.get("name")
+        ]
+        if not parts:
+            parts = [{"text": _strip_dsml_markup(answer_text) or ""}]
+    else:
+        parts = [{"text": _strip_dsml_markup(answer_text) or ""}]
     return {
         "candidates": [
             {
                 "content": {
-                    "parts": [{"text": answer_text}],
+                    "parts": parts,
                     "role": "model",
-                }
+                },
+                "finishReason": "STOP",
+                "index": 0,
             }
         ]
     }

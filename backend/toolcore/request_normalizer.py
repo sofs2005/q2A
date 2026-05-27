@@ -116,26 +116,60 @@ def _normalize_anthropic_tools(raw_tools: Any) -> list[ToolDefinition]:
     return tools
 
 
-def _normalize_gemini_messages(contents: Any) -> list[dict[str, Any]]:
+def _normalize_gemini_messages(contents: Any, *, tool_catalog: ToolCatalog | None = None) -> list[dict[str, Any]]:
     if contents is None:
         return []
     if not isinstance(contents, list):
         raise ValueError("contents must be a list")
 
     messages: list[dict[str, Any]] = []
+    call_id_counter = 0
     for message in contents:
         if not isinstance(message, dict):
             continue
         role = "assistant" if message.get("role") == "model" else "user"
         text_parts: list[str] = []
+        function_calls: list[dict[str, Any]] = []
+        function_responses: list[dict[str, Any]] = []
         for part in message.get("parts", []) or []:
             if not isinstance(part, dict):
                 continue
             text = part.get("text")
             if isinstance(text, str) and text:
                 text_parts.append(text)
+            elif isinstance(part.get("functionCall"), dict):
+                function_calls.append(part["functionCall"])
+            elif isinstance(part.get("functionResponse"), dict):
+                function_responses.append(part["functionResponse"])
         if text_parts:
             messages.append({"role": role, "content": "\n".join(text_parts)})
+        if role == "assistant" and function_calls:
+            tool_calls: list[dict[str, Any]] = []
+            for fc in function_calls:
+                call_id = f"call_{call_id_counter}"
+                call_id_counter += 1
+                name = str(fc.get("name", ""))
+                args = fc.get("args", fc.get("arguments", {}))
+                args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args or "{}")
+                tool_calls.append({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": args_str},
+                })
+            if tool_calls:
+                messages.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
+        if role == "user" and function_responses:
+            for fr in function_responses:
+                name = str(fr.get("name", ""))
+                response_data = fr.get("response")
+                if isinstance(response_data, dict):
+                    content = json.dumps(response_data, ensure_ascii=False)
+                elif isinstance(response_data, str):
+                    content = response_data
+                else:
+                    content = str(response_data or "")
+                messages.append({"role": "tool", "tool_call_id": f"call_{call_id_counter}", "name": name, "content": content})
+                call_id_counter += 1
     return messages
 
 
@@ -400,8 +434,9 @@ def normalize_anthropic_request(req_data: dict[str, Any]) -> ToolCoreRequest:
 
 def normalize_gemini_request(req_data: dict[str, Any], *, model: str, force_stream: bool | None = None) -> ToolCoreRequest:
     del model, force_stream
-    messages = _normalize_gemini_messages(req_data.get("contents"))
     tools = _normalize_gemini_tools(req_data.get("tools"))
+    tool_catalog = ToolCatalog(tools)
+    messages = _normalize_gemini_messages(req_data.get("contents"), tool_catalog=tool_catalog)
     tool_catalog = ToolCatalog(tools)
     declared_tool_names = {tool.name for tool in tools}
     raw_tool_choice = _normalize_gemini_tool_choice(req_data)

@@ -1,6 +1,8 @@
 import unittest
 
 from backend.services.standard_request_builder import build_chat_standard_request
+from backend.toolcore.tool_catalog import ToolCatalog
+from backend.toolcore.types import ToolDefinition
 
 
 class StandardRequestToolChoiceTests(unittest.TestCase):
@@ -28,6 +30,31 @@ class StandardRequestToolChoiceTests(unittest.TestCase):
         self.assertEqual(request.required_tool_name, "bridge-0")
         self.assertEqual(request.tool_choice_raw, {"type": "function", "function": {"name": "Read"}})
         self.assertEqual(request.tool_catalog.get_client_name("Read"), "Read")
+
+    def test_preserves_upstream_tool_catalog_when_present(self) -> None:
+        upstream_catalog = ToolCatalog(
+            [
+                ToolDefinition(
+                    name="Read",
+                    description="Read file",
+                    parameters={"type": "object"},
+                    client_name="Read",
+                    model_name="bridge-9",
+                )
+            ]
+        )
+        request = build_chat_standard_request(
+            {
+                "model": "gpt-4.1",
+                "messages": [{"role": "user", "content": "read the file"}],
+                "tools": [{"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}}],
+                "_tool_catalog": upstream_catalog,
+            },
+            default_model="gpt-4.1",
+            surface="gemini",
+        )
+
+        self.assertIs(request.tool_catalog, upstream_catalog)
 
     def test_required_tool_choice_adds_prompt_constraint(self) -> None:
         request = build_chat_standard_request(

@@ -3,7 +3,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from backend.adapter.standard_request import StandardRequest
-from backend.runtime.execution import RuntimeRetryDirective, RuntimeToolDirective, build_usage_delta_factory
+import backend.runtime.execution as runtime_execution
+from backend.runtime.execution import RuntimeRetryDirective, RuntimeToolDirective, build_usage_delta_factory, collect_completion_run
 from backend.services import completion_bridge
 from backend.services.token_calc import count_tokens
 
@@ -39,6 +40,65 @@ class RuntimeUsageTests(unittest.TestCase):
 
         self.assertEqual(usage_delta, count_tokens(prompt) + count_tokens(answer_text))
         self.assertNotEqual(usage_delta, len(prompt) + len(answer_text))
+
+
+class CollectCompletionRunStreamingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_streaming_on_delta_receives_safe_text_not_raw_dsml(self) -> None:
+        request = StandardRequest(
+            prompt="prompt",
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+            tools=[{"name": "Read", "parameters": {}}],
+            tool_names=["Read"],
+            tool_enabled=True,
+        )
+        client = _FakeStreamClient(
+            [
+                {"type": "meta", "chat_id": "chat_1", "acc": None},
+                {"type": "event", "event": {"type": "delta", "phase": "answer", "content": "prefix <|DSML|tool_calls>\n"}},
+                {
+                    "type": "event",
+                    "event": {
+                        "type": "delta",
+                        "phase": "answer",
+                        "content": (
+                            '  <|DSML|invoke name="Read">\n'
+                            '    <|DSML|parameter name="file_path"><![CDATA[README.md]]></|DSML|parameter>\n'
+                            '  </|DSML|invoke>\n'
+                            '</|DSML|tool_calls> suffix'
+                        ),
+                    },
+                },
+            ]
+        )
+        deltas: list[str] = []
+
+        async def on_delta(_evt, text_chunk, _tool_calls):
+            if text_chunk is not None:
+                deltas.append(text_chunk)
+
+        with patch.object(runtime_execution.settings, "TOOLCORE_V2_ENABLED", True):
+            result = await collect_completion_run(
+                client,
+                request,
+                request.prompt,
+                capture_events=False,
+                on_delta=on_delta,
+            )
+
+        self.assertEqual(deltas, ["prefix ", " suffix"])
+        self.assertNotIn("<|DSML|", "".join(deltas))
+        self.assertEqual(result.state.tool_calls[0]["name"], "Read")
+
+
+class _FakeStreamClient:
+    def __init__(self, items):
+        self._items = items
+
+    async def chat_stream_events_with_retry(self, *args, **kwargs):
+        for item in self._items:
+            yield item
 
 
 class CompletionBridgeUsageTests(unittest.IsolatedAsyncioTestCase):

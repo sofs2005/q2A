@@ -229,6 +229,46 @@ class CrossSurfaceNormalizationTests(unittest.TestCase):
         self.assertEqual([tool.model_name for tool in result.tools], ["bridge-0"])
         self.assertEqual(result.tool_choice_policy, ToolChoicePolicy.REQUIRED)
 
+    def test_gemini_request_preserves_function_call_messages(self) -> None:
+        result = normalize_gemini_request(
+            {
+                "contents": [
+                    {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "Read",
+                                    "args": {"file_path": "README.md"},
+                                }
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "functionResponse": {
+                                    "name": "Read",
+                                    "response": {"ok": True},
+                                }
+                            }
+                        ],
+                    },
+                ],
+                "tools": [{"functionDeclarations": [{"name": "Read", "description": "Read file", "parameters": {"type": "object"}}]}],
+            },
+            model="gemini-2.5-pro",
+            force_stream=False,
+        )
+
+        self.assertEqual(result.messages[0]["role"], "assistant")
+        self.assertEqual(result.messages[0]["tool_calls"][0]["function"]["name"], "Read")
+        self.assertEqual(result.messages[0]["tool_calls"][0]["function"]["arguments"], '{"file_path": "README.md"}')
+        self.assertEqual(result.messages[1]["role"], "tool")
+        self.assertEqual(result.messages[1]["name"], "Read")
+        self.assertEqual(result.messages[1]["content"], '{"ok": true}')
+
     def test_equivalent_requests_across_surfaces_produce_equivalent_core_fields(self) -> None:
         openai_chat = normalize_chat_request(
             {

@@ -56,6 +56,17 @@ class ToolCoreFormatterTests(unittest.TestCase):
 
         self.assertEqual(payload["candidates"][0]["content"]["parts"][0]["text"], "hello")
 
+    def test_gemini_formatter_renders_function_call_payload(self) -> None:
+        payload = build_canonical_gemini_payload(
+            answer_text="",
+            tool_calls=[{"name": "Read", "input": {"file_path": "README.md"}}],
+        )
+
+        part = payload["candidates"][0]["content"]["parts"][0]["functionCall"]
+        self.assertEqual(part["name"], "Read")
+        self.assertEqual(part["args"], {"file_path": "README.md"})
+        self.assertEqual(payload["candidates"][0]["finishReason"], "STOP")
+
     def test_openai_chat_formatter_counts_tool_calls_as_completion_usage(self) -> None:
         payload = build_canonical_openai_chat_payload(
             completion_id="chatcmpl_tool_usage",

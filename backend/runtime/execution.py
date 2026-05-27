@@ -664,8 +664,12 @@ async def collect_completion_run(
                         getattr(tool_sieve, "capturing", False),
                     )
                 for sieve_evt in sieve_events:
+                    if sieve_evt.get("type") == "content":
+                        safe_text = str(sieve_evt.get("text") or "")
+                        if safe_text and on_delta is not None:
+                            await on_delta(evt, safe_text, None)
+                        continue
                     if sieve_evt.get("type") == "tool_calls":
-                        # 检测到工具调用！
                         calls = sieve_evt.get("calls", [])
                         if calls:
                             import uuid
@@ -676,14 +680,20 @@ async def collect_completion_run(
                                 "input": call["input"]
                             } for call in calls]
                             native_tool_calls.extend(detected_calls)
+                            if on_delta is not None:
+                                for flush_evt in tool_sieve.flush():
+                                    if flush_evt.get("type") == "content":
+                                        safe_text = str(flush_evt.get("text") or "")
+                                        if safe_text:
+                                            await on_delta(evt, safe_text, None)
                             log.info(
                                 "[Collect] ✓ Tool Sieve 实时检测到工具调用: tools=%s",
                                 [c.get("name") for c in detected_calls],
                             )
                             return _finalize_result(reason="tool_sieve_detected")
-
-            if on_delta is not None:
+            elif on_delta is not None:
                 await on_delta(evt, content, None)
+
             if request.tools:
                 answer_text = None
                 join_elapsed = 0.0

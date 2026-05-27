@@ -5,6 +5,7 @@ from backend.core.config import resolve_request_model
 from backend.services.client_profiles import infer_client_profile, request_looks_like_coding_task
 from backend.toolcore.prompt_builder import messages_to_prompt
 from backend.toolcore.request_normalizer import normalize_chat_request, to_prompt_payload
+from backend.toolcore.tool_catalog import ToolCatalog
 from backend.toolcall.normalize import build_tool_name_registry
 
 
@@ -35,6 +36,9 @@ def build_chat_standard_request(req_data: dict, *, default_model: str, surface: 
     requested_model = req_data.get("model", default_model)
     effective_client_profile = infer_client_profile(req_data, fallback_profile=client_profile)
     normalized_request = normalize_chat_request(req_data, excluded_tool_names=_excluded_command_like_tool_names(req_data))
+    request_tool_catalog = req_data.get("_tool_catalog")
+    if not isinstance(request_tool_catalog, ToolCatalog):
+        request_tool_catalog = normalized_request.tool_catalog
     normalized_payload = to_prompt_payload(normalized_request, model=requested_model, stream=bool(req_data.get("stream", False)))
     for field_name in ("system", "developer", "instructions"):
         if field_name in req_data:
@@ -61,7 +65,7 @@ def build_chat_standard_request(req_data: dict, *, default_model: str, surface: 
         tools=tools,
         tool_names=tool_names,
         tool_name_registry=build_tool_name_registry(tool_names),
-        tool_catalog=normalized_request.tool_catalog,
+        tool_catalog=request_tool_catalog,
         tool_enabled=prompt_result.tool_enabled,
         tool_choice_mode=tool_choice.mode,
         required_tool_name=tool_choice.required_tool_name,

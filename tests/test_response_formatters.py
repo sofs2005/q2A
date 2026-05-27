@@ -10,7 +10,7 @@ class ResponseFormatterTests(unittest.TestCase):
             '<|DSML|tool_calls><|DSML|invoke name="Read"><|DSML|parameter name="file_path"><![CDATA[README.md]]></|DSML|parameter></|DSML|invoke></|DSML|tool_calls>'
         )
 
-        self.assertEqual(sanitize_visible_answer_text(text, tool_use=True), "")
+        self.assertEqual(sanitize_visible_answer_text(text, tool_use=True), "Here is the result.")
 
     def test_sanitize_visible_answer_text_ignores_dsml_inside_fenced_code(self) -> None:
         text = "```xml\n<|DSML|tool_calls></|DSML|tool_calls>\n```"
