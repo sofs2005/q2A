@@ -5,6 +5,7 @@ import time
 from typing import Optional
 from backend.core.database import AsyncJsonDB
 from backend.core.config import settings
+from backend.core.browser_fingerprint import fingerprint_id_for_email
 
 log = logging.getLogger("qwen2api.accounts")
 
@@ -46,6 +47,7 @@ class Account:
         self.last_request_finished = float(kwargs.get("last_request_finished", 0.0) or 0.0)
         self.consecutive_failures = int(kwargs.get("consecutive_failures", 0) or 0)
         self.rate_limit_strikes = int(kwargs.get("rate_limit_strikes", 0) or 0)
+        self.fingerprint_id = str(kwargs.get("fingerprint_id", "") or "").strip()
 
     def is_rate_limited(self) -> bool:
         return self.rate_limited_until > time.time()
@@ -100,6 +102,7 @@ class Account:
             "last_request_finished": self.last_request_finished,
             "consecutive_failures": self.consecutive_failures,
             "rate_limit_strikes": self.rate_limit_strikes,
+            "fingerprint_id": self.fingerprint_id,
         }
 
 
@@ -117,7 +120,19 @@ class AccountPool:
     async def load(self):
         data = await self.db.load()
         self.accounts = [Account(**d) for d in data] if isinstance(data, list) else []
+        migrated = self._assign_missing_fingerprints()
+        if migrated:
+            await self.save()
         log.info(f"Loaded {len(self.accounts)} upstream account(s)")
+
+    def _assign_missing_fingerprints(self) -> bool:
+        changed = False
+        for account in self.accounts:
+            if account.fingerprint_id:
+                continue
+            account.fingerprint_id = fingerprint_id_for_email(account.email)
+            changed = True
+        return changed
 
     async def save(self):
         await self.db.save([a.to_dict() for a in self.accounts])

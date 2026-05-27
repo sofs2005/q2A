@@ -1,0 +1,68 @@
+import json
+import sys
+import types
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+if "pydantic_settings" not in sys.modules:
+    fake_pydantic_settings = types.ModuleType("pydantic_settings")
+
+    class BaseSettings:
+        pass
+
+    fake_pydantic_settings.BaseSettings = BaseSettings
+    sys.modules["pydantic_settings"] = fake_pydantic_settings
+
+if "curl_cffi" not in sys.modules:
+    fake_curl_cffi = types.ModuleType("curl_cffi")
+    fake_curl_cffi_requests = types.ModuleType("curl_cffi.requests")
+
+    class AsyncSession:
+        pass
+
+    fake_curl_cffi_requests.AsyncSession = AsyncSession
+    fake_curl_cffi.requests = fake_curl_cffi_requests
+    sys.modules["curl_cffi"] = fake_curl_cffi
+    sys.modules["curl_cffi.requests"] = fake_curl_cffi_requests
+
+from backend.core.account_pool import Account
+from backend.core.browser_fingerprint import fingerprint_for_account
+from backend.services.qwen_client import QwenClient
+
+
+class _FakeResponse:
+    status_code = 200
+    text = '{"ok": true}'
+
+
+class _FakeSession:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def request(self, method, url, headers=None, json=None, data=None, **kwargs):
+        self.calls.append({"method": method, "url": url, "headers": headers or {}, "json": json, "data": data, "kwargs": kwargs})
+        return _FakeResponse()
+
+
+class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_personalization_uses_account_fingerprint_session_and_headers(self) -> None:
+        account = Account(email="alice@example.com", token="token-1")
+        account.fingerprint_id = "firefox147_windows"
+        client = QwenClient(SimpleNamespace())
+        session = _FakeSession()
+        get_session = AsyncMock(return_value=session)
+
+        with patch("backend.services.qwen_client.get_session", get_session):
+            result = await client.update_personalization_settings(account, {"memory": {"enable_memory": True}})
+
+        fingerprint = fingerprint_for_account(account)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(get_session.await_args.args[0], fingerprint)
+        self.assertEqual(session.calls[0]["headers"]["User-Agent"], fingerprint.user_agent)
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer token-1")
+        self.assertEqual(session.calls[0]["json"], {"memory": {"enable_memory": True}})
+
+
+if __name__ == "__main__":
+    unittest.main()

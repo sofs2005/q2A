@@ -18,6 +18,7 @@ from backend.core.account_pool import AccountPool
 from backend.core.session_affinity import SessionAffinityStore
 from backend.core.upstream_file_cache import UpstreamFileCache
 from backend.core.session_lock import SessionLockRegistry
+from backend.core.browser_fingerprint import close_all_sessions
 from backend.core.request_logging import configure_logging, request_context
 from backend.core.diagnostics import install_stack_dump_handler
 from backend.core.spa_static_files import SPAStaticFiles
@@ -77,6 +78,7 @@ async def lifespan(app: FastAPI):
 
     with request_context(surface="shutdown"):
         log.info("正在关闭网关服务...")
+        await close_all_sessions()
 
 app = FastAPI(title="qwen2API Enterprise Gateway", version="2.0.0", lifespan=lifespan)
 

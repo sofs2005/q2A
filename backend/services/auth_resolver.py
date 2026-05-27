@@ -1,28 +1,12 @@
 import hashlib
 import logging
 
-from curl_cffi.requests import AsyncSession
-
 from backend.core.account_pool import Account, AccountPool
+from backend.core.browser_fingerprint import fingerprint_for_account, get_session
 
 log = logging.getLogger(__name__)
 
 BASE_URL = "https://chat.qwen.ai"
-_AUTH_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Content-Type": "application/json",
-    "Referer": f"{BASE_URL}/",
-    "Origin": BASE_URL,
-    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
-}
 
 
 async def get_fresh_token(email: str, password: str) -> str:
@@ -99,12 +83,13 @@ class AuthResolver:
         }
 
         try:
-            async with AsyncSession(impersonate="chrome", timeout=15, allow_redirects=True) as session:
-                resp = await session.post(
-                    f"{BASE_URL}/api/v1/auths/signin",
-                    json=payload,
-                    headers=_AUTH_HEADERS,
-                )
+            fingerprint = fingerprint_for_account(acc)
+            session = await get_session(fingerprint)
+            resp = await session.post(
+                f"{BASE_URL}/api/v1/auths/signin",
+                json=payload,
+                headers=fingerprint.build_headers(content_type="application/json"),
+            )
         except Exception as e:
             log.warning(f"[Refresh] {acc.email} curl_cffi 登录异常: {e}")
             return False

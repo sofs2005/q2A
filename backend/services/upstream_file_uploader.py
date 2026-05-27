@@ -105,6 +105,7 @@ class UpstreamFileUploader:
                 "filetype": _upload_filetype_from_content_type(content_type),
             },
             timeout=20.0,
+            account=acc,
         )
         if sts_resp.get("status") != 200:
             raise RuntimeError(f"getstsToken failed: {sts_resp.get('status')} {sts_resp.get('body', '')[:200]}")
@@ -154,6 +155,7 @@ class UpstreamFileUploader:
                 acc.token,
                 {"file_id": file_id},
                 timeout=20.0,
+                account=acc,
             )
             if parse_resp.get("status") != 200:
                 raise RuntimeError(f"files/parse failed: {parse_resp.get('status')} {parse_resp.get('body', '')[:200]}")
@@ -167,6 +169,7 @@ class UpstreamFileUploader:
                     acc.token,
                     {"file_id_list": [file_id]},
                     timeout=20.0,
+                    account=acc,
                 )
                 if status_resp.get("status") != 200:
                     raise RuntimeError(f"files/parse/status failed: {status_resp.get('status')} {status_resp.get('body', '')[:200]}")

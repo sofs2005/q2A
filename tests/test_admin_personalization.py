@@ -25,23 +25,6 @@ if "pydantic" not in sys.modules:
     fake_pydantic.BaseModel = BaseModel
     sys.modules["pydantic"] = fake_pydantic
 
-if "httpx" not in sys.modules:
-    fake_httpx = types.ModuleType("httpx")
-
-    class AsyncClient:
-        def __init__(self, *args, **kwargs):
-            self.args = args
-            self.kwargs = kwargs
-
-    class Timeout:
-        def __init__(self, *args, **kwargs):
-            self.args = args
-            self.kwargs = kwargs
-
-    fake_httpx.AsyncClient = AsyncClient
-    fake_httpx.Timeout = Timeout
-    sys.modules["httpx"] = fake_httpx
-
 if "curl_cffi" not in sys.modules:
     fake_curl_cffi = types.ModuleType("curl_cffi")
     fake_curl_cffi_requests = types.ModuleType("curl_cffi.requests")

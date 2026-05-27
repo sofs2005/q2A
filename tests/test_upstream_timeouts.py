@@ -1,10 +1,34 @@
 import asyncio
+import sys
+import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from backend.core import httpx_engine
+if "pydantic_settings" not in sys.modules:
+    fake_pydantic_settings = types.ModuleType("pydantic_settings")
+
+    class BaseSettings:
+        pass
+
+    fake_pydantic_settings.BaseSettings = BaseSettings
+    sys.modules["pydantic_settings"] = fake_pydantic_settings
+
+if "curl_cffi" not in sys.modules:
+    fake_curl_cffi = types.ModuleType("curl_cffi")
+    fake_curl_cffi_requests = types.ModuleType("curl_cffi.requests")
+
+    class AsyncSession:
+        pass
+
+    fake_curl_cffi_requests.AsyncSession = AsyncSession
+    fake_curl_cffi.requests = fake_curl_cffi_requests
+    sys.modules["curl_cffi"] = fake_curl_cffi
+    sys.modules["curl_cffi.requests"] = fake_curl_cffi_requests
+
+from backend.core import browser_fingerprint
 from backend.core.config import settings
+from backend.core.browser_fingerprint import fingerprint_for_email
 from backend.services.qwen_client import QwenClient
 from backend.upstream.qwen_executor import QwenExecutor, _has_textual_tool_contract_marker
 
@@ -26,22 +50,23 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
             "QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS",
             None,
         )
-        httpx_engine._global_session = None
-        httpx_engine._session_lock = None
+        browser_fingerprint._sessions.clear()
+        browser_fingerprint._session_lock = None
 
     async def asyncTearDown(self) -> None:
         if self.original_request_timeout is not None:
             settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS = self.original_request_timeout
         if self.original_stream_timeout is not None:
             settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS = self.original_stream_timeout
-        httpx_engine._global_session = None
-        httpx_engine._session_lock = None
+        browser_fingerprint._sessions.clear()
+        browser_fingerprint._session_lock = None
 
     async def test_create_chat_uses_configured_upstream_request_timeout(self) -> None:
         captured = {}
 
         class FakeEngine:
-            async def _request_json(self, method, path, token, body, timeout):
+            async def _request_json(self, method, path, token, body, timeout, account=None):
+                del method, path, token, body, account
                 captured["timeout"] = timeout
                 return {"status": 200, "body": '{"success": true, "data": {"id": "chat-1"}}'}
 
@@ -53,7 +78,7 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chat_id, "chat-1")
         self.assertEqual(captured["timeout"], 75.0)
 
-    async def test_curl_stream_session_uses_configured_upstream_stream_timeout(self) -> None:
+    async def test_fingerprint_session_uses_configured_upstream_stream_timeout(self) -> None:
         captured = {}
 
         class FakeSession:
@@ -61,32 +86,27 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 captured.update(kwargs)
 
         settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS = 300.0
+        fingerprint = fingerprint_for_email("user@example.com")
 
-        with patch("backend.core.httpx_engine.AsyncSession", FakeSession):
-            session = await httpx_engine._get_global_session()
+        with patch("backend.core.browser_fingerprint.AsyncSession", FakeSession):
+            session = await browser_fingerprint.get_session(fingerprint)
 
         self.assertIsInstance(session, FakeSession)
+        self.assertEqual(captured["impersonate"], fingerprint.impersonate)
         self.assertEqual(captured["timeout"], 300.0)
 
     async def test_qwen_client_request_json_uses_configured_default_timeout(self) -> None:
         captured = {}
 
-        class FakeClient:
-            def __init__(self, **kwargs):
+        class FakeSession:
+            async def request(self, *_args, **kwargs):
                 captured.update(kwargs)
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_args):
-                return None
-
-            async def request(self, *_args, **_kwargs):
                 return SimpleNamespace(status_code=200, text="{}")
 
         settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS = 88.0
+        get_session = AsyncMock(return_value=FakeSession())
 
-        with patch("backend.services.qwen_client.httpx.AsyncClient", FakeClient):
+        with patch("backend.services.qwen_client.get_session", get_session):
             result = await QwenClient(account_pool=None)._request_json(
                 "GET",
                 "/api/test",
@@ -113,12 +133,12 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 self.released += 1
 
         class FakeExecutor(QwenExecutor):
-            async def create_chat(self, token, model):
-                del token, model
+            async def create_chat(self, account, model):
+                del account, model
                 return "chat-1"
 
-            async def stream(self, token, chat_id, model, content, has_custom_tools, files=None):
-                del token, chat_id, model, content, has_custom_tools, files
+            async def stream(self, account, chat_id, model, content, has_custom_tools, files=None):
+                del account, chat_id, model, content, has_custom_tools, files
                 yield {"type": "delta", "phase": "answer", "content": "hello"}
 
         pool = FakePool()
@@ -148,12 +168,12 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 self.released += 1
 
         class FakeExecutor(QwenExecutor):
-            async def create_chat(self, token, model):
-                del token, model
+            async def create_chat(self, account, model):
+                del account, model
                 return "chat-1"
 
-            async def stream(self, token, chat_id, model, content, has_custom_tools, files=None):
-                del token, chat_id, model, content, has_custom_tools, files
+            async def stream(self, account, chat_id, model, content, has_custom_tools, files=None):
+                del account, chat_id, model, content, has_custom_tools, files
                 await asyncio.Event().wait()
                 yield {"type": "delta", "phase": "answer", "content": "never"}
 
@@ -180,25 +200,18 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *_args):
                 return None
 
-            async def aread(self):
-                return b"upstream error"
+            async def aiter_content(self):
+                yield b"upstream error"
 
-        class FakeClient:
-            def __init__(self, **kwargs):
+        class FakeSession:
+            def stream(self, *_args, **kwargs):
                 captured.update(kwargs)
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_args):
-                return None
-
-            def stream(self, *_args, **_kwargs):
                 return FakeResponse()
 
         settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS = 420.0
+        get_session = AsyncMock(return_value=FakeSession())
 
-        with patch("backend.services.qwen_client.httpx.AsyncClient", FakeClient):
+        with patch("backend.services.qwen_client.get_session", get_session):
             events = [
                 event
                 async for event in QwenClient(account_pool=None).stream_chat_once(
@@ -208,8 +221,8 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 )
             ]
 
-        self.assertEqual(events, [{"status": 500, "body": b"upstream error"}])
-        self.assertEqual(captured["timeout"].read, 420.0)
+        self.assertEqual(events, [{"status": 500, "body": "upstream error"}])
+        self.assertEqual(captured["timeout"], 420.0)
 
 
 if __name__ == "__main__":

@@ -1,60 +1,87 @@
+from __future__ import annotations
+
 import json
 import logging
 import time
 import uuid
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
-import httpx
-
-from backend.core.account_pool import AccountPool
+from backend.core.account_pool import Account
+from backend.core.browser_fingerprint import fingerprint_for_account, get_session
 from backend.core.config import settings
 from backend.services.auth_resolver import BASE_URL, AuthResolver
 from backend.upstream.payload_builder import build_chat_payload
-from backend.upstream.qwen_executor import QwenExecutor
 from backend.upstream.sse_consumer import parse_sse_chunk
 
 log = logging.getLogger("qwen2api.client")
 
 
 class QwenClient:
-    def __init__(self, account_pool: AccountPool):
+    def __init__(self, account_pool):
         self.account_pool = account_pool
         self.auth_resolver = AuthResolver(account_pool) if account_pool is not None else None
+        self.executor = None
+        from backend.upstream.qwen_executor import QwenExecutor
+
         self.executor = QwenExecutor(self, account_pool)
 
     @staticmethod
-    def _build_headers(token: str) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Referer": f"{BASE_URL}/",
-            "Origin": BASE_URL,
-            "Connection": "keep-alive",
-            "Content-Type": "application/json",
-        }
+    def _build_headers(
+        *,
+        account: Account | None = None,
+        token: str | None = None,
+        cookies: str | None = None,
+        referer: str | None = None,
+        content_type: str | None = "application/json",
+        accept: str = "application/json, text/plain, */*",
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        fingerprint = fingerprint_for_account(account)
+        headers = fingerprint.build_headers(
+            token=token,
+            cookies=cookies,
+            referer=referer,
+            content_type=content_type,
+            accept=accept,
+        )
+        if extra_headers:
+            headers.update(extra_headers)
+        return headers
 
     @staticmethod
-    def _build_chat_clear_headers(*, token: str | None = None, cookies: str | None = None) -> dict[str, str]:
-        headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": f"{BASE_URL}/settings/chats",
-            "Origin": BASE_URL,
-            "Connection": "keep-alive",
-            "Content-Type": "application/json",
-            "Version": "0.2.57",
-            "source": "web",
-            "X-Request-Id": str(uuid.uuid4()),
-            "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT%z", time.localtime()),
-        }
-        if cookies:
-            headers["Cookie"] = cookies
-        elif token:
-            headers["Authorization"] = f"Bearer {token}"
-        return headers
+    def _build_chat_clear_headers(*, account: Account | None = None, token: str | None = None, cookies: str | None = None) -> dict[str, str]:
+        return QwenClient._build_headers(
+            account=account,
+            token=token,
+            cookies=cookies,
+            referer=f"{BASE_URL}/settings/chats",
+            extra_headers={
+                "Version": "0.2.57",
+                "source": "web",
+                "X-Request-Id": str(uuid.uuid4()),
+                "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT%z", time.localtime()),
+            },
+        )
+
+    @staticmethod
+    def _build_personalization_headers(
+        *,
+        account: Account | None = None,
+        token: str | None = None,
+        cookies: str | None = None,
+    ) -> dict[str, str]:
+        return QwenClient._build_headers(
+            account=account,
+            token=token,
+            cookies=cookies,
+            referer=f"{BASE_URL}/settings/personalization",
+            extra_headers={
+                "Version": "0.2.57",
+                "source": "web",
+                "X-Request-Id": str(uuid.uuid4()),
+                "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT%z", time.localtime()),
+            },
+        )
 
     @staticmethod
     def _looks_like_upstream_auth_failure(status: int, body: str) -> bool:
@@ -68,26 +95,101 @@ class QwenClient:
             or "expired" in body_lower
         )
 
-    @staticmethod
-    def _build_personalization_headers(*, token: str | None = None, cookies: str | None = None) -> dict[str, str]:
-        headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": f"{BASE_URL}/settings/personalization",
-            "Origin": BASE_URL,
-            "Connection": "keep-alive",
-            "Content-Type": "application/json",
-            "Version": "0.2.57",
-            "source": "web",
-            "X-Request-Id": str(uuid.uuid4()),
-            "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT%z", time.localtime()),
-        }
-        if cookies:
-            headers["Cookie"] = cookies
-        elif token:
-            headers["Authorization"] = f"Bearer {token}"
-        return headers
+    async def _request_raw_json(
+        self,
+        method: str,
+        path: str,
+        headers: dict[str, str],
+        body: dict | None = None,
+        timeout: float | None = None,
+        account: Account | None = None,
+    ) -> dict:
+        request_timeout = timeout if timeout is not None else settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS
+        session = await get_session(fingerprint_for_account(account))
+        try:
+            resp = await session.request(
+                method,
+                f"{BASE_URL}{path}",
+                headers=headers,
+                json=body,
+                timeout=request_timeout,
+            )
+            return {"status": resp.status_code, "body": getattr(resp, "text", "")}
+        except Exception as e:
+            return {"status": 0, "body": str(e)}
+
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        token: str,
+        body: dict | None = None,
+        timeout: float | None = None,
+        account: Account | None = None,
+    ) -> dict:
+        request_timeout = timeout if timeout is not None else settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS
+        headers = self._build_headers(account=account, token=token)
+        session = await get_session(fingerprint_for_account(account))
+        try:
+            resp = await session.request(
+                method,
+                f"{BASE_URL}{path}",
+                headers=headers,
+                json=body,
+                timeout=request_timeout,
+            )
+            return {"status": resp.status_code, "body": getattr(resp, "text", "")}
+        except Exception as e:
+            return {"status": 0, "body": str(e)}
+
+    async def clear_all_chats(self, account) -> dict:
+        email = getattr(account, "email", "")
+        cookie_value = str(getattr(account, "cookies", "") or "").strip()
+        token_value = str(getattr(account, "token", "") or "").strip()
+
+        if not cookie_value and not token_value:
+            return {"email": email, "status": "skipped", "reason": "missing_credentials"}
+
+        path = "/api/v2/chats/"
+
+        if cookie_value:
+            cookie_res = await self._request_raw_json(
+                "DELETE",
+                path,
+                self._build_chat_clear_headers(account=account, cookies=cookie_value),
+                timeout=20.0,
+                account=account,
+            )
+            if cookie_res["status"] in (200, 204):
+                return {"email": email, "status": "success", "transport": "cookie", "http_status": cookie_res["status"]}
+            if not self._looks_like_upstream_auth_failure(cookie_res["status"], cookie_res["body"]):
+                return {
+                    "email": email,
+                    "status": "failed",
+                    "transport": "cookie",
+                    "http_status": cookie_res["status"],
+                    "error": f"HTTP {cookie_res['status']}: {cookie_res['body'][:120]}",
+                }
+
+        if token_value:
+            token_res = await self._request_raw_json(
+                "DELETE",
+                path,
+                self._build_chat_clear_headers(account=account, token=token_value),
+                timeout=20.0,
+                account=account,
+            )
+            if token_res["status"] in (200, 204):
+                return {"email": email, "status": "success", "transport": "token", "http_status": token_res["status"]}
+            return {
+                "email": email,
+                "status": "failed",
+                "transport": "token",
+                "http_status": token_res["status"],
+                "error": f"HTTP {token_res['status']}: {token_res['body'][:120]}",
+            }
+
+        return {"email": email, "status": "skipped", "reason": "missing_credentials"}
 
     async def _request_personalization_raw_json(
         self,
@@ -110,9 +212,10 @@ class QwenClient:
             cookie_res = await self._request_raw_json(
                 method,
                 path,
-                self._build_personalization_headers(cookies=cookie_value),
+                self._build_personalization_headers(account=account, cookies=cookie_value),
                 body,
                 timeout=request_timeout,
+                account=account,
             )
             if cookie_res["status"] in (200, 204):
                 return {
@@ -143,9 +246,10 @@ class QwenClient:
             token_res = await self._request_raw_json(
                 method,
                 path,
-                self._build_personalization_headers(token=token_value),
+                self._build_personalization_headers(account=account, token=token_value),
                 body,
                 timeout=request_timeout,
+                account=account,
             )
             if token_res["status"] in (200, 204):
                 return {
@@ -165,107 +269,8 @@ class QwenClient:
 
         return {"email": email, "status": "skipped", "reason": "missing_credentials"}
 
-    async def _request_raw_json(
-        self,
-        method: str,
-        path: str,
-        headers: dict[str, str],
-        body: dict | None = None,
-        timeout: float | None = None,
-    ) -> dict:
-        request_timeout = timeout if timeout is not None else settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS
-        async with httpx.AsyncClient(timeout=request_timeout, follow_redirects=True) as hc:
-            resp = await hc.request(
-                method,
-                f"{BASE_URL}{path}",
-                headers=headers,
-                json=body,
-            )
-        return {"status": resp.status_code, "body": resp.text}
-
-    async def clear_all_chats(self, account) -> dict:
-        email = getattr(account, "email", "")
-        cookie_value = str(getattr(account, "cookies", "") or "").strip()
-        token_value = str(getattr(account, "token", "") or "").strip()
-
-        if not cookie_value and not token_value:
-            return {"email": email, "status": "skipped", "reason": "missing_credentials"}
-
-        path = "/api/v2/chats/"
-
-        if cookie_value:
-            cookie_res = await self._request_raw_json(
-                "DELETE",
-                path,
-                self._build_chat_clear_headers(cookies=cookie_value),
-                timeout=20.0,
-            )
-            if cookie_res["status"] in (200, 204):
-                return {"email": email, "status": "success", "transport": "cookie", "http_status": cookie_res["status"]}
-            if not self._looks_like_upstream_auth_failure(cookie_res["status"], cookie_res["body"]):
-                return {
-                    "email": email,
-                    "status": "failed",
-                    "transport": "cookie",
-                    "http_status": cookie_res["status"],
-                    "error": f"HTTP {cookie_res['status']}: {cookie_res['body'][:120]}",
-                }
-
-        if token_value:
-            token_res = await self._request_raw_json(
-                "DELETE",
-                path,
-                self._build_chat_clear_headers(token=token_value),
-                timeout=20.0,
-            )
-            if token_res["status"] in (200, 204):
-                return {"email": email, "status": "success", "transport": "token", "http_status": token_res["status"]}
-            return {
-                "email": email,
-                "status": "failed",
-                "transport": "token",
-                "http_status": token_res["status"],
-                "error": f"HTTP {token_res['status']}: {token_res['body'][:120]}",
-            }
-
-        return {"email": email, "status": "skipped", "reason": "missing_credentials"}
-
-    async def _request_json(
-        self,
-        method: str,
-        path: str,
-        token: str,
-        body: dict | None = None,
-        timeout: float | None = None,
-    ) -> dict:
-        request_timeout = (
-            timeout if timeout is not None else settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS
-        )
-        async with httpx.AsyncClient(timeout=request_timeout, follow_redirects=True) as hc:
-            resp = await hc.request(
-                method,
-                f"{BASE_URL}{path}",
-                headers=self._build_headers(token),
-                json=body,
-            )
-        return {"status": resp.status_code, "body": resp.text}
-
-    async def create_chat(self, token: str, model: str, chat_type: str = "t2t") -> str:
-        return await self.executor.create_chat(token, model, chat_type=chat_type)
-
-    async def delete_chat(self, token: str, chat_id: str):
-        await self._request_json("DELETE", f"/api/v2/chats/{chat_id}", token, timeout=20.0)
-
-    async def list_chats(self, token: str, limit: int = 50) -> list[dict]:
-        res = await self._request_json("GET", f"/api/v2/chats?limit={limit}", token, timeout=20.0)
-        if res["status"] != 200:
-            return []
-        try:
-            data = json.loads(res.get("body", "{}"))
-        except Exception:
-            return []
-        chats = data.get("data", [])
-        return chats if isinstance(chats, list) else []
+    async def clear_all_chats_for_account(self, account) -> dict:
+        return await self.clear_all_chats(account)
 
     async def get_personalization_settings(self, account) -> dict:
         return await self._request_personalization_raw_json(
@@ -284,26 +289,26 @@ class QwenClient:
             timeout=20.0,
         )
 
-    async def verify_token(self, token: str) -> bool:
-        """Verify token validity via direct HTTP (no browser page needed)."""
+    async def verify_token(self, token: str, account: Account | None = None) -> bool:
         if not token:
             return False
 
         try:
-            async with httpx.AsyncClient(timeout=15) as hc:
-                resp = await hc.get(
-                    f"{BASE_URL}/api/v1/auths/",
-                    headers=self._build_headers(token),
-                )
-            if resp.status_code != 200:
+            res = await self._request_json(
+                "GET",
+                "/api/v1/auths/",
+                token,
+                timeout=15,
+                account=account,
+            )
+            if res["status"] != 200:
                 return False
-
             try:
-                data = resp.json()
+                data = json.loads(res.get("body", "{}"))
                 return data.get("role") == "user"
             except Exception as e:
-                log.warning(f"[verify_token] JSON 解析失败（可能被拦截或代理异常）: {e}, status={resp.status_code}, text={resp.text[:100]}")
-                if "aliyun_waf" in resp.text.lower() or "<!doctype" in resp.text.lower():
+                log.warning(f"[verify_token] JSON 解析失败（可能被拦截或代理异常）: {e}, status={res['status']}, text={res['body'][:100]}")
+                if "aliyun_waf" in res["body"].lower() or "<!doctype" in res["body"].lower():
                     log.info("[verify_token] 遇到 WAF 拦截页面，放行交给浏览器自动化账号流程处理。")
                     return True
                 return False
@@ -311,19 +316,15 @@ class QwenClient:
             log.warning(f"[verify_token] HTTP 请求异常: {e}")
             return False
 
-    async def list_models(self, token: str) -> list:
+    async def list_models(self, token: str, account: Account | None = None) -> list:
         try:
-            async with httpx.AsyncClient(timeout=10) as hc:
-                resp = await hc.get(
-                    f"{BASE_URL}/api/models",
-                    headers=self._build_headers(token),
-                )
-            if resp.status_code != 200:
+            res = await self._request_json("GET", "/api/models", token, timeout=10, account=account)
+            if res["status"] != 200:
                 return []
             try:
-                return resp.json().get("data", [])
+                return json.loads(res.get("body", "{}")).get("data", [])
             except Exception as e:
-                log.warning(f"[list_models] JSON 解析失败: {e}, status={resp.status_code}, text={resp.text[:100]}")
+                log.warning(f"[list_models] JSON 解析失败: {e}, status={res['status']}, text={res['body'][:100]}")
                 return []
         except Exception:
             return []
@@ -334,32 +335,38 @@ class QwenClient:
     def parse_sse_chunk(self, chunk: str) -> list[dict]:
         return parse_sse_chunk(chunk)
 
-    async def stream(self, token: str, chat_id: str, model: str, content: str, has_custom_tools: bool = False, files: list[dict] | None = None):
-        async for event in self.executor.stream(token, chat_id, model, content, has_custom_tools, files=files):
+    async def stream(self, token: str, chat_id: str, model: str, content: str, has_custom_tools: bool = False, files: list[dict] | None = None, account: Account | None = None):
+        async for event in self.executor.stream(token, chat_id, model, content, has_custom_tools, files=files, account=account):
             yield event
 
-    async def stream_chat_once(self, token: str, chat_id: str, payload: dict) -> AsyncIterator[dict]:
-        # 流式读取允许更长的模型思考/首 token 等待时间
-        timeout = httpx.Timeout(
-            connect=30.0,
-            read=settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS,
-            write=30.0,
-            pool=30.0,
-        )
-        async with httpx.AsyncClient(timeout=timeout) as hc:
-            async with hc.stream(
+    async def stream_chat_once(self, token: str, chat_id: str, payload: dict, account: Account | None = None) -> AsyncIterator[dict]:
+        timeout = settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS
+        session = await get_session(fingerprint_for_account(account))
+        headers = self._build_headers(account=account, token=token, accept="text/event-stream")
+        try:
+            async with session.stream(
                 "POST",
                 f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
-                headers=self._build_headers(token),
+                headers=headers,
                 json=payload,
+                timeout=timeout,
             ) as resp:
                 if resp.status_code != 200:
-                    yield {"status": resp.status_code, "body": await resp.aread()}
+                    body_chunks = []
+                    async for chunk in resp.aiter_content():
+                        body_chunks.append(chunk)
+                    body_text = b"".join(body_chunks).decode(errors="replace")[:2000]
+                    yield {"status": resp.status_code, "body": body_text}
                     return
-                async for chunk in resp.aiter_text():
-                    if chunk:
-                        yield {"chunk": chunk}
+
+                async for chunk in resp.aiter_content():
+                    decoded = chunk.decode("utf-8", errors="replace")
+                    if decoded:
+                        yield {"chunk": decoded}
                 yield {"status": "streamed"}
+        except Exception as e:
+            log.error(f"[QwenClient] stream_chat_once error: {e}")
+            yield {"status": 0, "body": str(e)}
 
     async def chat_stream_events_with_retry(
         self,

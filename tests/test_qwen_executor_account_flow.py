@@ -1,0 +1,73 @@
+import sys
+import types
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+if "pydantic_settings" not in sys.modules:
+    fake_pydantic_settings = types.ModuleType("pydantic_settings")
+
+    class BaseSettings:
+        pass
+
+    fake_pydantic_settings.BaseSettings = BaseSettings
+    sys.modules["pydantic_settings"] = fake_pydantic_settings
+
+if "curl_cffi" not in sys.modules:
+    fake_curl_cffi = types.ModuleType("curl_cffi")
+    fake_curl_cffi_requests = types.ModuleType("curl_cffi.requests")
+
+    class AsyncSession:
+        pass
+
+    fake_curl_cffi_requests.AsyncSession = AsyncSession
+    fake_curl_cffi.requests = fake_curl_cffi_requests
+    sys.modules["curl_cffi"] = fake_curl_cffi
+    sys.modules["curl_cffi.requests"] = fake_curl_cffi_requests
+
+from backend.core.account_pool import Account
+from backend.upstream.qwen_executor import QwenExecutor
+
+
+class _Pool:
+    def release(self, acc):
+        self.released = acc
+
+
+class QwenExecutorAccountFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fixed_account_path_passes_account_objects_to_create_and_stream(self) -> None:
+        account = Account(email="alice@example.com", token="token-1")
+        account.fingerprint_id = "chrome146_windows"
+        executor = QwenExecutor(SimpleNamespace(), _Pool())
+        seen = []
+
+        async def fake_create_chat(acc, model, chat_type="t2t"):
+            seen.append(("create", acc, model, chat_type))
+            return "chat-1"
+
+        async def fake_stream(acc, chat_id, model, content, has_custom_tools=False, files=None):
+            seen.append(("stream", acc, chat_id, model, content, has_custom_tools, files))
+            if False:
+                yield None
+            return
+            yield
+
+        executor.create_chat = fake_create_chat
+        executor.stream = fake_stream
+
+        events = []
+        async for item in executor.chat_stream_events_with_retry("gpt-4o", "hello", fixed_account=account):
+            events.append(item)
+
+        self.assertEqual(events[0]["type"], "meta")
+        self.assertIs(events[0]["acc"], account)
+        self.assertEqual(seen[0][0], "create")
+        self.assertIs(seen[0][1], account)
+        self.assertEqual(seen[0][2], "gpt-4o")
+        self.assertEqual(seen[1][0], "stream")
+        self.assertIs(seen[1][1], account)
+        self.assertEqual(seen[1][2], "chat-1")
+
+
+if __name__ == "__main__":
+    unittest.main()

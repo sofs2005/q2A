@@ -204,7 +204,7 @@ async def add_account(request: Request):
         username=data.get("username", "")
     )
 
-    is_valid = await client.verify_token(token)
+    is_valid = await client.verify_token(token, acc)
     if not is_valid:
         return {"ok": False, "error": "Invalid token (验证失败，请确认Token有效)"}
 
@@ -246,7 +246,7 @@ async def verify_all_accounts(request: Request):
 
     results = []
     for acc in pool.accounts:
-        is_valid = await client.verify_token(acc.token)
+        is_valid = await client.verify_token(acc.token, acc)
         if not is_valid and acc.password:
             log.info(f"[校验] {acc.email} token失效，尝试自动刷新...")
             is_valid = await client.auth_resolver.refresh_token(acc)
@@ -326,7 +326,7 @@ async def verify_account(email: str, request: Request):
     if not acc:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    is_valid = await client.verify_token(acc.token)
+    is_valid = await client.verify_token(acc.token, acc)
     if not is_valid and acc.password:
         log.info(f"[校验] {acc.email} token失效，尝试自动刷新...")
         is_valid = await client.auth_resolver.refresh_token(acc)

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -22,7 +24,16 @@ class QwenExecutor:
         self.account_pool = account_pool
         self.auth_resolver = AuthResolver(account_pool) if account_pool is not None else None
 
-    async def create_chat(self, token: str, model: str, chat_type: str = "t2t") -> str:
+    @staticmethod
+    def _resolve_account_context(account_or_token, account=None):
+        if account is not None:
+            return account, str(getattr(account, "token", "") or account_or_token or "")
+        if hasattr(account_or_token, "token") and hasattr(account_or_token, "email"):
+            return account_or_token, str(getattr(account_or_token, "token", "") or "")
+        return None, str(account_or_token or "")
+
+    async def create_chat(self, account_or_token, model: str, chat_type: str = "t2t") -> str:
+        account, token = self._resolve_account_context(account_or_token)
         request_fn = getattr(self.engine, "_request_json", None) or getattr(self.engine, "api_call", None)
         if request_fn is None:
             raise Exception("request transport unavailable")
@@ -43,6 +54,7 @@ class QwenExecutor:
                 token,
                 body,
                 timeout=settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS,
+                account=account,
             )
         else:
             r = await request_fn("POST", "/api/v2/chats/new", token, body)
@@ -89,13 +101,15 @@ class QwenExecutor:
 
     async def stream(
         self,
-        token: str,
+        account_or_token,
         chat_id: str,
         model: str,
         content: str,
         has_custom_tools: bool = False,
         files: list[dict] | None = None,
+        account=None,
     ):
+        account_obj, token = self._resolve_account_context(account_or_token, account=account)
         stream_fn = getattr(self.engine, "stream_chat_once", None) or getattr(self.engine, "fetch_chat", None)
         if stream_fn is None:
             raise Exception("stream transport unavailable")
@@ -110,22 +124,24 @@ class QwenExecutor:
         parsed_event_count = 0
         last_heartbeat_at = started_at
 
-        # Log the actual feature_config being sent
         feature_config = payload.get("messages", [{}])[0].get("feature_config", {})
         log.info(f"[Executor] stream start chat_id={chat_id} model={model} has_custom_tools={has_custom_tools}")
         log.info(f"[Executor] feature_config: function_calling={feature_config.get('function_calling')} auto_search={feature_config.get('auto_search')} code_interpreter={feature_config.get('code_interpreter')} plugins_enabled={feature_config.get('plugins_enabled')}")
 
-        # Log the prompt content to debug tool interception
         prompt_content = payload.get("messages", [{}])[0].get("content", "")
         if _has_textual_tool_contract_marker(prompt_content):
             log.info("[Executor] prompt contains textual tool contract markers (expected)")
         else:
             log.warning("[Executor] prompt does NOT contain textual tool contract markers - this may cause interception")
-        # Log first 500 chars of prompt to see tool instruction format
         log.info(f"[Executor] prompt preview (first 500 chars): {prompt_content[:500]}")
 
         try:
-            async for chunk_result in stream_fn(token, chat_id, payload):
+            if account_obj is not None and getattr(self.engine, "stream_chat_once", None) is not None:
+                stream_iter = stream_fn(token, chat_id, payload, account=account_obj)
+            else:
+                stream_iter = stream_fn(token, chat_id, payload)
+
+            async for chunk_result in stream_iter:
                 last_chunk_time = time.perf_counter()
 
                 if chunk_result.get("status") not in (None, 200, "streamed"):
@@ -204,14 +220,14 @@ class QwenExecutor:
             acc = fixed_account
             try:
                 log.info(f"[Executor] using fixed account={acc.email} model={model}")
-                chat_id = existing_chat_id or await self.create_chat(acc.token, model)
+                chat_id = existing_chat_id or await self.create_chat(acc, model)
                 update_request_context(chat_id=chat_id)
                 if existing_chat_id:
                     log.info(f"[Executor] reusing chat_id={chat_id} account={acc.email}")
                 else:
                     log.info(f"[Executor] created chat_id={chat_id} account={acc.email}")
                 yield {"type": "meta", "chat_id": chat_id, "acc": acc}
-                async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files):
+                async for evt in self.stream(acc, chat_id, model, content, has_custom_tools, files=files):
                     yield {"type": "event", "event": evt}
                 return
             except Exception:
@@ -229,18 +245,17 @@ class QwenExecutor:
 
             try:
                 log.info(f"[Executor] acquired account={acc.email} model={model} attempt={attempt + 1}")
-                chat_id = await self.create_chat(acc.token, model)
+                chat_id = await self.create_chat(acc, model)
                 update_request_context(chat_id=chat_id)
                 log.info(f"[Executor] created chat_id={chat_id} account={acc.email}")
                 yield {"type": "meta", "chat_id": chat_id, "acc": acc}
 
-                async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files):
+                async for evt in self.stream(acc, chat_id, model, content, has_custom_tools, files=files):
                     yield {"type": "event", "event": evt}
                 return
 
             except Exception as e:
                 err_msg = str(e).lower()
-                # 检测超时错误
                 is_timeout = (
                     "timeout" in err_msg
                     or "timed out" in err_msg
