@@ -518,7 +518,7 @@ async def get_settings():
     # 强制将 dict 转换，确保能被 JSON 序列化
     safe_map = {k: v for k, v in MODEL_MAP.items()}
     return {
-        "version": "2.0.0",
+        "version": "v3.0.0（modified by softs2005）",
         "max_inflight_per_account": backend_settings.MAX_INFLIGHT_PER_ACCOUNT,
         "model_aliases": safe_map
     }

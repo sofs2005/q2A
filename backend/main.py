@@ -44,7 +44,7 @@ log = logging.getLogger("qwen2api")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     with request_context(surface="startup"):
-        log.info("正在启动 qwen2API v2.0 企业网关...")
+        log.info("正在启动 qwen2API v3.0.0（modified by softs2005） 企业网关...")
 
         # 初始化数据存储 (带锁 JSON)
         app.state.accounts_db = AsyncJsonDB(settings.ACCOUNTS_FILE, default_data=[])
@@ -80,7 +80,7 @@ async def lifespan(app: FastAPI):
         log.info("正在关闭网关服务...")
         await close_all_sessions()
 
-app = FastAPI(title="qwen2API Enterprise Gateway", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="qwen2API Enterprise Gateway", version="v3.0.0（modified by softs2005）", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -107,7 +107,7 @@ async def root():
     return {
         "status": "qwen2API Enterprise Gateway is running",
         "docs": "/docs",
-        "version": "2.0.0"
+        "version": "v3.0.0（modified by softs2005）"
     }
 
 # 托管前端构建产物
