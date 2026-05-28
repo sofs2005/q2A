@@ -275,7 +275,10 @@ class QwenClient:
     async def delete_chat(self, token: str, chat_id: str, account: Account | None = None):
         if not token or not chat_id:
             return
-        await self._request_json("DELETE", f"/api/v2/chats/{chat_id}", token, timeout=20.0, account=account)
+        res = await self._request_json("DELETE", f"/api/v2/chats/{chat_id}", token, timeout=20.0, account=account)
+        if res["status"] in (200, 204):
+            return
+        raise RuntimeError(f"HTTP {res['status']}: {res['body'][:120]}")
 
     async def list_chats(self, token: str, limit: int = 50, account: Account | None = None) -> list[dict]:
         res = await self._request_json("GET", f"/api/v2/chats?limit={int(limit)}", token, timeout=20.0, account=account)

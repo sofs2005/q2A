@@ -25,7 +25,7 @@ async def garbage_collect_chats(app):
             if not acc.is_available():
                 continue
             try:
-                chats = await client.list_chats(acc.token, limit=50)
+                chats = await client.list_chats(acc.token, limit=50, account=acc)
                 for c in chats:
                     if not isinstance(c, dict):
                         continue
@@ -34,6 +34,6 @@ async def garbage_collect_chats(app):
                         continue
                     if chat_id and chat_id in active_chat_ids:
                         continue
-                    asyncio.create_task(client.delete_chat(acc.token, chat_id))
+                    asyncio.create_task(client.delete_chat(acc.token, chat_id, account=acc))
             except Exception as e:
                 log.warning(f"[GC] ?? {acc.email} ????: {e}")

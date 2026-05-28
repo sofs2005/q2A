@@ -116,6 +116,17 @@ async def create_image(request: Request):
 
         answer_text = "\n".join(event_payloads)
         image_urls = _extract_image_urls(answer_text)
+        if not image_urls:
+            try:
+                chats = await client.list_chats(acc.token, limit=20, account=acc)
+                current_chat = next(
+                    (c for c in chats if isinstance(c, dict) and str(c.get("id") or "") == str(chat_id)),
+                    None,
+                )
+                if current_chat:
+                    image_urls = _extract_image_urls(answer_text + "\n" + json.dumps(current_chat, ensure_ascii=False))
+            except Exception as exc:
+                log.debug("[T2I] current chat fallback failed chat_id=%s error=%s", chat_id, exc)
         log.info(f"[T2I] 提取到 {len(image_urls)} 张图片 URL: {image_urls}")
 
         if not image_urls:
@@ -130,7 +141,7 @@ async def create_image(request: Request):
         log.error(f"[T2I] 生成失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        if acc is not None:
+        if acc is not None and getattr(acc, "inflight", 0) > 0:
             client.account_pool.release(acc)
-            if chat_id and settings.UPSTREAM_AUTO_DELETE_ENABLED:
-                asyncio.create_task(client.delete_chat(acc.token, chat_id))
+        if acc is not None and chat_id and settings.UPSTREAM_AUTO_DELETE_ENABLED:
+            asyncio.create_task(client.delete_chat(acc.token, chat_id, account=acc))

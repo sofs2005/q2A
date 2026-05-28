@@ -123,6 +123,23 @@ class QwenClientChatClearTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["error"].startswith("HTTP 500"))
         self.assertEqual(len(calls), 1)
 
+    async def test_delete_chat_raises_on_non_success_status(self) -> None:
+        account = Account(email="user@example.com", token="token-1")
+        client = QwenClient(SimpleNamespace())
+        calls: list[dict] = []
+        responses = [_FakeResponse(500, {"detail": "server error"}, "server error")]
+        get_session = AsyncMock(return_value=_FakeSession(responses, calls))
+
+        with patch("backend.services.qwen_client.get_session", get_session):
+            with self.assertRaises(RuntimeError) as ctx:
+                await client.delete_chat("token-1", "chat-1", account=account)
+
+        self.assertIn("HTTP 500", str(ctx.exception))
+        self.assertEqual(calls[0]["method"], "DELETE")
+        self.assertEqual(calls[0]["url"], "https://chat.qwen.ai/api/v2/chats/chat-1")
+        self.assertEqual(calls[0]["headers"]["Authorization"], "Bearer token-1")
+        self.assertEqual(get_session.await_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
