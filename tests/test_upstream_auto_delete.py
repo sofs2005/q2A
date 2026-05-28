@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from backend.core.config import settings
 from backend.runtime.execution import cleanup_runtime_resources
 from backend.services.context_cleanup import context_cleanup_loop
 from backend.services.garbage_collector import garbage_collect_chats
@@ -17,8 +18,9 @@ class UpstreamAutoDeleteTests(unittest.IsolatedAsyncioTestCase):
         )
         client.account_pool.release = unittest.mock.Mock()
 
-        await cleanup_runtime_resources(client, acc, "chat-1")
-        await asyncio.sleep(0)
+        with patch.object(settings, "UPSTREAM_AUTO_DELETE_ENABLED", False):
+            await cleanup_runtime_resources(client, acc, "chat-1")
+            await asyncio.sleep(0)
 
         client.account_pool.release.assert_called_once_with(acc)
         client.delete_chat.assert_not_called()
@@ -46,9 +48,10 @@ class UpstreamAutoDeleteTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        with patch("backend.services.context_cleanup.asyncio.sleep", AsyncMock(side_effect=StopLoop)):
-            with self.assertRaises(StopLoop):
-                await context_cleanup_loop(app, interval_seconds=60)
+        with patch.object(settings, "UPSTREAM_AUTO_DELETE_ENABLED", False):
+            with patch("backend.services.context_cleanup.asyncio.sleep", AsyncMock(side_effect=StopLoop)):
+                with self.assertRaises(StopLoop):
+                    await context_cleanup_loop(app, interval_seconds=60)
 
         app.state.qwen_client.delete_chat.assert_not_called()
         app.state.upstream_file_uploader.delete_remote_file.assert_not_called()
@@ -70,9 +73,10 @@ class UpstreamAutoDeleteTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        with patch("backend.services.garbage_collector.asyncio.sleep", AsyncMock(side_effect=[None, StopLoop])):
-            with self.assertRaises(StopLoop):
-                await garbage_collect_chats(app)
+        with patch.object(settings, "UPSTREAM_AUTO_DELETE_ENABLED", False):
+            with patch("backend.services.garbage_collector.asyncio.sleep", AsyncMock(side_effect=[None, StopLoop])):
+                with self.assertRaises(StopLoop):
+                    await garbage_collect_chats(app)
 
         client.list_chats.assert_not_called()
         client.delete_chat.assert_not_called()

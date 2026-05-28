@@ -272,6 +272,22 @@ class QwenClient:
     async def clear_all_chats_for_account(self, account) -> dict:
         return await self.clear_all_chats(account)
 
+    async def delete_chat(self, token: str, chat_id: str, account: Account | None = None):
+        if not token or not chat_id:
+            return
+        await self._request_json("DELETE", f"/api/v2/chats/{chat_id}", token, timeout=20.0, account=account)
+
+    async def list_chats(self, token: str, limit: int = 50, account: Account | None = None) -> list[dict]:
+        res = await self._request_json("GET", f"/api/v2/chats?limit={int(limit)}", token, timeout=20.0, account=account)
+        if res["status"] != 200:
+            return []
+        try:
+            data = json.loads(res.get("body", "{}"))
+        except Exception:
+            return []
+        chats = data.get("data", [])
+        return chats if isinstance(chats, list) else []
+
     async def get_personalization_settings(self, account) -> dict:
         return await self._request_personalization_raw_json(
             "GET",

@@ -114,11 +114,7 @@ async def create_image(request: Request):
         if acc is None or chat_id is None:
             raise HTTPException(status_code=500, detail="Image generation session was not created")
 
-        chats = await client.list_chats(acc.token, limit=20)
-        current_chat = next((c for c in chats if isinstance(c, dict) and c.get("id") == chat_id), None)
         answer_text = "\n".join(event_payloads)
-        if current_chat:
-            answer_text += "\n" + json.dumps(current_chat, ensure_ascii=False)
         image_urls = _extract_image_urls(answer_text)
         log.info(f"[T2I] 提取到 {len(image_urls)} 张图片 URL: {image_urls}")
 
