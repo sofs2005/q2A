@@ -11,6 +11,7 @@ from backend.toolcall.markup_scan import find_partial_tool_markup_start, find_to
 TOOL_START_MARKERS = ('{"name":', '<tool_call>', '##tool_call##', 'tool_call##', 'function.name:')
 LEGACY_HOLD_CHARS = max(len(marker) for marker in TOOL_START_MARKERS) - 1
 MAX_CAPTURE_CHARS = 64 * 1024
+FENCE_PASSTHROUGH_HOLD_CHARS = 32
 FENCE_OPEN_RE = re.compile(r"(?m)^[ \t]*(```+|~~~+)[^\n]*(?:\n|$)")
 
 
@@ -64,17 +65,27 @@ def _markdown_code_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _unclosed_markdown_code_start(text: str) -> int:
+def _fence_close_re(fence: str):
+    return re.compile(rf"(?m)^[ \t]*{re.escape(fence)}[ \t]*(?:\n|$)")
+
+
+def _unclosed_fenced_code(text: str) -> tuple[int, str] | None:
     pos = 0
     while True:
         opener = FENCE_OPEN_RE.search(text, pos)
         if opener is None:
-            break
+            return None
         fence = opener.group(1)
-        closer = re.compile(rf"(?m)^[ \t]*{re.escape(fence)}[ \t]*(?:\n|$)").search(text, opener.end())
+        closer = _fence_close_re(fence).search(text, opener.end())
         if closer is None:
-            return opener.start()
+            return opener.start(), fence
         pos = closer.end()
+
+
+def _unclosed_markdown_code_start(text: str) -> int:
+    fenced = _unclosed_fenced_code(text)
+    if fenced is not None:
+        return fenced[0]
 
     pos = text.rfind("\n") + 1
     while pos < len(text):
@@ -122,6 +133,7 @@ class ToolStreamSieve:
         self.pending = ""
         self.capture = ""
         self.capturing = False
+        self.fenced_passthrough_fence: str | None = None
 
     def process_chunk(self, chunk: str) -> list[dict[str, Any]]:
         if not chunk:
@@ -134,6 +146,12 @@ class ToolStreamSieve:
         events: list[dict[str, Any]] = []
 
         while True:
+            if self.fenced_passthrough_fence is not None:
+                self._drain_fenced_passthrough(events)
+                if self.fenced_passthrough_fence is not None or not self.pending:
+                    return events
+                continue
+
             if self.capturing:
                 self.capture += self.pending
                 self.pending = ""
@@ -165,11 +183,44 @@ class ToolStreamSieve:
                 self.capturing = True
                 continue
 
+            fenced = _unclosed_fenced_code(self.pending)
+            if fenced is not None:
+                code_start, fence = fenced
+                partial_start = find_partial_tool_markup_start(self.pending[:code_start])
+                if partial_start >= 0:
+                    safe = self.pending[:partial_start]
+                    if safe:
+                        events.append({"type": "content", "text": safe})
+                    self.pending = self.pending[partial_start:]
+                    return events
+                if code_start > 0:
+                    events.append({"type": "content", "text": self.pending[:code_start]})
+                    self.pending = self.pending[code_start:]
+                self.fenced_passthrough_fence = fence
+                continue
+
             safe, hold = self._split_safe_content(self.pending)
             if safe:
                 events.append({"type": "content", "text": safe})
             self.pending = hold
             return events
+
+    def _drain_fenced_passthrough(self, events: list[dict[str, Any]]) -> None:
+        fence = self.fenced_passthrough_fence
+        if fence is None:
+            return
+
+        closer = _fence_close_re(fence).search(self.pending)
+        if closer is not None:
+            events.append({"type": "content", "text": self.pending[:closer.end()]})
+            self.pending = self.pending[closer.end():]
+            self.fenced_passthrough_fence = None
+            return
+
+        hold_chars = max(FENCE_PASSTHROUGH_HOLD_CHARS, len(fence) + 4)
+        if len(self.pending) > hold_chars:
+            events.append({"type": "content", "text": self.pending[:-hold_chars]})
+            self.pending = self.pending[-hold_chars:]
 
     def flush(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -189,6 +240,7 @@ class ToolStreamSieve:
         if self.pending:
             events.append({"type": "content", "text": self.pending})
             self.pending = ""
+        self.fenced_passthrough_fence = None
         return events
 
     def _is_dsml_capture(self, text: str) -> bool:
@@ -205,7 +257,7 @@ class ToolStreamSieve:
                 break
             tag = find_tool_markup_tag_outside_ignored(scan_text, tag.end)
 
-        legacy_start = _find_legacy_tool_start(text)
+        legacy_start = _find_legacy_tool_start(scan_text)
         if legacy_start >= 0:
             positions.append(legacy_start)
         return min(positions) if positions else -1

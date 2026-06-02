@@ -191,6 +191,19 @@ class ToolStreamSieveTests(unittest.TestCase):
         self.assertIn('<|DSML|tool_calls>', text)
         self.assertGreater(len(text), 64 * 1024)
 
+    def test_unclosed_fenced_code_streams_content_without_pending_growth(self) -> None:
+        sieve = ToolStreamSieve(["Read"])
+        emitted_text = []
+
+        for index in range(120):
+            chunk = "```go\n" if index == 0 else "func x(){ println(\"hello\") }\n" * 10
+            events = sieve.process_chunk(chunk)
+            emitted_text.extend(event.get("text", "") for event in events if event.get("type") == "content")
+
+        self.assertFalse(any("tool_calls" == event.get("type") for event in events))
+        self.assertGreater(len("".join(emitted_text)), 10_000)
+        self.assertLess(len(sieve.pending), 4096)
+
 
 if __name__ == "__main__":
     unittest.main()
