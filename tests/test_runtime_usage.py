@@ -43,6 +43,45 @@ class RuntimeUsageTests(unittest.TestCase):
 
 
 class CollectCompletionRunStreamingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_streaming_on_delta_receives_final_safe_text_tail(self) -> None:
+        request = StandardRequest(
+            prompt="prompt",
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+            tools=[{"name": "Read", "parameters": {}}],
+            tool_names=["Read"],
+            tool_enabled=True,
+        )
+        answer = (
+            "自定义 Skill 应放置在以下目录中：\n\n"
+            "C:/Users/daife/.agents/skills\n\n"
+            "需要我帮你创建一个自定义 Skill 的模板吗？"
+        )
+        client = _FakeStreamClient(
+            [
+                {"type": "meta", "chat_id": "chat_1", "acc": None},
+                {"type": "event", "event": {"type": "delta", "phase": "answer", "content": answer}},
+            ]
+        )
+        deltas: list[str] = []
+
+        async def on_delta(_evt, text_chunk, _tool_calls):
+            if text_chunk is not None:
+                deltas.append(text_chunk)
+
+        with patch.object(runtime_execution.settings, "TOOLCORE_V2_ENABLED", True):
+            result = await collect_completion_run(
+                client,
+                request,
+                request.prompt,
+                capture_events=False,
+                on_delta=on_delta,
+            )
+
+        self.assertEqual(result.state.answer_text, answer)
+        self.assertEqual("".join(deltas), answer)
+
     async def test_streaming_on_delta_receives_safe_text_not_raw_dsml(self) -> None:
         request = StandardRequest(
             prompt="prompt",

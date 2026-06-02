@@ -481,6 +481,7 @@ async def collect_completion_run(
     answer_chars = 0
     raw_events: list[dict[str, Any]] = []
     metrics = StreamMetrics()
+    final_tool_sieve_events: list[dict[str, Any]] | None = None
 
     # 初始化 Tool Sieve 用于实时检测
     tool_sieve = None
@@ -499,6 +500,7 @@ async def collect_completion_run(
         return cleaned
 
     def _finalize_result(*, reason: str | None = None) -> RuntimeExecutionResult:
+        nonlocal final_tool_sieve_events
         answer_text = "".join(answer_fragments)
         reasoning_text = "".join(reasoning_fragments)
         if native_tool_calls and not answer_text:
@@ -510,7 +512,8 @@ async def collect_completion_run(
 
         # 第一重：刷新 Tool Sieve
         if tool_sieve and not native_tool_calls:
-            flush_events = tool_sieve.flush()
+            flush_events = final_tool_sieve_events if final_tool_sieve_events is not None else tool_sieve.flush()
+            final_tool_sieve_events = None
             for evt in flush_events:
                 if evt.get("type") == "tool_calls":
                     calls = evt.get("calls", [])
@@ -739,6 +742,19 @@ async def collect_completion_run(
                 if on_delta is not None:
                     await on_delta(evt, None, completed_calls)
                 return _finalize_result(reason="native_tool_use")
+
+    if tool_sieve and on_delta is not None:
+        final_tool_sieve_events = tool_sieve.flush()
+        has_flushed_tool_call = any(
+            evt.get("type") == "tool_calls" and evt.get("calls")
+            for evt in final_tool_sieve_events
+        )
+        if not has_flushed_tool_call:
+            for flush_evt in final_tool_sieve_events:
+                if flush_evt.get("type") == "content":
+                    safe_text = str(flush_evt.get("text") or "")
+                    if safe_text:
+                        await on_delta({"phase": "answer"}, safe_text, None)
 
     return _finalize_result(reason="stream_end")
 
