@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     QWEN_CODE_FORCE_CODER_FOR_CODING_TASKS: bool = os.getenv("QWEN_CODE_FORCE_CODER_FOR_CODING_TASKS", "true").lower() in {"1", "true", "yes", "on"}
     TOOLCORE_V2_ENABLED: bool = os.getenv("TOOLCORE_V2_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     DIAGNOSTIC_STACK_DUMP_ENABLED: bool = os.getenv("DIAGNOSTIC_STACK_DUMP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    DIAGNOSTIC_EVENT_LOOP_WATCHDOG_ENABLED: bool = os.getenv("DIAGNOSTIC_EVENT_LOOP_WATCHDOG_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    DIAGNOSTIC_EVENT_LOOP_WATCHDOG_INTERVAL_SECONDS: float = float(os.getenv("DIAGNOSTIC_EVENT_LOOP_WATCHDOG_INTERVAL_SECONDS", 1.0))
+    DIAGNOSTIC_EVENT_LOOP_LAG_THRESHOLD_SECONDS: float = float(os.getenv("DIAGNOSTIC_EVENT_LOOP_LAG_THRESHOLD_SECONDS", 5.0))
+    DIAGNOSTIC_SLOW_STEP_SECONDS: float = float(os.getenv("DIAGNOSTIC_SLOW_STEP_SECONDS", 0.05))
     UPSTREAM_AUTO_DELETE_ENABLED: bool = os.getenv("UPSTREAM_AUTO_DELETE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 
     # 上游请求超时

@@ -4,6 +4,12 @@ import uuid
 from contextlib import contextmanager
 from typing import Any
 
+from backend.core.diagnostics import (
+    get_active_request_diagnostic,
+    restore_active_request_diagnostic,
+    update_active_request_diagnostic,
+)
+
 _REQUEST_CONTEXT: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
     "request_context", default={}
 )
@@ -16,6 +22,11 @@ _REQUEST_DEFAULTS: dict[str, Any] = {
     "chat_id": "-",
     "stream_attempt": "-",
     "upstream_attempt": "-",
+    "stream_stage": "-",
+    "method": "-",
+    "path": "-",
+    "client": "-",
+    "status": "-",
 }
 
 _LOG_FORMAT = (
@@ -84,15 +95,20 @@ def update_request_context(**kwargs: Any) -> dict[str, Any]:
         if value is not None:
             ctx[key] = value
     _REQUEST_CONTEXT.set(ctx)
+    update_active_request_diagnostic(**ctx)
     return ctx
 
 
 @contextmanager
 def request_context(**kwargs: Any):
-    merged = get_request_context()
+    previous_context = get_request_context()
+    previous_diagnostic = get_active_request_diagnostic()
+    merged = dict(previous_context)
     merged.update({k: v for k, v in kwargs.items() if v is not None})
     token = _REQUEST_CONTEXT.set(merged)
+    update_active_request_diagnostic(**merged)
     try:
         yield _REQUEST_CONTEXT.get({})
     finally:
         _REQUEST_CONTEXT.reset(token)
+        restore_active_request_diagnostic(previous_diagnostic)

@@ -511,7 +511,19 @@ async def collect_completion_run(
 
         # 第一重：刷新 Tool Sieve
         if tool_sieve and not native_tool_calls:
+            update_request_context(stream_stage="final_tool_sieve_flush")
+            flush_started = time.perf_counter()
             flush_events = final_tool_sieve_events if final_tool_sieve_events is not None else tool_sieve.flush()
+            flush_elapsed = time.perf_counter() - flush_started
+            if flush_elapsed > settings.DIAGNOSTIC_SLOW_STEP_SECONDS:
+                log.warning(
+                    "[Collect] slow final_tool_sieve_flush chat_id=%s elapsed=%.3fs pending_chars=%s capture_chars=%s capturing=%s",
+                    chat_id,
+                    flush_elapsed,
+                    len(getattr(tool_sieve, "pending", "")),
+                    len(getattr(tool_sieve, "capture", "")),
+                    getattr(tool_sieve, "capturing", False),
+                )
             final_tool_sieve_events = None
             for evt in flush_events:
                 if evt.get("type") == "tool_calls":
@@ -539,7 +551,18 @@ async def collect_completion_run(
         # 第二重：解析最终文本
         if not detected_tool_calls and request.tools and answer_text:
             # 尝试从最终文本中解析工具调用
+            update_request_context(stream_stage="final_textual_tool_parse")
+            final_parse_started = time.perf_counter()
             tool_blocks, stop_reason = tool_parser.parse_tool_calls_silent(answer_text, request.tools)
+            final_parse_elapsed = time.perf_counter() - final_parse_started
+            if final_parse_elapsed > settings.DIAGNOSTIC_SLOW_STEP_SECONDS:
+                log.warning(
+                    "[Collect] slow final_textual_tool_parse chat_id=%s elapsed=%.3fs answer_chars=%s tool_count=%s",
+                    chat_id,
+                    final_parse_elapsed,
+                    len(answer_text),
+                    len(request.tools),
+                )
             tool_use_blocks = [b for b in tool_blocks if b.get("type") == "tool_use"]
 
             if tool_use_blocks and stop_reason == "tool_use":
@@ -597,6 +620,23 @@ async def collect_completion_run(
         )
         return RuntimeExecutionResult(state=state, chat_id=chat_id, acc=acc)
 
+    async def _emit_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None, *, stage: str) -> None:
+        update_request_context(stream_stage=stage)
+        if on_delta is None:
+            return
+        started = time.perf_counter()
+        await on_delta(evt, text_chunk, tool_calls)
+        elapsed = time.perf_counter() - started
+        if elapsed > settings.DIAGNOSTIC_SLOW_STEP_SECONDS:
+            log.warning(
+                "[Collect] slow on_delta chat_id=%s stage=%s elapsed=%.3fs text_chars=%s tool_calls=%s",
+                chat_id,
+                stage,
+                elapsed,
+                len(text_chunk or ""),
+                len(tool_calls or []),
+            )
+
     try:
         async for item in client.chat_stream_events_with_retry(
             request.resolved_model,
@@ -629,8 +669,7 @@ async def collect_completion_run(
                 if not first_event_marked:
                     metrics.mark("first_event", float(len(raw_events)))
                     first_event_marked = True
-                if on_delta is not None:
-                    await on_delta(evt, content, None)
+                await _emit_delta(evt, content, None, stage="answer_raw")
                 continue
 
             if phase == "answer" and content:
@@ -652,24 +691,26 @@ async def collect_completion_run(
 
                 # Tool Sieve 实时检测
                 if tool_sieve:
+                    update_request_context(stream_stage="tool_sieve")
                     sieve_started = time.perf_counter()
                     sieve_events = tool_sieve.process_chunk(content)
                     sieve_elapsed = time.perf_counter() - sieve_started
-                    if sieve_elapsed > 0.05:
+                    if sieve_elapsed > settings.DIAGNOSTIC_SLOW_STEP_SECONDS:
                         log.warning(
-                            "[Collect] slow tool_sieve chat_id=%s elapsed=%.3fs chunk_chars=%s pending_chars=%s capture_chars=%s capturing=%s",
+                            "[Collect] slow tool_sieve chat_id=%s elapsed=%.3fs chunk_chars=%s pending_chars=%s capture_chars=%s capturing=%s stage=%s",
                             chat_id,
                             sieve_elapsed,
                             len(content),
                             len(getattr(tool_sieve, "pending", "")),
                             len(getattr(tool_sieve, "capture", "")),
                             getattr(tool_sieve, "capturing", False),
+                            getattr(tool_sieve, "fenced_passthrough_fence", None),
                         )
                     for sieve_evt in sieve_events:
                         if sieve_evt.get("type") == "content":
                             safe_text = str(sieve_evt.get("text") or "")
-                            if safe_text and on_delta is not None:
-                                await on_delta(evt, safe_text, None)
+                            if safe_text:
+                                await _emit_delta(evt, safe_text, None, stage="tool_sieve_emit")
                             continue
                         if sieve_evt.get("type") == "tool_calls":
                             calls = sieve_evt.get("calls", [])
@@ -687,14 +728,14 @@ async def collect_completion_run(
                                         if flush_evt.get("type") == "content":
                                             safe_text = str(flush_evt.get("text") or "")
                                             if safe_text:
-                                                await on_delta(evt, safe_text, None)
+                                                await _emit_delta(evt, safe_text, None, stage="tool_sieve_flush")
                                 log.info(
                                     "[Collect] ✓ Tool Sieve 实时检测到工具调用: tools=%s",
                                     [c.get("name") for c in detected_calls],
                                 )
                                 return _finalize_result(reason="tool_sieve_detected")
-                elif on_delta is not None:
-                    await on_delta(evt, content, None)
+                else:
+                    await _emit_delta(evt, content, None, stage="answer_passthrough")
 
                 if request.tools:
                     answer_text = None
@@ -721,10 +762,21 @@ async def collect_completion_run(
                     if "##TOOL_CALL##" in content or "<tool_call>" in content:
                         if answer_text is None:
                             answer_text = "".join(answer_fragments)
+                        update_request_context(stream_stage="textual_tool_parse")
+                        textual_parse_started = time.perf_counter()
                         directive = parse_tool_directive_once(
                             request,
                             RuntimeAttemptState(answer_text=answer_text, reasoning_text="".join(reasoning_fragments)),
                         )
+                        textual_parse_elapsed = time.perf_counter() - textual_parse_started
+                        if textual_parse_elapsed > settings.DIAGNOSTIC_SLOW_STEP_SECONDS:
+                            log.warning(
+                                "[Collect] slow textual_tool_parse chat_id=%s elapsed=%.3fs answer_chars=%s chunks=%s",
+                                chat_id,
+                                textual_parse_elapsed,
+                                len(answer_text),
+                                answer_chunk_count,
+                            )
                         if directive.stop_reason == "tool_use":
                             return _finalize_result(reason="textual_tool_use")
                 continue
@@ -738,11 +790,11 @@ async def collect_completion_run(
                 if completed_calls:
                     completed_calls = normalize_streamed_tool_calls(completed_calls, request.tool_names)
                     native_tool_calls.extend(completed_calls)
-                    if on_delta is not None:
-                        await on_delta(evt, None, completed_calls)
+                    await _emit_delta(evt, None, completed_calls, stage="native_tool_call")
                     return _finalize_result(reason="native_tool_use")
 
-        if tool_sieve and on_delta is not None:
+        if tool_sieve:
+            update_request_context(stream_stage="tool_sieve_flush")
             final_tool_sieve_events = tool_sieve.flush()
             has_flushed_tool_call = any(
                 evt.get("type") == "tool_calls" and evt.get("calls")
@@ -753,7 +805,7 @@ async def collect_completion_run(
                     if flush_evt.get("type") == "content":
                         safe_text = str(flush_evt.get("text") or "")
                         if safe_text:
-                            await on_delta({"phase": "answer"}, safe_text, None)
+                            await _emit_delta({"phase": "answer"}, safe_text, None, stage="tool_sieve_flush")
 
         return _finalize_result(reason="stream_end")
     except Exception:

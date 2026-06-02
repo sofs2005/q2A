@@ -20,7 +20,7 @@ from backend.core.upstream_file_cache import UpstreamFileCache
 from backend.core.session_lock import SessionLockRegistry
 from backend.core.browser_fingerprint import close_all_sessions
 from backend.core.request_logging import configure_logging, request_context
-from backend.core.diagnostics import install_stack_dump_handler
+from backend.core.diagnostics import event_loop_lag_watchdog, install_stack_dump_handler
 from backend.core.spa_static_files import SPAStaticFiles
 from backend.services.qwen_client import QwenClient
 from backend.services.file_store import LocalFileStore
@@ -74,10 +74,31 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(garbage_collect_chats(app))
         asyncio.create_task(context_cleanup_loop(app))
 
+        app.state.event_loop_watchdog_stop = asyncio.Event()
+        app.state.event_loop_watchdog_task = None
+        if settings.DIAGNOSTIC_EVENT_LOOP_WATCHDOG_ENABLED:
+            app.state.event_loop_watchdog_task = asyncio.create_task(
+                event_loop_lag_watchdog(
+                    interval_seconds=settings.DIAGNOSTIC_EVENT_LOOP_WATCHDOG_INTERVAL_SECONDS,
+                    threshold_seconds=settings.DIAGNOSTIC_EVENT_LOOP_LAG_THRESHOLD_SECONDS,
+                    stop_event=app.state.event_loop_watchdog_stop,
+                )
+            )
+
     yield
 
     with request_context(surface="shutdown"):
         log.info("正在关闭网关服务...")
+        watchdog_stop = getattr(app.state, "event_loop_watchdog_stop", None)
+        if watchdog_stop is not None:
+            watchdog_stop.set()
+        watchdog_task = getattr(app.state, "event_loop_watchdog_task", None)
+        if watchdog_task is not None:
+            watchdog_task.cancel()
+            try:
+                await watchdog_task
+            except asyncio.CancelledError:
+                pass
         await close_all_sessions()
 
 app = FastAPI(title="qwen2API Enterprise Gateway", version="v3.0.0（modified by softs2005）", lifespan=lifespan)
