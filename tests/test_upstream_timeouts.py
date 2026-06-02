@@ -26,9 +26,11 @@ if "curl_cffi" not in sys.modules:
     sys.modules["curl_cffi"] = fake_curl_cffi
     sys.modules["curl_cffi.requests"] = fake_curl_cffi_requests
 
+from backend.adapter.standard_request import StandardRequest
 from backend.core import browser_fingerprint
 from backend.core.config import settings
 from backend.core.browser_fingerprint import fingerprint_for_email
+from backend.runtime.execution import collect_completion_run
 from backend.services.qwen_client import QwenClient
 from backend.upstream.qwen_executor import QwenExecutor, _has_textual_tool_contract_marker
 
@@ -187,6 +189,28 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first["type"], "meta")
         self.assertEqual(pool.released, 1)
+
+    async def test_collect_completion_run_cleans_up_when_stream_fails_after_meta(self) -> None:
+        acc = SimpleNamespace(email="acc@example.com", token="tok")
+
+        class FakeClient:
+            async def chat_stream_events_with_retry(self, *_args, **_kwargs):
+                yield {"type": "meta", "acc": acc, "chat_id": "chat-1"}
+                raise RuntimeError("stream failed")
+
+        request = StandardRequest(
+            prompt="hello",
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+        )
+        client = FakeClient()
+
+        with patch("backend.runtime.execution.cleanup_runtime_resources", new=AsyncMock()) as cleanup:
+            with self.assertRaisesRegex(RuntimeError, "stream failed"):
+                await collect_completion_run(client, request, "hello")
+
+        cleanup.assert_awaited_once_with(client, acc, "chat-1")
 
     async def test_qwen_client_stream_uses_configured_read_timeout(self) -> None:
         captured = {}

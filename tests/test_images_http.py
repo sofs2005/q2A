@@ -28,7 +28,7 @@ class ImagesHttpTests(unittest.TestCase):
     def test_create_image_does_not_require_list_chats(self) -> None:
         acc = SimpleNamespace(token="token-1", email="user@example.com", inflight=1)
 
-        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, fixed_account=None, existing_chat_id=None):
+        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, fixed_account=None):
             yield {"type": "meta", "acc": acc, "chat_id": "chat-1"}
             yield {
                 "type": "event",
@@ -67,7 +67,7 @@ class ImagesHttpTests(unittest.TestCase):
     def test_create_image_uses_current_chat_fallback_when_stream_payload_has_no_url(self) -> None:
         acc = SimpleNamespace(token="token-1", email="user@example.com", inflight=1)
 
-        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, fixed_account=None, existing_chat_id=None):
+        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, fixed_account=None):
             yield {"type": "meta", "acc": acc, "chat_id": "chat-1"}
             yield {"type": "event", "event": {"choices": [{"delta": {"content": "image ready"}}]}}
 
@@ -103,7 +103,7 @@ class ImagesHttpTests(unittest.TestCase):
     def test_create_image_does_not_double_release_after_stream_failure(self) -> None:
         acc = SimpleNamespace(token="token-1", email="user@example.com", inflight=1)
 
-        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, fixed_account=None, existing_chat_id=None):
+        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, fixed_account=None):
             yield {"type": "meta", "acc": acc, "chat_id": "chat-1"}
             app.state.qwen_client.account_pool.release(acc)
             raise RuntimeError("upstream failed")

@@ -25,8 +25,8 @@ class AnthropicToolCoreIntegrationTests(unittest.TestCase):
         )
 
         self.assertEqual(request.tool_choice_mode, "required")
-        self.assertEqual(request.required_tool_name, "Read")
-        self.assertEqual(request.tool_choice_raw, {"type": "function", "function": {"name": "Read"}})
+        self.assertEqual(request.required_tool_name, "bridge-0")
+        self.assertEqual(request.tool_choice_raw, {"type": "function", "function": {"name": "bridge-0"}})
 
     def test_build_standard_request_rejects_undeclared_forced_tool(self) -> None:
         with self.assertRaisesRegex(ValueError, "undeclared tool"):
@@ -159,15 +159,11 @@ class AnthropicBridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch.object(anthropic, "resolve_auth_context", AsyncMock(return_value=SimpleNamespace(token="tok"))), \
-             patch.object(anthropic, "derive_session_key", return_value="session"), \
+             patch.object(anthropic, "build_request_session_key", return_value="session"), \
              patch.object(anthropic, "prepare_context_attachments", AsyncMock(return_value={"payload": request._payload, "upstream_files": [], "session_key": "session", "context_mode": "inline", "bound_account_email": None, "bound_account": None})), \
-             patch.object(anthropic, "plan_persistent_session_turn", AsyncMock(return_value=SimpleNamespace(enabled=False))), \
              patch.object(anthropic, "preprocess_attachments", AsyncMock(side_effect=lambda payload, *_args, **_kwargs: SimpleNamespace(payload=payload, attachments=[], uploaded_file_ids=[]))), \
              patch.object(anthropic, "run_retryable_completion_bridge", AsyncMock(return_value=bridge_result)) as bridge_mock, \
-             patch.object(anthropic, "persist_session_turn", AsyncMock()), \
-             patch.object(anthropic, "clear_invalidated_session_chat", AsyncMock()), \
-             patch.object(anthropic, "update_request_context"), \
-             patch.object(anthropic, "build_anthropic_assistant_history_message", return_value={"role": "assistant", "content": []}):
+             patch.object(anthropic, "update_request_context"):
             response = await anthropic.anthropic_messages(request)
 
         self.assertEqual(response.status_code, 200)

@@ -19,7 +19,7 @@ from backend.runtime.execution import (
     request_max_attempts,
 )
 from backend.services.auth_quota import resolve_auth_context
-from backend.services.context_attachment_manager import prepare_context_attachments, derive_session_key
+from backend.services.context_attachment_manager import build_request_session_key, prepare_context_attachments
 from backend.services.attachment_preprocessor import preprocess_attachments
 from backend.services.client_profiles import CLAUDE_CODE_OPENAI_PROFILE
 from backend.toolcore.prompt_builder import messages_to_prompt
@@ -28,14 +28,6 @@ from backend.services.qwen_client import QwenClient
 from backend.services.token_calc import count_tokens
 from backend.adapter.standard_request import normalize_tool_choice
 from backend.toolcore.request_normalizer import normalize_anthropic_request, to_prompt_payload
-from backend.toolcore.task_session import (
-    build_anthropic_assistant_history_message,
-    build_retry_rebase_prompt,
-    clear_invalidated_session_chat,
-    log_session_plan_reuse_cancelled,
-    persist_session_turn,
-    plan_persistent_session_turn,
-)
 from backend.services.completion_bridge import run_retryable_completion_bridge
 from backend.toolcall.normalize import build_tool_name_registry
 
@@ -230,7 +222,8 @@ async def anthropic_messages(request: Request):
     except Exception:
         raise HTTPException(400, {"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}})
 
-    session_key = derive_session_key("anthropic", token, req_data)
+    req_id = new_request_id()
+    session_key = build_request_session_key("anthropic", req_id)
     original_history_messages = req_data.get("messages", [])
 
     async def prepare_locked_request(payload: dict) -> tuple[StandardRequest, dict, str, str, str, str]:
@@ -246,6 +239,7 @@ async def anthropic_messages(request: Request):
             surface="anthropic",
             auth_token=token,
             client_profile=CLAUDE_CODE_OPENAI_PROFILE,
+            session_key=session_key,
             existing_attachments=(preprocessed.attachments if preprocessed is not None else None),
         )
         working_payload = context_prepared["payload"]
@@ -260,35 +254,13 @@ async def anthropic_messages(request: Request):
         standard_request.bound_account_email = context_prepared["bound_account_email"]
         standard_request.bound_account = context_prepared["bound_account"]
 
-        session_plan = await plan_persistent_session_turn(app=app, request=standard_request, payload=working_payload, surface="anthropic")
-        if session_plan.enabled:
-            standard_request.persistent_session = True
-            standard_request.full_prompt = session_plan.full_prompt
-            standard_request.prompt = session_plan.prompt
-            standard_request.session_message_hashes = session_plan.current_hashes
-            standard_request.upstream_chat_id = session_plan.existing_chat_id if session_plan.reuse_chat else None
-            if standard_request.bound_account is None and session_plan.account_email:
-                standard_request.bound_account = await app.state.account_pool.acquire_wait_preferred(session_plan.account_email, timeout=60)
-                if standard_request.bound_account is not None:
-                    standard_request.bound_account_email = standard_request.bound_account.email
-            elif standard_request.bound_account is not None and not standard_request.bound_account_email:
-                standard_request.bound_account_email = standard_request.bound_account.email
-            if standard_request.upstream_chat_id and standard_request.bound_account is None:
-                log_session_plan_reuse_cancelled(
-                    request=standard_request,
-                    planned_chat_id=session_plan.existing_chat_id,
-                    reason="missing_bound_account",
-                )
-                standard_request.upstream_chat_id = None
-                standard_request.prompt = standard_request.full_prompt or standard_request.prompt
-
         model_name = standard_request.response_model
         qwen_model = standard_request.resolved_model
         prompt = standard_request.prompt
         msg_id = f"msg_{uuid.uuid4().hex[:12]}"
         return standard_request, working_payload, model_name, qwen_model, prompt, msg_id
 
-    with request_context(req_id=new_request_id(), surface="anthropic", requested_model=req_data.get("model", "claude-3-5-sonnet"), resolved_model="-"):
+    with request_context(req_id=req_id, surface="anthropic", requested_model=req_data.get("model", "claude-3-5-sonnet"), resolved_model="-"):
         if request.headers.get("x-debug-session-key"):
             pass
 
@@ -341,109 +313,92 @@ async def anthropic_messages(request: Request):
                                 capture_events=False,
                                 on_delta=on_delta,
                             )
-                            retry = evaluate_retry_directive(
-                                request=standard_request,
-                                current_prompt=current_prompt,
-                                history_messages=history_messages,
-                                attempt_index=stream_attempt,
-                                max_attempts=max_attempts,
-                                state=execution.state,
-                                allow_after_visible_output=True,
-                            )
-                            if retry.retry:
-                                reused_persistent_chat = bool(standard_request.persistent_session and standard_request.upstream_chat_id)
-                                # 如果正在复用会话，重试时保留会话，避免删除后重建导致上下文丢失
-                                preserve_chat = reused_persistent_chat
-                                await cleanup_runtime_resources(client, execution.acc, execution.chat_id, preserve_chat=preserve_chat)
-                                if reused_persistent_chat:
-                                    # 保留 upstream_chat_id，在同一会话中重试
-                                    # standard_request.session_chat_invalidated = True
-                                    # standard_request.upstream_chat_id = None
-                                    current_prompt = build_retry_rebase_prompt(standard_request, reason=retry.reason)
-                                else:
+                            should_retry = False
+                            try:
+                                retry = evaluate_retry_directive(
+                                    request=standard_request,
+                                    current_prompt=current_prompt,
+                                    history_messages=history_messages,
+                                    attempt_index=stream_attempt,
+                                    max_attempts=max_attempts,
+                                    state=execution.state,
+                                    allow_after_visible_output=True,
+                                )
+                                if retry.retry:
                                     current_prompt = retry.next_prompt
+                                    should_retry = True
+                                else:
+                                    if not stream_state.pending_chunks:
+                                        stream_state.pending_chunks.append(_message_start_event(
+                                            msg_id,
+                                            model_name,
+                                            current_prompt,
+                                            execution.state.answer_text,
+                                            extra_prompt_tokens=standard_request.context_attachment_tokens,
+                                        ))
+
+                                    stream_state.close_current_block()
+                                    directive = build_tool_directive(standard_request, execution.state)
+                                    if directive.stop_reason == "tool_use":
+                                        stream_state.clear_answer_text()
+                                        stream_state.current_block = {"type": None, "index": None, "tool_call_id": None}
+                                    else:
+                                        stream_state.flush_answer_text()
+                                    expected_tool_ids = {
+                                        block.get("id")
+                                        for block in directive.tool_blocks
+                                        if block.get("type") == "tool_use" and block.get("id")
+                                    }
+                                    for block in directive.tool_blocks:
+                                        if block.get("type") != "tool_use":
+                                            continue
+                                        tool_id = block.get("id")
+                                        if tool_id in stream_state.opened_tool_calls:
+                                            continue
+                                        index = stream_state.open_tool_block(
+                                            str(tool_id),
+                                            _client_visible_tool_name(str(block.get("name", "")), standard_request.tool_catalog),
+                                        )
+                                        stream_state.pending_chunks.append(
+                                            stream_presenter.anthropic_content_block_delta(index, {'type': 'input_json_delta', 'partial_json': json.dumps(block.get('input', {}), ensure_ascii=False)})
+                                        )
+                                        stream_state.close_current_block()
+
+                                    visible_answer_length = _visible_answer_text_length(
+                                        directive=directive,
+                                        execution=execution,
+                                        stream_state=stream_state,
+                                    )
+                                    stop_reason = "tool_use" if expected_tool_ids else "end_turn"
+                                    stream_state.pending_chunks.append(stream_presenter.anthropic_message_delta(stop_reason, visible_answer_length))
+                                    stream_state.pending_chunks.append(stream_presenter.anthropic_message_stop())
+
+                                    await _add_used_tokens_for_prompt(
+                                        users_db=users_db,
+                                        token=token,
+                                        prompt_text=current_prompt,
+                                        answer_text_length=count_tokens(execution.state.answer_text),
+                                        extra_prompt_tokens=standard_request.context_attachment_tokens,
+                                    )
+                            finally:
+                                await cleanup_runtime_resources(
+                                    client,
+                                    execution.acc,
+                                    execution.chat_id,
+                                )
+
+                            if should_retry:
+                                await asyncio.sleep(0.15)
                                 await _reacquire_bound_account_if_needed(client=client, standard_request=standard_request)
                                 continue
 
-                            if not stream_state.pending_chunks:
-                                stream_state.pending_chunks.append(_message_start_event(
-                                    msg_id,
-                                    model_name,
-                                    current_prompt,
-                                    execution.state.answer_text,
-                                    extra_prompt_tokens=standard_request.context_attachment_tokens,
-                                ))
-
-                            stream_state.close_current_block()
-                            directive = build_tool_directive(standard_request, execution.state)
-                            if directive.stop_reason == "tool_use":
-                                stream_state.clear_answer_text()
-                                stream_state.current_block = {"type": None, "index": None, "tool_call_id": None}
-                            else:
-                                stream_state.flush_answer_text()
-                            expected_tool_ids = {
-                                block.get("id")
-                                for block in directive.tool_blocks
-                                if block.get("type") == "tool_use" and block.get("id")
-                            }
-                            for block in directive.tool_blocks:
-                                if block.get("type") != "tool_use":
-                                    continue
-                                tool_id = block.get("id")
-                                if tool_id in stream_state.opened_tool_calls:
-                                    continue
-                                index = stream_state.open_tool_block(
-                                    str(tool_id),
-                                    _client_visible_tool_name(str(block.get("name", "")), standard_request.tool_catalog),
-                                )
-                                stream_state.pending_chunks.append(
-                                    stream_presenter.anthropic_content_block_delta(index, {'type': 'input_json_delta', 'partial_json': json.dumps(block.get('input', {}), ensure_ascii=False)})
-                                )
-                                stream_state.close_current_block()
-
-                            visible_answer_length = _visible_answer_text_length(
-                                directive=directive,
-                                execution=execution,
-                                stream_state=stream_state,
-                            )
-                            stop_reason = "tool_use" if expected_tool_ids else "end_turn"
-                            stream_state.pending_chunks.append(stream_presenter.anthropic_message_delta(stop_reason, visible_answer_length))
-                            stream_state.pending_chunks.append(stream_presenter.anthropic_message_stop())
-
-                            await _add_used_tokens_for_prompt(
-                                users_db=users_db,
-                                token=token,
-                                prompt_text=current_prompt,
-                                answer_text_length=count_tokens(execution.state.answer_text),
-                                extra_prompt_tokens=standard_request.context_attachment_tokens,
-                            )
-                            assistant_message = build_anthropic_assistant_history_message(
-                                execution=execution,
-                                request=standard_request,
-                                directive=directive,
-                            )
-                            await persist_session_turn(
-                                app=app,
-                                request=standard_request,
-                                surface="anthropic",
-                                execution=execution,
-                                assistant_message=assistant_message,
-                            )
-                            await cleanup_runtime_resources(
-                                client,
-                                execution.acc,
-                                execution.chat_id,
-                                preserve_chat=bool(standard_request.persistent_session),
-                            )
                             for chunk in stream_state.pending_chunks:
                                 yield chunk
                             return
                         except HTTPException as he:
-                            await clear_invalidated_session_chat(app=app, request=standard_request)
                             yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': he.detail}}, ensure_ascii=False)}\n\n"
                             return
                         except Exception as e:
-                            await clear_invalidated_session_chat(app=app, request=standard_request)
                             yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)}}, ensure_ascii=False)}\n\n"
                             return
 
@@ -471,18 +426,6 @@ async def anthropic_messages(request: Request):
                 )
                 execution = result.execution
                 directive = result.directive or build_tool_directive(standard_request, execution.state)
-                assistant_message = build_anthropic_assistant_history_message(
-                    execution=execution,
-                    request=standard_request,
-                    directive=directive,
-                )
-                await persist_session_turn(
-                    app=app,
-                    request=standard_request,
-                    surface="anthropic",
-                    execution=execution,
-                    assistant_message=assistant_message,
-                )
                 return JSONResponse(
                     build_anthropic_message_payload(
                         msg_id=msg_id,
@@ -493,5 +436,4 @@ async def anthropic_messages(request: Request):
                     )
                 )
             except Exception as e:
-                await clear_invalidated_session_chat(app=app, request=standard_request)
                 raise HTTPException(status_code=500, detail=str(e))

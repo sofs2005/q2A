@@ -43,6 +43,10 @@ def _text_from_content(content: Any) -> str:
     return str(content or "")
 
 
+def build_request_session_key(surface: str, request_id: str) -> str:
+    return f"{surface}:{request_id}"
+
+
 def derive_session_key(surface: str, auth_token: str, payload: dict[str, Any]) -> str:
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
     explicit = payload.get("session_key") or payload.get("conversation_id") or metadata.get("conversation_id")
@@ -146,7 +150,7 @@ def _context_tools_for_payload(payload: dict[str, Any], surface: str) -> list[di
         return tools
 
 
-async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: str, auth_token: str, client_profile: str, existing_attachments=None) -> dict[str, Any]:
+async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: str, auth_token: str, client_profile: str, session_key: str, existing_attachments=None) -> dict[str, Any]:
     context_offloader = app.state.context_offloader
     account_pool = app.state.account_pool
     file_store = app.state.file_store
@@ -154,7 +158,6 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
     cache = app.state.upstream_file_cache
     uploader = app.state.upstream_file_uploader
 
-    session_key = derive_session_key(surface, auth_token, payload)
     tools = _context_tools_for_payload(payload, surface)
     messages = payload.get("messages", []) or []
     context_messages = _context_messages_for_payload(payload)

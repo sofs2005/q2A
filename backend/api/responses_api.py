@@ -16,7 +16,7 @@ from backend.runtime.execution import RuntimeAttemptState, build_tool_directive,
 from backend.services.attachment_preprocessor import preprocess_attachments
 from backend.services.auth_quota import resolve_auth_context
 from backend.services.completion_bridge import run_retryable_completion_bridge
-from backend.services.context_attachment_manager import derive_session_key, prepare_context_attachments
+from backend.services.context_attachment_manager import build_request_session_key, prepare_context_attachments
 from backend.services.qwen_client import QwenClient
 from backend.services.responses_compat import (
     PreparedResponsesRequest,
@@ -28,13 +28,7 @@ from backend.services.responses_compat import (
 )
 from backend.services.response_formatters import build_openai_response_payload
 from backend.services.standard_request_builder import build_chat_standard_request
-from backend.toolcore.task_session import (
-    build_openai_assistant_history_message,
-    clear_invalidated_session_chat,
-    log_session_plan_reuse_cancelled,
-    persist_session_turn,
-    plan_persistent_session_turn,
-)
+from backend.toolcore.task_session import build_openai_assistant_history_message
 
 router = APIRouter()
 log = logging.getLogger("qwen2api.responses")
@@ -104,6 +98,9 @@ async def create_response(request: Request):
     except Exception:
         raise HTTPException(400, {"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}})
 
+    req_id = new_request_id()
+    session_key = build_request_session_key("responses", req_id)
+
     prepared: PreparedResponsesRequest = await prepare_responses_request(
         response_store=request.app.state.response_store,
         req_data=raw_req_data,
@@ -111,7 +108,6 @@ async def create_response(request: Request):
     transformed_req = prepared.transformed_payload
     previous_response_id = prepared.previous_response_id
     client_profile = _detect_openai_client_profile(request, raw_req_data)
-    session_key = derive_session_key("responses", token, transformed_req)
 
     file_store = getattr(app.state, "file_store", None)
     preprocessed = None
@@ -125,6 +121,7 @@ async def create_response(request: Request):
         surface="responses",
         auth_token=token,
         client_profile=client_profile,
+        session_key=session_key,
         existing_attachments=(preprocessed.attachments if preprocessed is not None else None),
     )
     transformed_req = context_prepared["payload"]
@@ -140,35 +137,13 @@ async def create_response(request: Request):
     standard_request.bound_account_email = context_prepared["bound_account_email"]
     standard_request.bound_account = context_prepared["bound_account"]
 
-    session_plan = await plan_persistent_session_turn(app=app, request=standard_request, payload=transformed_req, surface="responses")
-    if session_plan.enabled:
-        standard_request.persistent_session = True
-        standard_request.full_prompt = session_plan.full_prompt
-        standard_request.prompt = session_plan.prompt
-        standard_request.session_message_hashes = session_plan.current_hashes
-        standard_request.upstream_chat_id = session_plan.existing_chat_id if session_plan.reuse_chat else None
-        if standard_request.bound_account is None and session_plan.account_email:
-            standard_request.bound_account = await app.state.account_pool.acquire_wait_preferred(session_plan.account_email, timeout=60)
-            if standard_request.bound_account is not None:
-                standard_request.bound_account_email = standard_request.bound_account.email
-        elif standard_request.bound_account is not None and not standard_request.bound_account_email:
-            standard_request.bound_account_email = standard_request.bound_account.email
-        if standard_request.upstream_chat_id and standard_request.bound_account is None:
-            log_session_plan_reuse_cancelled(
-                request=standard_request,
-                planned_chat_id=session_plan.existing_chat_id,
-                reason="missing_bound_account",
-            )
-            standard_request.upstream_chat_id = None
-            standard_request.prompt = standard_request.full_prompt or standard_request.prompt
-
     model_name = standard_request.response_model
     prompt = standard_request.prompt
     response_id = f"resp_{uuid.uuid4().hex[:24]}"
     created = int(time.time())
     history_messages = prepared.combined_messages
 
-    with request_context(req_id=new_request_id(), surface="responses", requested_model=model_name, resolved_model=standard_request.resolved_model):
+    with request_context(req_id=req_id, surface="responses", requested_model=model_name, resolved_model=standard_request.resolved_model):
         if standard_request.stream:
             async def generate():
                 translator = ResponsesStreamTranslator(response_id=response_id, created=created, model_name=model_name, tool_catalog=standard_request.tool_catalog)
@@ -223,22 +198,13 @@ async def create_response(request: Request):
                         )
                         updated_history = list(transformed_req.get("messages", [])) + [assistant_message]
                         await app.state.response_store.save(response_id, response_payload, updated_history)
-                        await persist_session_turn(
-                            app=app,
-                            request=standard_request,
-                            surface="responses",
-                            execution=execution,
-                            assistant_message=assistant_message,
-                        )
                         for chunk in translator.finalize(response_payload=response_payload, standard_request=standard_request, execution=execution):
                             yield chunk
                         return
                 except HTTPException as he:
-                    await clear_invalidated_session_chat(app=app, request=standard_request)
                     yield sse_event({"type": "response.failed", "sequence_number": translator._next_sequence(), "response": {"id": response_id, "status": "failed"}, "error": he.detail})
                     return
                 except Exception as e:
-                    await clear_invalidated_session_chat(app=app, request=standard_request)
                     yield sse_event({"type": "response.failed", "sequence_number": translator._next_sequence(), "response": {"id": response_id, "status": "failed"}, "error": {"message": str(e)}})
                     return
 
@@ -284,16 +250,8 @@ async def create_response(request: Request):
                 )
                 updated_history = list(transformed_req.get("messages", [])) + [assistant_message]
                 await app.state.response_store.save(response_id, response_payload, updated_history)
-                await persist_session_turn(
-                    app=app,
-                    request=standard_request,
-                    surface="responses",
-                    execution=execution,
-                    assistant_message=assistant_message,
-                )
                 return JSONResponse(response_payload)
         except Exception as e:
-            await clear_invalidated_session_chat(app=app, request=standard_request)
             raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -330,6 +288,9 @@ async def create_response_websocket(websocket: WebSocket):
         await websocket.close(code=4400, reason="Invalid JSON body")
         return
 
+    req_id = new_request_id()
+    session_key = build_request_session_key("responses", req_id)
+
     try:
         prepared: PreparedResponsesRequest = await prepare_responses_request(
             response_store=app.state.response_store,
@@ -338,7 +299,6 @@ async def create_response_websocket(websocket: WebSocket):
         transformed_req = prepared.transformed_payload
         previous_response_id = prepared.previous_response_id
         client_profile = _detect_openai_client_profile(websocket, raw_req_data)
-        session_key = derive_session_key("responses", token, transformed_req)
 
         file_store = getattr(app.state, "file_store", None)
         preprocessed = None
@@ -352,6 +312,7 @@ async def create_response_websocket(websocket: WebSocket):
             surface="responses",
             auth_token=token,
             client_profile=client_profile,
+            session_key=session_key,
             existing_attachments=(preprocessed.attachments if preprocessed is not None else None),
         )
         transformed_req = context_prepared["payload"]
@@ -367,35 +328,13 @@ async def create_response_websocket(websocket: WebSocket):
         standard_request.bound_account_email = context_prepared["bound_account_email"]
         standard_request.bound_account = context_prepared["bound_account"]
 
-        session_plan = await plan_persistent_session_turn(app=app, request=standard_request, payload=transformed_req, surface="responses")
-        if session_plan.enabled:
-            standard_request.persistent_session = True
-            standard_request.full_prompt = session_plan.full_prompt
-            standard_request.prompt = session_plan.prompt
-            standard_request.session_message_hashes = session_plan.current_hashes
-            standard_request.upstream_chat_id = session_plan.existing_chat_id if session_plan.reuse_chat else None
-            if standard_request.bound_account is None and session_plan.account_email:
-                standard_request.bound_account = await app.state.account_pool.acquire_wait_preferred(session_plan.account_email, timeout=60)
-                if standard_request.bound_account is not None:
-                    standard_request.bound_account_email = standard_request.bound_account.email
-            elif standard_request.bound_account is not None and not standard_request.bound_account_email:
-                standard_request.bound_account_email = standard_request.bound_account.email
-            if standard_request.upstream_chat_id and standard_request.bound_account is None:
-                log_session_plan_reuse_cancelled(
-                    request=standard_request,
-                    planned_chat_id=session_plan.existing_chat_id,
-                    reason="missing_bound_account",
-                )
-                standard_request.upstream_chat_id = None
-                standard_request.prompt = standard_request.full_prompt or standard_request.prompt
-
         model_name = standard_request.response_model
         prompt = standard_request.prompt
         response_id = f"resp_{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         history_messages = prepared.combined_messages
 
-        with request_context(req_id=new_request_id(), surface="responses_ws", requested_model=model_name, resolved_model=standard_request.resolved_model):
+        with request_context(req_id=req_id, surface="responses_ws", requested_model=model_name, resolved_model=standard_request.resolved_model):
             translator = ResponsesStreamTranslator(response_id=response_id, created=created, model_name=model_name, tool_catalog=standard_request.tool_catalog)
             translator.start()
             for chunk in translator.pending_chunks:
@@ -449,13 +388,6 @@ async def create_response_websocket(websocket: WebSocket):
                 )
                 updated_history = list(transformed_req.get("messages", [])) + [assistant_message]
                 await app.state.response_store.save(response_id, response_payload, updated_history)
-                await persist_session_turn(
-                    app=app,
-                    request=standard_request,
-                    surface="responses",
-                    execution=execution,
-                    assistant_message=assistant_message,
-                )
                 for chunk in translator.finalize(response_payload=response_payload, standard_request=standard_request, execution=execution):
                     await websocket.send_json(sse_chunk_to_payload(chunk))
     except WebSocketDisconnect:

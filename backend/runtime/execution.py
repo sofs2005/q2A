@@ -451,12 +451,11 @@ async def run_runtime_attempt(
         state=execution.state,
         allow_after_visible_output=allow_after_visible_output,
     )
-    preserve_chat = bool(getattr(request, 'persistent_session', False))
     continuation = await continue_after_retry_directive(
         client=client,
         execution=execution,
         retry=retry,
-        preserve_chat=preserve_chat,
+        preserve_chat=False,
     )
     return RuntimeAttemptOutcome(execution=execution, continuation=continuation)
 
@@ -598,166 +597,169 @@ async def collect_completion_run(
         )
         return RuntimeExecutionResult(state=state, chat_id=chat_id, acc=acc)
 
-    async for item in client.chat_stream_events_with_retry(
-        request.resolved_model,
-        prompt,
-        has_custom_tools=bool(request.tools),
-        files=getattr(request, "upstream_files", None),
-        fixed_account=getattr(request, "bound_account", None),
-        existing_chat_id=getattr(request, "upstream_chat_id", None),
-    ):
-        if item.get("type") == "meta":
-            chat_id = item.get("chat_id")
-            acc = item.get("acc")
-            update_request_context(chat_id=chat_id)
-            metrics.mark("chat_created", float(len(raw_events)))
-            continue
-        if item.get("type") != "event":
-            continue
+    try:
+        async for item in client.chat_stream_events_with_retry(
+            request.resolved_model,
+            prompt,
+            has_custom_tools=bool(request.tools),
+            files=getattr(request, "upstream_files", None),
+            fixed_account=getattr(request, "bound_account", None),
+        ):
+            if item.get("type") == "meta":
+                chat_id = item.get("chat_id")
+                acc = item.get("acc")
+                update_request_context(chat_id=chat_id)
+                metrics.mark("chat_created", float(len(raw_events)))
+                continue
+            if item.get("type") != "event":
+                continue
 
-        evt = item.get("event", {})
-        if capture_events:
-            raw_events.append(evt)
-        if evt.get("type") != "delta":
-            continue
+            evt = item.get("event", {})
+            if capture_events:
+                raw_events.append(evt)
+            if evt.get("type") != "delta":
+                continue
 
-        phase = evt.get("phase", "")
-        content = evt.get("content", "")
+            phase = evt.get("phase", "")
+            content = evt.get("content", "")
 
-        if phase in ("think", "thinking_summary") and content:
-            reasoning_fragments.append(content)
-            emitted_visible_output = True
-            if not first_event_marked:
-                metrics.mark("first_event", float(len(raw_events)))
-                first_event_marked = True
-            if on_delta is not None:
-                await on_delta(evt, content, None)
-            continue
-
-        if phase == "answer" and content:
-            answer_fragments.append(content)
-            answer_chunk_count += 1
-            answer_chars += len(content)
-            emitted_visible_output = True
-            if not first_event_marked:
-                metrics.mark("first_event", float(len(raw_events)))
-                first_event_marked = True
-            if answer_chunk_count % 100 == 0:
-                log.info(
-                    "[Collect] stream heartbeat chat_id=%s chunks=%s answer_chars=%s raw_events=%s",
-                    chat_id,
-                    answer_chunk_count,
-                    answer_chars,
-                    len(raw_events),
-                )
-
-            # Tool Sieve 实时检测
-            if tool_sieve:
-                sieve_started = time.perf_counter()
-                sieve_events = tool_sieve.process_chunk(content)
-                sieve_elapsed = time.perf_counter() - sieve_started
-                if sieve_elapsed > 0.05:
-                    log.warning(
-                        "[Collect] slow tool_sieve chat_id=%s elapsed=%.3fs chunk_chars=%s pending_chars=%s capture_chars=%s capturing=%s",
-                        chat_id,
-                        sieve_elapsed,
-                        len(content),
-                        len(getattr(tool_sieve, "pending", "")),
-                        len(getattr(tool_sieve, "capture", "")),
-                        getattr(tool_sieve, "capturing", False),
-                    )
-                for sieve_evt in sieve_events:
-                    if sieve_evt.get("type") == "content":
-                        safe_text = str(sieve_evt.get("text") or "")
-                        if safe_text and on_delta is not None:
-                            await on_delta(evt, safe_text, None)
-                        continue
-                    if sieve_evt.get("type") == "tool_calls":
-                        calls = sieve_evt.get("calls", [])
-                        if calls:
-                            import uuid
-                            detected_calls = [{
-                                "type": "tool_use",
-                                "id": f"toolu_{uuid.uuid4().hex[:8]}",
-                                "name": call["name"],
-                                "input": call["input"]
-                            } for call in calls]
-                            native_tool_calls.extend(detected_calls)
-                            if on_delta is not None:
-                                for flush_evt in tool_sieve.flush():
-                                    if flush_evt.get("type") == "content":
-                                        safe_text = str(flush_evt.get("text") or "")
-                                        if safe_text:
-                                            await on_delta(evt, safe_text, None)
-                            log.info(
-                                "[Collect] ✓ Tool Sieve 实时检测到工具调用: tools=%s",
-                                [c.get("name") for c in detected_calls],
-                            )
-                            return _finalize_result(reason="tool_sieve_detected")
-            elif on_delta is not None:
-                await on_delta(evt, content, None)
-
-            if request.tools:
-                answer_text = None
-                join_elapsed = 0.0
-                if "does not exist" in content.lower():
-                    join_started = time.perf_counter()
-                    answer_text = "".join(answer_fragments)
-                    join_elapsed = time.perf_counter() - join_started
-                    blocked_started = time.perf_counter()
-                    blocked_tool_names = extract_blocked_tool_names(answer_text.strip(), request.tool_names)
-                    blocked_elapsed = time.perf_counter() - blocked_started
-                    if join_elapsed + blocked_elapsed > 0.05:
-                        log.warning(
-                            "[Collect] slow tool_guard chat_id=%s elapsed=%.3fs join=%.3fs blocked=%.3fs answer_chars=%s chunks=%s",
-                            chat_id,
-                            join_elapsed + blocked_elapsed,
-                            join_elapsed,
-                            blocked_elapsed,
-                            len(answer_text),
-                            answer_chunk_count,
-                        )
-                    if blocked_tool_names:
-                        return _finalize_result(reason=f"blocked_tool_name:{blocked_tool_names[0]}")
-                if "##TOOL_CALL##" in content or "<tool_call>" in content:
-                    if answer_text is None:
-                        answer_text = "".join(answer_fragments)
-                    directive = parse_tool_directive_once(
-                        request,
-                        RuntimeAttemptState(answer_text=answer_text, reasoning_text="".join(reasoning_fragments)),
-                    )
-                    if directive.stop_reason == "tool_use":
-                        return _finalize_result(reason="textual_tool_use")
-            continue
-
-        if phase == "tool_call":
-            emitted_visible_output = True
-            if not first_event_marked:
-                metrics.mark("first_event", float(len(raw_events)))
-                first_event_marked = True
-            completed_calls = tool_state.process_event(evt)
-            if completed_calls:
-                completed_calls = normalize_streamed_tool_calls(completed_calls, request.tool_names)
-                native_tool_calls.extend(completed_calls)
+            if phase in ("think", "thinking_summary") and content:
+                reasoning_fragments.append(content)
+                emitted_visible_output = True
+                if not first_event_marked:
+                    metrics.mark("first_event", float(len(raw_events)))
+                    first_event_marked = True
                 if on_delta is not None:
-                    await on_delta(evt, None, completed_calls)
-                return _finalize_result(reason="native_tool_use")
+                    await on_delta(evt, content, None)
+                continue
 
-    if tool_sieve and on_delta is not None:
-        final_tool_sieve_events = tool_sieve.flush()
-        has_flushed_tool_call = any(
-            evt.get("type") == "tool_calls" and evt.get("calls")
-            for evt in final_tool_sieve_events
-        )
-        if not has_flushed_tool_call:
-            for flush_evt in final_tool_sieve_events:
-                if flush_evt.get("type") == "content":
-                    safe_text = str(flush_evt.get("text") or "")
-                    if safe_text:
-                        await on_delta({"phase": "answer"}, safe_text, None)
+            if phase == "answer" and content:
+                answer_fragments.append(content)
+                answer_chunk_count += 1
+                answer_chars += len(content)
+                emitted_visible_output = True
+                if not first_event_marked:
+                    metrics.mark("first_event", float(len(raw_events)))
+                    first_event_marked = True
+                if answer_chunk_count % 100 == 0:
+                    log.info(
+                        "[Collect] stream heartbeat chat_id=%s chunks=%s answer_chars=%s raw_events=%s",
+                        chat_id,
+                        answer_chunk_count,
+                        answer_chars,
+                        len(raw_events),
+                    )
 
-    return _finalize_result(reason="stream_end")
+                # Tool Sieve 实时检测
+                if tool_sieve:
+                    sieve_started = time.perf_counter()
+                    sieve_events = tool_sieve.process_chunk(content)
+                    sieve_elapsed = time.perf_counter() - sieve_started
+                    if sieve_elapsed > 0.05:
+                        log.warning(
+                            "[Collect] slow tool_sieve chat_id=%s elapsed=%.3fs chunk_chars=%s pending_chars=%s capture_chars=%s capturing=%s",
+                            chat_id,
+                            sieve_elapsed,
+                            len(content),
+                            len(getattr(tool_sieve, "pending", "")),
+                            len(getattr(tool_sieve, "capture", "")),
+                            getattr(tool_sieve, "capturing", False),
+                        )
+                    for sieve_evt in sieve_events:
+                        if sieve_evt.get("type") == "content":
+                            safe_text = str(sieve_evt.get("text") or "")
+                            if safe_text and on_delta is not None:
+                                await on_delta(evt, safe_text, None)
+                            continue
+                        if sieve_evt.get("type") == "tool_calls":
+                            calls = sieve_evt.get("calls", [])
+                            if calls:
+                                import uuid
+                                detected_calls = [{
+                                    "type": "tool_use",
+                                    "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                                    "name": call["name"],
+                                    "input": call["input"]
+                                } for call in calls]
+                                native_tool_calls.extend(detected_calls)
+                                if on_delta is not None:
+                                    for flush_evt in tool_sieve.flush():
+                                        if flush_evt.get("type") == "content":
+                                            safe_text = str(flush_evt.get("text") or "")
+                                            if safe_text:
+                                                await on_delta(evt, safe_text, None)
+                                log.info(
+                                    "[Collect] ✓ Tool Sieve 实时检测到工具调用: tools=%s",
+                                    [c.get("name") for c in detected_calls],
+                                )
+                                return _finalize_result(reason="tool_sieve_detected")
+                elif on_delta is not None:
+                    await on_delta(evt, content, None)
 
+                if request.tools:
+                    answer_text = None
+                    join_elapsed = 0.0
+                    if "does not exist" in content.lower():
+                        join_started = time.perf_counter()
+                        answer_text = "".join(answer_fragments)
+                        join_elapsed = time.perf_counter() - join_started
+                        blocked_started = time.perf_counter()
+                        blocked_tool_names = extract_blocked_tool_names(answer_text.strip(), request.tool_names)
+                        blocked_elapsed = time.perf_counter() - blocked_started
+                        if join_elapsed + blocked_elapsed > 0.05:
+                            log.warning(
+                                "[Collect] slow tool_guard chat_id=%s elapsed=%.3fs join=%.3fs blocked=%.3fs answer_chars=%s chunks=%s",
+                                chat_id,
+                                join_elapsed + blocked_elapsed,
+                                join_elapsed,
+                                blocked_elapsed,
+                                len(answer_text),
+                                answer_chunk_count,
+                            )
+                        if blocked_tool_names:
+                            return _finalize_result(reason=f"blocked_tool_name:{blocked_tool_names[0]}")
+                    if "##TOOL_CALL##" in content or "<tool_call>" in content:
+                        if answer_text is None:
+                            answer_text = "".join(answer_fragments)
+                        directive = parse_tool_directive_once(
+                            request,
+                            RuntimeAttemptState(answer_text=answer_text, reasoning_text="".join(reasoning_fragments)),
+                        )
+                        if directive.stop_reason == "tool_use":
+                            return _finalize_result(reason="textual_tool_use")
+                continue
+
+            if phase == "tool_call":
+                emitted_visible_output = True
+                if not first_event_marked:
+                    metrics.mark("first_event", float(len(raw_events)))
+                    first_event_marked = True
+                completed_calls = tool_state.process_event(evt)
+                if completed_calls:
+                    completed_calls = normalize_streamed_tool_calls(completed_calls, request.tool_names)
+                    native_tool_calls.extend(completed_calls)
+                    if on_delta is not None:
+                        await on_delta(evt, None, completed_calls)
+                    return _finalize_result(reason="native_tool_use")
+
+        if tool_sieve and on_delta is not None:
+            final_tool_sieve_events = tool_sieve.flush()
+            has_flushed_tool_call = any(
+                evt.get("type") == "tool_calls" and evt.get("calls")
+                for evt in final_tool_sieve_events
+            )
+            if not has_flushed_tool_call:
+                for flush_evt in final_tool_sieve_events:
+                    if flush_evt.get("type") == "content":
+                        safe_text = str(flush_evt.get("text") or "")
+                        if safe_text:
+                            await on_delta({"phase": "answer"}, safe_text, None)
+
+        return _finalize_result(reason="stream_end")
+    except Exception:
+        if acc is not None:
+            await cleanup_runtime_resources(client, acc, chat_id)
+        raise
 
 def parse_tool_directive_once(request: StandardRequest, state: RuntimeAttemptState) -> RuntimeToolDirective:
     if settings.TOOLCORE_V2_ENABLED:

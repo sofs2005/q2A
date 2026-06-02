@@ -6,13 +6,13 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 from backend.adapter.standard_request import StandardRequest, detect_openai_client_profile
 from backend.core.config import settings
 from backend.core.request_logging import new_request_id, request_context, update_request_context
 from backend.services.attachment_preprocessor import preprocess_attachments
-from backend.services.context_attachment_manager import prepare_context_attachments, derive_session_key
-from backend.services.auth_quota import add_used_tokens, resolve_auth_context
+from backend.services.context_attachment_manager import build_request_session_key, prepare_context_attachments
+from backend.services.auth_quota import resolve_auth_context
 from backend.services.completion_bridge import run_retryable_completion_bridge
 from backend.services.openai_stream_translator import OpenAIStreamTranslator
 from backend.services.response_formatters import build_openai_completion_payload
@@ -20,18 +20,10 @@ from backend.services.token_calc import calculate_usage
 from backend.services.qwen_client import QwenClient
 from backend.services.standard_request_builder import build_chat_standard_request
 from backend.toolcore.request_singleflight import RequestSingleflight
-from backend.toolcore.task_session import (
-    build_openai_assistant_history_message,
-    clear_invalidated_session_chat,
-    log_session_plan_reuse_cancelled,
-    persist_session_turn,
-    plan_persistent_session_turn,
-)
 from backend.runtime.execution import RuntimeAttemptState, RuntimeToolDirective, build_tool_directive, build_usage_delta_factory, request_max_attempts
 
 log = logging.getLogger("qwen2api.chat")
 router = APIRouter()
-OpenAIDeltaHandler = Callable[[dict[str, Any], str | None, list[dict[str, Any]] | None], Awaitable[None]]
 _openai_json_singleflight = RequestSingleflight(
     result_ttl_seconds=settings.OPENAI_JSON_SINGLEFLIGHT_RESULT_TTL_SECONDS,
 )
@@ -63,7 +55,6 @@ def _stable_json(value: Any) -> str:
 
 def _build_openai_json_singleflight_key(
     *,
-    session_key: str,
     standard_request: StandardRequest,
     diagnostics: dict[str, Any],
 ) -> tuple[Any, ...] | None:
@@ -71,11 +62,15 @@ def _build_openai_json_singleflight_key(
         return None
     prompt_hash = str(diagnostics.get("prompt_hash") or "")
     latest_user_hash = str(diagnostics.get("latest_user_hash") or "")
-    if not session_key or not prompt_hash or not latest_user_hash:
+    if not prompt_hash or not latest_user_hash:
         return None
+    context_fingerprint = str(
+        diagnostics.get("context_fingerprint")
+        or getattr(standard_request, "context_fingerprint", "")
+        or ""
+    )
     return (
         "openai-json",
-        session_key,
         standard_request.client_profile,
         standard_request.response_model,
         standard_request.resolved_model,
@@ -85,6 +80,7 @@ def _build_openai_json_singleflight_key(
         _stable_json(standard_request.tool_choice_raw),
         prompt_hash,
         latest_user_hash,
+        context_fingerprint,
     )
 
 
@@ -135,7 +131,16 @@ def _build_openai_context_fingerprint(
     context_mode = str(context_prepared.get("context_mode") or "")
     attachment_fallback = bool(context_prepared.get("attachment_fallback"))
     context_attachment_tokens = int(context_prepared.get("context_attachment_tokens") or 0)
-    if not any((request_upstream_files, prepared_upstream_files, generated_files, context_mode, attachment_fallback, context_attachment_tokens)):
+    has_context_difference = any(
+        (
+            request_upstream_files,
+            prepared_upstream_files,
+            generated_files,
+            attachment_fallback,
+            context_attachment_tokens,
+        )
+    )
+    if not has_context_difference:
         return ""
     generated_file_fingerprints = [
         {
@@ -843,7 +848,6 @@ async def chat_completions(request: Request):
         raise HTTPException(400, {"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}})
 
     client_profile = _detect_openai_client_profile(request, req_data)
-    session_key = derive_session_key("openai", token, req_data)
     original_history_messages = req_data.get("messages", [])
     file_store = getattr(app.state, "file_store", None)
     preprocessed = None
@@ -854,6 +858,7 @@ async def chat_completions(request: Request):
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
     req_id = new_request_id()
+    session_key = build_request_session_key("openai", req_id)
     client_host = request.client.host if request.client else "-"
     early_standard_request = _build_standard_request(req_data, client_profile=client_profile)
     early_context_fingerprint = _build_openai_context_fingerprint(req_data=req_data)
@@ -902,7 +907,6 @@ async def chat_completions(request: Request):
     singleflight_owner = False
     if settings.OPENAI_JSON_SINGLEFLIGHT_ENABLED and not early_standard_request.stream:
         singleflight_key = _build_openai_json_singleflight_key(
-            session_key=session_key,
             standard_request=early_standard_request,
             diagnostics=early_diagnostics,
         )
@@ -913,24 +917,26 @@ async def chat_completions(request: Request):
             )
             if cached_payload is not None:
                 log.warning(
-                    "[OAI] duplicate_json_request_cache_hit req_id=%s completion_id=%s session=%s prompt_hash=%s latest_user_hash=%s",
+                    "[OAI] duplicate_json_request_cache_hit req_id=%s completion_id=%s session=%s prompt_hash=%s latest_user_hash=%s context_fingerprint=%s",
                     req_id,
                     completion_id,
                     session_key,
                     early_diagnostics["prompt_hash"],
                     early_diagnostics["latest_user_hash"],
+                    early_diagnostics["context_fingerprint"],
                 )
                 return JSONResponse(cached_payload)
             if not singleflight_owner and entry is not None:
                 age_seconds = max(0.0, _openai_json_singleflight.now() - entry.created_at)
                 log.warning(
-                    "[OAI] duplicate_json_request_join req_id=%s owner_req_id=%s completion_id=%s session=%s prompt_hash=%s latest_user_hash=%s age=%.3f",
+                    "[OAI] duplicate_json_request_join req_id=%s owner_req_id=%s completion_id=%s session=%s prompt_hash=%s latest_user_hash=%s context_fingerprint=%s age=%.3f",
                     req_id,
                     entry.owner_id,
                     completion_id,
                     session_key,
                     early_diagnostics["prompt_hash"],
                     early_diagnostics["latest_user_hash"],
+                    early_diagnostics["context_fingerprint"],
                     age_seconds,
                 )
                 try:
@@ -943,7 +949,7 @@ async def chat_completions(request: Request):
                 return JSONResponse(payload)
 
     try:
-        context_prepared = await prepare_context_attachments(app=app, payload=req_data, surface="openai", auth_token=token, client_profile=client_profile, existing_attachments=(preprocessed.attachments if preprocessed is not None else None))
+        context_prepared = await prepare_context_attachments(app=app, payload=req_data, surface="openai", auth_token=token, client_profile=client_profile, session_key=session_key, existing_attachments=(preprocessed.attachments if preprocessed is not None else None))
     except Exception as e:
         if singleflight_owner and singleflight_key is not None:
             await _openai_json_singleflight.fail(singleflight_key, e)
@@ -960,28 +966,6 @@ async def chat_completions(request: Request):
     standard_request.context_fingerprint = _build_openai_context_fingerprint(req_data=req_data, context_prepared=context_prepared)
     standard_request.bound_account_email = context_prepared["bound_account_email"]
     standard_request.bound_account = context_prepared["bound_account"]
-
-    session_plan = await plan_persistent_session_turn(app=app, request=standard_request, payload=req_data, surface="openai")
-    if session_plan.enabled:
-        standard_request.persistent_session = True
-        standard_request.full_prompt = session_plan.full_prompt
-        standard_request.prompt = session_plan.prompt
-        standard_request.session_message_hashes = session_plan.current_hashes
-        standard_request.upstream_chat_id = session_plan.existing_chat_id if session_plan.reuse_chat else None
-        if standard_request.bound_account is None and session_plan.account_email:
-            standard_request.bound_account = await app.state.account_pool.acquire_wait_preferred(session_plan.account_email, timeout=60)
-            if standard_request.bound_account is not None:
-                standard_request.bound_account_email = standard_request.bound_account.email
-        elif standard_request.bound_account is not None and not standard_request.bound_account_email:
-            standard_request.bound_account_email = standard_request.bound_account.email
-        if standard_request.upstream_chat_id and standard_request.bound_account is None:
-            log_session_plan_reuse_cancelled(
-                request=standard_request,
-                planned_chat_id=session_plan.existing_chat_id,
-                reason="missing_bound_account",
-            )
-            standard_request.upstream_chat_id = None
-            standard_request.prompt = standard_request.full_prompt or standard_request.prompt
 
     model_name = standard_request.response_model
     qwen_model = standard_request.resolved_model
@@ -1180,18 +1164,6 @@ async def chat_completions(request: Request):
                                         tool_blocks=[{"type": "text", "text": execution.state.answer_text or ""}],
                                         stop_reason="end_turn",
                                     )
-                                assistant_message = build_openai_assistant_history_message(
-                                    execution=execution,
-                                    request=standard_request,
-                                    directive=directive,
-                                )
-                                await persist_session_turn(
-                                    app=app,
-                                    request=standard_request,
-                                    surface="openai",
-                                    execution=execution,
-                                    assistant_message=assistant_message,
-                                )
                                 final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else (execution.state.finish_reason or "stop")
                                 tool_names = [block.get("name") for block in directive.tool_blocks if block.get("type") == "tool_use"]
                                 _record_repeated_tool_guard(
@@ -1287,18 +1259,6 @@ async def chat_completions(request: Request):
                                 )
                                 execution = result.execution
                                 directive = result.directive or build_tool_directive(standard_request, execution.state)
-                                assistant_message = build_openai_assistant_history_message(
-                                    execution=execution,
-                                    request=standard_request,
-                                    directive=directive,
-                                )
-                                await persist_session_turn(
-                                    app=app,
-                                    request=standard_request,
-                                    surface="openai",
-                                    execution=execution,
-                                    assistant_message=assistant_message,
-                                )
                                 final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else (execution.state.finish_reason or "stop")
                                 tool_names = [block.get("name") for block in directive.tool_blocks if block.get("type") == "tool_use"]
                                 _record_repeated_tool_guard(
@@ -1333,7 +1293,6 @@ async def chat_completions(request: Request):
                                 for chunk in translator.finalize(final_finish_reason, usage=usage):
                                     await queue.put(chunk)
                         except HTTPException as he:
-                            await clear_invalidated_session_chat(app=app, request=standard_request)
                             await queue.put(f"data: {json.dumps({'error': he.detail})}\n\n")
                         except Exception as e:
                             log.exception(
@@ -1343,7 +1302,6 @@ async def chat_completions(request: Request):
                                 diagnostics["prompt_hash"],
                                 e,
                             )
-                            await clear_invalidated_session_chat(app=app, request=standard_request)
                             await queue.put(f"data: {json.dumps({'error': str(e)})}\n\n")
                         finally:
                             log.info(
@@ -1406,18 +1364,6 @@ async def chat_completions(request: Request):
                 )
                 execution = result.execution
                 directive = result.directive or build_tool_directive(standard_request, execution.state)
-                assistant_message = build_openai_assistant_history_message(
-                    execution=execution,
-                    request=standard_request,
-                    directive=directive,
-                )
-                await persist_session_turn(
-                    app=app,
-                    request=standard_request,
-                    surface="openai",
-                    execution=execution,
-                    assistant_message=assistant_message,
-                )
                 tool_names = [block.get("name") for block in directive.tool_blocks if block.get("type") == "tool_use"]
                 final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else (execution.state.finish_reason or "stop")
                 _record_repeated_tool_guard(
@@ -1453,5 +1399,4 @@ async def chat_completions(request: Request):
         except Exception as e:
             if singleflight_owner and singleflight_key is not None:
                 await _openai_json_singleflight.fail(singleflight_key, e)
-            await clear_invalidated_session_chat(app=app, request=standard_request)
             raise HTTPException(status_code=500, detail=str(e))

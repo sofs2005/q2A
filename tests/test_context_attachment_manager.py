@@ -120,6 +120,35 @@ class ContextAttachmentManagerTests(unittest.TestCase):
 
 
 class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prepare_context_attachments_keeps_caller_session_key(self) -> None:
+        app = SimpleNamespace(state=SimpleNamespace(
+            context_offloader=ContextOffloader(SimpleNamespace(
+                CONTEXT_INLINE_MAX_CHARS=1000,
+                CONTEXT_FORCE_FILE_MAX_CHARS=2000,
+                CONTEXT_ATTACHMENT_TTL_SECONDS=600,
+            )),
+            account_pool=SimpleNamespace(),
+            file_store=SimpleNamespace(),
+            session_affinity=SimpleNamespace(),
+            upstream_file_cache=SimpleNamespace(),
+            upstream_file_uploader=SimpleNamespace(),
+        ))
+        payload = {
+            "model": "gpt-4.1",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        result = await prepare_context_attachments(
+            app=app,
+            payload=payload,
+            surface="openai",
+            auth_token="tok",
+            client_profile=OPENCLAW_OPENAI_PROFILE,
+            session_key="openai:req_123",
+        )
+
+        self.assertEqual(result["session_key"], "openai:req_123")
+
     async def test_tool_requests_can_upload_large_latest_user_context(self) -> None:
         uploaded = []
         saved_texts = []
@@ -190,6 +219,7 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
             surface="openai",
             auth_token="tok",
             client_profile="openclaw_openai",
+            session_key="openai:test",
         )
 
         self.assertEqual(result["context_mode"], "file")
@@ -261,6 +291,7 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
             surface="openai",
             auth_token="tok",
             client_profile="generic_openai",
+            session_key="openai:test",
         )
 
         tools_text = next(text for text in saved_texts if "Available tool descriptions" in text)
@@ -330,6 +361,7 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
             surface="openai",
             auth_token="tok",
             client_profile="openclaw_openai",
+            session_key="openai:test",
         )
 
         self.assertEqual(result["context_mode"], "file")
@@ -375,6 +407,7 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
             surface="openai",
             auth_token="tok",
             client_profile="openclaw_openai",
+            session_key="openai:test",
         )
 
         self.assertTrue(result["attachment_fallback"])
@@ -424,6 +457,7 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
             surface="openai",
             auth_token="tok",
             client_profile="openclaw_openai",
+            session_key="openai:test",
         )
 
         self.assertTrue(result["attachment_fallback"])
@@ -483,6 +517,7 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
             surface="openai",
             auth_token="tok",
             client_profile="openclaw_openai",
+            session_key="openai:test",
         )
 
         app.state.account_pool.acquire_wait.assert_awaited_once_with(timeout=60)
@@ -532,6 +567,7 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
             surface="openai",
             auth_token="tok",
             client_profile="openclaw_openai",
+            session_key="openai:test",
         )
 
         self.assertEqual(result["context_mode"], "inline")

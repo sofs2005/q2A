@@ -15,7 +15,6 @@ from backend.runtime.execution import (
     evaluate_retry_directive,
 )
 from backend.services.auth_quota import add_used_tokens
-from backend.toolcore.task_session import build_retry_rebase_prompt
 from backend.services.token_calc import calculate_usage
 from backend.toolcall.runtime_tools import (
     is_list_directory_tool_name,
@@ -196,7 +195,6 @@ async def run_completion_bridge(
             client,
             execution.acc,
             execution.chat_id,
-            preserve_chat=bool(getattr(standard_request, 'persistent_session', False)),
         )
         execution_cleaned = True
         return CompletionBridgeResult(execution=execution, usage=usage, prompt=prompt, attempt_index=0)
@@ -206,7 +204,6 @@ async def run_completion_bridge(
                 client,
                 execution.acc,
                 execution.chat_id,
-                preserve_chat=bool(getattr(standard_request, 'persistent_session', False)),
             )
 
 
@@ -227,8 +224,6 @@ async def run_retryable_completion_bridge(
     on_retry: Callable[[int, RuntimeRetryDirective, Any], Awaitable[None]] | None = None,
 ) -> CompletionBridgeResult:
     current_prompt = prompt
-    if not getattr(standard_request, 'full_prompt', None):
-        standard_request.full_prompt = prompt
 
     for attempt_index in range(max_attempts):
         if on_attempt_start is not None:
@@ -254,18 +249,10 @@ async def run_retryable_completion_bridge(
             if retry.retry:
                 if on_retry is not None:
                     await on_retry(attempt_index, retry, execution)
-                preserve_chat = bool(getattr(standard_request, 'persistent_session', False))
-                await cleanup_runtime_resources(client, execution.acc, execution.chat_id, preserve_chat=preserve_chat)
+                await cleanup_runtime_resources(client, execution.acc, execution.chat_id)
                 execution_cleaned = True
-
-                reused_persistent_chat = bool(getattr(standard_request, 'persistent_session', False) and getattr(standard_request, 'upstream_chat_id', None))
-                if reused_persistent_chat:
-                    current_prompt = build_retry_rebase_prompt(standard_request, reason=retry.reason)
-                else:
-                    current_prompt = retry.next_prompt
-
-                if not preserve_chat:
-                    await asyncio.sleep(0.15)
+                current_prompt = retry.next_prompt
+                await asyncio.sleep(0.15)
                 await _reacquire_bound_account_if_needed(client=client, standard_request=standard_request)
                 continue
 
@@ -288,7 +275,6 @@ async def run_retryable_completion_bridge(
                 client,
                 execution.acc,
                 execution.chat_id,
-                preserve_chat=bool(getattr(standard_request, 'persistent_session', False)),
             )
             execution_cleaned = True
             return CompletionBridgeResult(
@@ -304,7 +290,6 @@ async def run_retryable_completion_bridge(
                     client,
                     execution.acc,
                     execution.chat_id,
-                    preserve_chat=bool(getattr(standard_request, 'persistent_session', False)),
                 )
 
     raise RuntimeError("Retryable completion bridge exhausted attempts")

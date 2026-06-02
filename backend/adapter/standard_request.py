@@ -94,8 +94,3 @@ class StandardRequest:
     bound_account_email: str | None = None
     bound_account: Any | None = None
     stage_labels: dict[str, str] = field(default_factory=dict)
-    full_prompt: str | None = None
-    upstream_chat_id: str | None = None
-    persistent_session: bool = False
-    session_message_hashes: list[str] = field(default_factory=list)
-    session_chat_invalidated: bool = False

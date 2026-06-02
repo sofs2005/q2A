@@ -134,7 +134,7 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         prepare_context_attachments = AsyncMock()
 
         with patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
-             patch.object(v1_chat, "derive_session_key", return_value="session"), \
+             patch.object(v1_chat, "build_request_session_key", return_value="session"), \
              patch.object(v1_chat, "_build_standard_request", return_value=standard_request), \
              patch.object(v1_chat, "_repeated_tool_request_guard", guard), \
              patch.object(v1_chat, "prepare_context_attachments", prepare_context_attachments), \
@@ -214,11 +214,10 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
-             patch.object(v1_chat, "derive_session_key", return_value="session"), \
+             patch.object(v1_chat, "build_request_session_key", return_value="session"), \
              patch.object(v1_chat, "_build_standard_request", side_effect=[early_standard_request, prepared_standard_request]), \
              patch.object(v1_chat, "_repeated_tool_request_guard", guard), \
              patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value=context_prepared)), \
-             patch.object(v1_chat, "plan_persistent_session_turn", AsyncMock(return_value=types.SimpleNamespace(enabled=False))), \
              patch.object(v1_chat, "run_retryable_completion_bridge", AsyncMock()):
             response = await v1_chat.chat_completions(request)
 
@@ -258,16 +257,12 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         chunks = []
         with patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
-             patch.object(v1_chat, "derive_session_key", return_value="session"), \
+             patch.object(v1_chat, "build_request_session_key", return_value="session"), \
              patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value={"payload": request._payload, "upstream_files": [], "session_key": "session", "context_mode": "inline", "bound_account_email": None, "bound_account": None})), \
              patch.object(v1_chat, "_build_standard_request", return_value=standard_request), \
-             patch.object(v1_chat, "plan_persistent_session_turn", AsyncMock(return_value=types.SimpleNamespace(enabled=False))), \
              patch.object(v1_chat, "OpenAIStreamTranslator", _FakeTranslator), \
              patch.object(v1_chat, "run_retryable_completion_bridge", new=fake_bridge), \
              patch.object(v1_chat, "build_tool_directive", return_value=types.SimpleNamespace(stop_reason="end_turn", tool_blocks=[])), \
-             patch.object(v1_chat, "build_openai_assistant_history_message", return_value={"role": "assistant", "content": "done"}), \
-             patch.object(v1_chat, "persist_session_turn", AsyncMock()), \
-             patch.object(v1_chat, "clear_invalidated_session_chat", AsyncMock()), \
              patch.object(v1_chat, "update_request_context"):
             response = await v1_chat.chat_completions(request)
             self.assertIsInstance(response, StreamingResponse)
@@ -315,16 +310,12 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
             )
 
         with patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
-             patch.object(v1_chat, "derive_session_key", return_value="session"), \
+             patch.object(v1_chat, "build_request_session_key", return_value="session"), \
              patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value={"payload": request._payload, "upstream_files": [], "session_key": "session", "context_mode": "inline", "bound_account_email": None, "bound_account": None})), \
              patch.object(v1_chat, "_build_standard_request", return_value=standard_request), \
-             patch.object(v1_chat, "plan_persistent_session_turn", AsyncMock(return_value=types.SimpleNamespace(enabled=False))), \
              patch.object(v1_chat, "OpenAIStreamTranslator", _FakeTranslator), \
              patch.object(v1_chat, "run_retryable_completion_bridge", new=fake_bridge), \
              patch.object(v1_chat, "build_tool_directive", return_value=types.SimpleNamespace(stop_reason="end_turn", tool_blocks=[])), \
-             patch.object(v1_chat, "build_openai_assistant_history_message", return_value={"role": "assistant", "content": "plain chunk"}), \
-             patch.object(v1_chat, "persist_session_turn", AsyncMock()), \
-             patch.object(v1_chat, "clear_invalidated_session_chat", AsyncMock()), \
              patch.object(v1_chat, "update_request_context"):
             response = await v1_chat.chat_completions(request)
             self.assertIsInstance(response, StreamingResponse)
@@ -375,15 +366,11 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         chunks = []
         with patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
-             patch.object(v1_chat, "derive_session_key", return_value="session"), \
+             patch.object(v1_chat, "build_request_session_key", return_value="session"), \
              patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value={"payload": request._payload, "upstream_files": [], "session_key": "session", "context_mode": "inline", "bound_account_email": None, "bound_account": None})), \
              patch.object(v1_chat, "_build_standard_request", return_value=standard_request), \
-             patch.object(v1_chat, "plan_persistent_session_turn", AsyncMock(return_value=types.SimpleNamespace(enabled=False))), \
              patch.object(v1_chat, "run_retryable_completion_bridge", new=fake_bridge), \
              patch.object(v1_chat, "build_tool_directive", return_value=directive), \
-             patch.object(v1_chat, "build_openai_assistant_history_message", return_value={"role": "assistant", "content": None, "tool_calls": []}), \
-             patch.object(v1_chat, "persist_session_turn", AsyncMock()), \
-             patch.object(v1_chat, "clear_invalidated_session_chat", AsyncMock()), \
              patch.object(v1_chat, "update_request_context"):
             response = await v1_chat.chat_completions(request)
             self.assertIsInstance(response, StreamingResponse)
@@ -445,15 +432,11 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         chunks = []
         with patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
-             patch.object(v1_chat, "derive_session_key", return_value="session"), \
+             patch.object(v1_chat, "build_request_session_key", return_value="session"), \
              patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value={"payload": request._payload, "upstream_files": [], "session_key": "session", "context_mode": "inline", "bound_account_email": None, "bound_account": None})), \
              patch.object(v1_chat, "_build_standard_request", return_value=standard_request), \
-             patch.object(v1_chat, "plan_persistent_session_turn", AsyncMock(return_value=types.SimpleNamespace(enabled=False))), \
              patch.object(v1_chat, "run_retryable_completion_bridge", new=fake_bridge), \
              patch.object(v1_chat, "build_tool_directive", return_value=types.SimpleNamespace(stop_reason="end_turn", tool_blocks=[])), \
-             patch.object(v1_chat, "build_openai_assistant_history_message", return_value={"role": "assistant", "content": None, "tool_calls": []}), \
-             patch.object(v1_chat, "persist_session_turn", AsyncMock()), \
-             patch.object(v1_chat, "clear_invalidated_session_chat", AsyncMock()), \
              patch.object(v1_chat, "update_request_context"):
             response = await v1_chat.chat_completions(request)
             self.assertIsInstance(response, StreamingResponse)
@@ -515,15 +498,11 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         chunks = []
         with patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
-             patch.object(v1_chat, "derive_session_key", return_value="session"), \
+             patch.object(v1_chat, "build_request_session_key", return_value="session"), \
              patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value={"payload": request._payload, "upstream_files": [], "session_key": "session", "context_mode": "inline", "bound_account_email": None, "bound_account": None})), \
              patch.object(v1_chat, "_build_standard_request", return_value=standard_request), \
-             patch.object(v1_chat, "plan_persistent_session_turn", AsyncMock(return_value=types.SimpleNamespace(enabled=False))), \
              patch.object(v1_chat, "run_retryable_completion_bridge", new=fake_bridge), \
              patch.object(v1_chat, "build_tool_directive", return_value=directive), \
-             patch.object(v1_chat, "build_openai_assistant_history_message", return_value={"role": "assistant", "content": None, "tool_calls": []}), \
-             patch.object(v1_chat, "persist_session_turn", AsyncMock()), \
-             patch.object(v1_chat, "clear_invalidated_session_chat", AsyncMock()), \
              patch.object(v1_chat, "update_request_context"):
             response = await v1_chat.chat_completions(request)
             self.assertIsInstance(response, StreamingResponse)
@@ -594,16 +573,12 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         chunks = []
         with self.assertLogs("qwen2api.chat", level="INFO") as captured_logs, \
              patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
-             patch.object(v1_chat, "derive_session_key", return_value="session"), \
+             patch.object(v1_chat, "build_request_session_key", return_value="session"), \
              patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value={"payload": request._payload, "upstream_files": [], "session_key": "session", "context_mode": "inline", "bound_account_email": None, "bound_account": None})), \
              patch.object(v1_chat, "_build_standard_request", return_value=standard_request), \
-             patch.object(v1_chat, "plan_persistent_session_turn", AsyncMock(return_value=types.SimpleNamespace(enabled=False))), \
              patch.object(v1_chat, "OpenAIStreamTranslator", OpenAIStreamTranslator), \
              patch.object(v1_chat, "run_retryable_completion_bridge", new=fake_bridge), \
              patch.object(v1_chat, "build_tool_directive", return_value=directive), \
-             patch.object(v1_chat, "build_openai_assistant_history_message", return_value={"role": "assistant", "content": None, "tool_calls": []}), \
-             patch.object(v1_chat, "persist_session_turn", AsyncMock()), \
-             patch.object(v1_chat, "clear_invalidated_session_chat", AsyncMock()), \
              patch.object(v1_chat, "update_request_context"):
             response = await v1_chat.chat_completions(request)
             self.assertIsInstance(response, StreamingResponse)
@@ -687,15 +662,11 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         chunks = []
         with patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
-             patch.object(v1_chat, "derive_session_key", return_value="session"), \
+             patch.object(v1_chat, "build_request_session_key", return_value="session"), \
              patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value={"payload": request._payload, "upstream_files": [], "session_key": "session", "context_mode": "inline", "bound_account_email": None, "bound_account": None})), \
              patch.object(v1_chat, "_build_standard_request", return_value=standard_request), \
-             patch.object(v1_chat, "plan_persistent_session_turn", AsyncMock(return_value=types.SimpleNamespace(enabled=False))), \
              patch.object(v1_chat, "run_retryable_completion_bridge", new=fake_bridge), \
              patch.object(v1_chat, "build_tool_directive", return_value=directive), \
-             patch.object(v1_chat, "build_openai_assistant_history_message", return_value={"role": "assistant", "content": None, "tool_calls": []}), \
-             patch.object(v1_chat, "persist_session_turn", AsyncMock()), \
-             patch.object(v1_chat, "clear_invalidated_session_chat", AsyncMock()), \
              patch.object(v1_chat, "update_request_context"):
             response = await v1_chat.chat_completions(request)
             self.assertIsInstance(response, StreamingResponse)

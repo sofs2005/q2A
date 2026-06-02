@@ -394,7 +394,6 @@ class QwenClient:
         has_custom_tools: bool = False,
         files: list[dict] | None = None,
         fixed_account=None,
-        existing_chat_id: str | None = None,
     ):
         async for item in self.executor.chat_stream_events_with_retry(
             model,
@@ -402,6 +401,5 @@ class QwenClient:
             has_custom_tools,
             files=files,
             fixed_account=fixed_account,
-            existing_chat_id=existing_chat_id,
         ):
             yield item
