@@ -7,7 +7,7 @@ import uuid
 from typing import Any, AsyncIterator
 
 from backend.core.account_pool import Account
-from backend.core.browser_fingerprint import fingerprint_for_account, get_session
+from backend.core.browser_fingerprint import fingerprint_for_account, get_session, new_session
 from backend.core.config import settings
 from backend.services.auth_resolver import BASE_URL, AuthResolver
 from backend.upstream.payload_builder import build_chat_payload
@@ -360,7 +360,9 @@ class QwenClient:
 
     async def stream_chat_once(self, token: str, chat_id: str, payload: dict, account: Account | None = None) -> AsyncIterator[dict]:
         timeout = settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS
-        session = await get_session(fingerprint_for_account(account))
+        fingerprint = fingerprint_for_account(account)
+        dedicated_session = bool(getattr(settings, "QWEN_UPSTREAM_STREAM_DEDICATED_SESSION", True))
+        session = new_session(fingerprint, timeout=timeout) if dedicated_session else await get_session(fingerprint)
         headers = self._build_headers(account=account, token=token, accept="text/event-stream")
         try:
             async with session.stream(
@@ -386,6 +388,11 @@ class QwenClient:
         except Exception as e:
             log.error(f"[QwenClient] stream_chat_once error: {e}")
             yield {"status": 0, "body": str(e)}
+        finally:
+            if dedicated_session:
+                close = getattr(session, "close", None)
+                if close is not None:
+                    await close()
 
     async def chat_stream_events_with_retry(
         self,

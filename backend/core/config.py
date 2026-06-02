@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS: float = float(
         os.getenv("QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS", 300)
     )
+    QWEN_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECONDS: float = float(
+        os.getenv("QWEN_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECONDS", 300)
+    )
+    QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS: float = float(
+        os.getenv("QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS", 90)
+    )
+    QWEN_UPSTREAM_STREAM_DEDICATED_SESSION: bool = os.getenv("QWEN_UPSTREAM_STREAM_DEDICATED_SESSION", "true").lower() in {"1", "true", "yes", "on"}
+    MODELS_USE_UPSTREAM: bool = os.getenv("MODELS_USE_UPSTREAM", "false").lower() in {"1", "true", "yes", "on"}
     OPENAI_JSON_SINGLEFLIGHT_ENABLED: bool = os.getenv("OPENAI_JSON_SINGLEFLIGHT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     OPENAI_JSON_SINGLEFLIGHT_WAIT_TIMEOUT_SECONDS: float = float(os.getenv("OPENAI_JSON_SINGLEFLIGHT_WAIT_TIMEOUT_SECONDS", 600))
     OPENAI_JSON_SINGLEFLIGHT_RESULT_TTL_SECONDS: float = float(os.getenv("OPENAI_JSON_SINGLEFLIGHT_RESULT_TTL_SECONDS", 120))

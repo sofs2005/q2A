@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from backend.core.config import MODEL_MAP, resolve_model
+from backend.core.config import MODEL_MAP, resolve_model, settings
 from backend.services.auth_quota import resolve_auth_context
 from backend.services.qwen_client import QwenClient
 
@@ -27,10 +27,12 @@ async def list_models(request: Request):
 
     auth = await resolve_auth_context(request, users_db)
     token = auth.token
-    try:
-        upstream_models = await client.list_models(token)
-    except Exception:
-        upstream_models = []
+    upstream_models = []
+    if settings.MODELS_USE_UPSTREAM:
+        try:
+            upstream_models = await client.list_models(token)
+        except Exception:
+            upstream_models = []
 
     if upstream_models:
         seen: set[str] = set()

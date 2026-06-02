@@ -166,6 +166,16 @@ def fingerprint_for_account(account: Any | None) -> BrowserFingerprint:
     return fingerprint_for_email(str(getattr(account, "email", "") or ""))
 
 
+def new_session(fingerprint: BrowserFingerprint, *, timeout: float | None = None) -> AsyncSession:
+    from backend.core.config import settings
+
+    return AsyncSession(
+        impersonate=fingerprint.impersonate,
+        timeout=timeout if timeout is not None else settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS,
+        allow_redirects=True,
+    )
+
+
 async def get_session(fingerprint: BrowserFingerprint) -> AsyncSession:
     global _session_lock
     if _session_lock is None:
@@ -177,13 +187,7 @@ async def get_session(fingerprint: BrowserFingerprint) -> AsyncSession:
         session = _sessions.get(fingerprint.impersonate)
         if session is not None:
             return session
-        from backend.core.config import settings
-
-        session = AsyncSession(
-            impersonate=fingerprint.impersonate,
-            timeout=settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS,
-            allow_redirects=True,
-        )
+        session = new_session(fingerprint)
         _sessions[fingerprint.impersonate] = session
         return session
 

@@ -140,8 +140,33 @@ class QwenExecutor:
                 stream_iter = stream_fn(token, chat_id, payload, account=account_obj)
             else:
                 stream_iter = stream_fn(token, chat_id, payload)
+            stream_iterator = stream_iter.__aiter__()
+            total_timeout = max(0.0, float(getattr(settings, "QWEN_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECONDS", 0) or 0))
+            idle_timeout = max(0.0, float(getattr(settings, "QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS", 0) or 0))
 
-            async for chunk_result in stream_iter:
+            while True:
+                now = time.perf_counter()
+                elapsed = now - started_at
+                if total_timeout > 0 and elapsed >= total_timeout:
+                    raise TimeoutError(f"upstream stream total timeout after {total_timeout:.0f}s")
+                wait_timeout = idle_timeout if idle_timeout > 0 else None
+                if total_timeout > 0:
+                    remaining_total = max(0.0, total_timeout - elapsed)
+                    wait_timeout = remaining_total if wait_timeout is None else min(wait_timeout, remaining_total)
+                try:
+                    if wait_timeout is None:
+                        chunk_result = await anext(stream_iterator)
+                    else:
+                        chunk_result = await asyncio.wait_for(anext(stream_iterator), timeout=wait_timeout)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError as exc:
+                    elapsed = time.perf_counter() - started_at
+                    idle_time = time.perf_counter() - last_chunk_time
+                    if total_timeout > 0 and elapsed >= total_timeout:
+                        raise TimeoutError(f"upstream stream total timeout after {total_timeout:.0f}s") from exc
+                    raise TimeoutError(f"upstream stream idle timeout after {idle_timeout:.0f}s") from exc
+
                 last_chunk_time = time.perf_counter()
 
                 if chunk_result.get("status") not in (None, 200, "streamed"):
@@ -158,12 +183,13 @@ class QwenExecutor:
                     if chunk_count % 100 == 0 or now - last_heartbeat_at >= 60:
                         last_heartbeat_at = now
                         log.info(
-                            "[Executor] stream heartbeat chat_id=%s chunks=%s chars=%s parsed_events=%s elapsed=%.3fs",
+                            "[Executor] stream heartbeat chat_id=%s chunks=%s chars=%s parsed_events=%s elapsed=%.3fs idle=%.3fs",
                             chat_id,
                             chunk_count,
                             stream_chars,
                             parsed_event_count,
                             now - started_at,
+                            now - last_chunk_time,
                         )
                     buffer += chunk
                     while "\n\n" in buffer:

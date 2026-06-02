@@ -52,6 +52,21 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
             "QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS",
             None,
         )
+        self.original_stream_total_timeout = getattr(
+            settings,
+            "QWEN_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECONDS",
+            None,
+        )
+        self.original_stream_idle_timeout = getattr(
+            settings,
+            "QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS",
+            None,
+        )
+        self.original_stream_dedicated_session = getattr(
+            settings,
+            "QWEN_UPSTREAM_STREAM_DEDICATED_SESSION",
+            None,
+        )
         browser_fingerprint._sessions.clear()
         browser_fingerprint._session_lock = None
 
@@ -60,6 +75,21 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
             settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS = self.original_request_timeout
         if self.original_stream_timeout is not None:
             settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS = self.original_stream_timeout
+        if self.original_stream_total_timeout is None:
+            if hasattr(settings, "QWEN_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECONDS"):
+                delattr(settings, "QWEN_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECONDS")
+        else:
+            settings.QWEN_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECONDS = self.original_stream_total_timeout
+        if self.original_stream_idle_timeout is None:
+            if hasattr(settings, "QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS"):
+                delattr(settings, "QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS")
+        else:
+            settings.QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS = self.original_stream_idle_timeout
+        if self.original_stream_dedicated_session is None:
+            if hasattr(settings, "QWEN_UPSTREAM_STREAM_DEDICATED_SESSION"):
+                delattr(settings, "QWEN_UPSTREAM_STREAM_DEDICATED_SESSION")
+        else:
+            settings.QWEN_UPSTREAM_STREAM_DEDICATED_SESSION = self.original_stream_dedicated_session
         browser_fingerprint._sessions.clear()
         browser_fingerprint._session_lock = None
 
@@ -232,10 +262,15 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 captured.update(kwargs)
                 return FakeResponse()
 
-        settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS = 420.0
-        get_session = AsyncMock(return_value=FakeSession())
+            async def close(self):
+                pass
 
-        with patch("backend.services.qwen_client.get_session", get_session):
+        settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS = 420.0
+        settings.QWEN_UPSTREAM_STREAM_DEDICATED_SESSION = True
+        new_session = patch("backend.services.qwen_client.new_session", return_value=FakeSession())
+        get_session = patch("backend.services.qwen_client.get_session", AsyncMock())
+
+        with new_session as new_session_mock, get_session as get_session_mock:
             events = [
                 event
                 async for event in QwenClient(account_pool=None).stream_chat_once(
@@ -247,6 +282,43 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(events, [{"status": 500, "body": "upstream error"}])
         self.assertEqual(captured["timeout"], 420.0)
+        new_session_mock.assert_called_once()
+        get_session_mock.assert_not_awaited()
+
+    async def test_executor_aborts_stream_after_idle_timeout(self) -> None:
+        class FakeEngine:
+            async def stream_chat_once(self, *_args, **_kwargs):
+                await asyncio.Event().wait()
+                yield {"chunk": "never"}
+
+        settings.QWEN_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECONDS = 10.0
+        settings.QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS = 0.01
+        executor = QwenExecutor(FakeEngine(), account_pool=None)
+
+        async def consume_stream():
+            async for _event in executor.stream("tok", "chat-1", "qwen3.6-plus", "hello"):
+                pass
+
+        with self.assertRaisesRegex(TimeoutError, "idle timeout"):
+            await asyncio.wait_for(consume_stream(), timeout=0.2)
+
+    async def test_executor_aborts_stream_after_total_timeout(self) -> None:
+        class FakeEngine:
+            async def stream_chat_once(self, *_args, **_kwargs):
+                while True:
+                    await asyncio.sleep(0.01)
+                    yield {"chunk": "data: {\"type\": \"delta\", \"phase\": \"answer\", \"content\": \"x\"}\n\n"}
+
+        settings.QWEN_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECONDS = 0.03
+        settings.QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS = 1.0
+        executor = QwenExecutor(FakeEngine(), account_pool=None)
+
+        async def consume_stream():
+            async for _event in executor.stream("tok", "chat-1", "qwen3.6-plus", "hello"):
+                pass
+
+        with self.assertRaisesRegex(TimeoutError, "total timeout"):
+            await asyncio.wait_for(consume_stream(), timeout=0.2)
 
 
 if __name__ == "__main__":
