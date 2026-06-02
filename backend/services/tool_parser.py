@@ -7,6 +7,7 @@ from typing import Any, cast
 from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW_OPENAI_PROFILE
 from backend.core.request_logging import get_request_context
 from backend.toolcall.formats_json import load_json_with_repair
+from backend.toolcall.normalize import normalize_arguments
 from backend.toolcall.parser import parse_tool_calls_detailed
 from backend.toolcore.directive_parser import parse_textual_tool_calls
 
@@ -50,6 +51,100 @@ def _tool_properties(tool: dict[str, Any] | None) -> dict[str, Any]:
     return props if isinstance(props, dict) else {}
 
 
+def _tool_parameters(tool: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(tool, dict):
+        return {}
+    params = tool.get("parameters", {}) or {}
+    if not params and isinstance(tool.get("function"), dict):
+        params = tool["function"].get("parameters", {}) or {}
+    return params if isinstance(params, dict) else {}
+
+
+def _schema_type(schema: dict[str, Any] | None) -> str:
+    if not isinstance(schema, dict):
+        return ""
+    return str(schema.get("type") or "").strip().lower()
+
+
+def _coerce_schema_scalar(value: Any, schema: dict[str, Any] | None) -> Any:
+    schema_type = _schema_type(schema)
+    if not schema_type:
+        return value
+
+    if schema_type == "boolean":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes", "y", "on"}:
+                return True
+            if lowered in {"false", "0", "no", "n", "off"}:
+                return False
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return bool(value)
+        return value
+
+    if schema_type == "integer":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if re.fullmatch(r"[+-]?\d+", stripped):
+                try:
+                    return int(stripped)
+                except ValueError:
+                    return value
+        return value
+
+    if schema_type == "number":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, str):
+            stripped = value.strip()
+            if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", stripped):
+                try:
+                    numeric = float(stripped)
+                except ValueError:
+                    return value
+                return int(numeric) if numeric.is_integer() else numeric
+        return value
+
+    if schema_type == "string":
+        if isinstance(value, str):
+            return value
+        if value is None:
+            return value
+        if isinstance(value, (dict, list)):
+            return value
+        return str(value)
+
+    return value
+
+
+def _coerce_schema_value(value: Any, schema: dict[str, Any] | None) -> Any:
+    if not isinstance(schema, dict):
+        return value
+
+    schema_type = _schema_type(schema)
+    if schema_type == "object" and isinstance(value, dict):
+        return _coerce_tool_input_by_schema(value, {"parameters": schema})
+
+    if schema_type == "array":
+        items_schema = schema.get("items") if isinstance(schema.get("items"), dict) else None
+        items = value if isinstance(value, list) else ([] if value is None else [value])
+        if isinstance(items_schema, dict):
+            return [_coerce_schema_value(item, items_schema) for item in items]
+        return items
+
+    return _coerce_schema_scalar(value, schema)
+
+
 def _pick_declared_key(props: dict[str, Any], aliases: list[str], fallback: str) -> str:
     if not props:
         return fallback
@@ -62,15 +157,23 @@ def _pick_declared_key(props: dict[str, Any], aliases: list[str], fallback: str)
     return fallback
 
 
+def _has_meaningful_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
 def _move_alias_value(payload: dict[str, Any], target_key: str, aliases: list[str]) -> None:
-    if target_key in payload and str(payload.get(target_key, "")).strip():
+    if _has_meaningful_value(payload.get(target_key)):
         return
     for alias in aliases:
-        if alias == target_key:
+        if alias == target_key or alias not in payload:
             continue
-        value = payload.get(alias)
-        if isinstance(value, str) and value.strip():
-            payload[target_key] = payload.pop(alias).strip()
+        value = payload.pop(alias)
+        if _has_meaningful_value(value):
+            payload[target_key] = value.strip() if isinstance(value, str) else value
             return
 
 
@@ -383,20 +486,52 @@ def _coerce_query_aliases(input_data: dict[str, Any], tools: list[dict[str, Any]
     return input_data
 
 
-def _coerce_tool_input(name: str, input_data: Any, tools: list[dict[str, Any]]) -> Any:
-    if not isinstance(input_data, dict):
-        return input_data
+def _coerce_tool_input_by_schema(tool_input: Any, tool_def: dict[str, Any] | None) -> Any:
+    fixed = normalize_arguments(tool_input)
+    if not isinstance(fixed, dict):
+        return fixed
 
+    props = _tool_properties(tool_def)
+    if not props:
+        return fixed
+
+    params = _tool_parameters(tool_def)
+    required = [key for key in params.get("required", []) if key in props]
+    target_keys = required or list(props.keys())
+
+    for key in list(fixed.keys()):
+        if key in props:
+            continue
+        declared = _pick_declared_key(props, [key], "")
+        if declared and declared != key:
+            _move_alias_value(fixed, declared, [key])
+
+    if "value" in fixed:
+        target_key = required[0] if len(required) == 1 else (target_keys[0] if len(target_keys) == 1 else "")
+        if target_key and target_key not in fixed:
+            fixed[target_key] = fixed.pop("value")
+
+    for prop_name, prop_schema in props.items():
+        if prop_name not in fixed or not isinstance(prop_schema, dict):
+            continue
+        fixed[prop_name] = _coerce_schema_value(fixed[prop_name], prop_schema)
+
+    return fixed
+
+
+def _coerce_tool_input(name: str, input_data: Any, tools: list[dict[str, Any]]) -> Any:
     tool_def = _find_tool_definition(name, tools)
     props = _tool_properties(tool_def)
     normalized_name = str(name or "").strip().lower()
 
-    fixed = dict(input_data)
+    fixed = _coerce_tool_input_by_schema(input_data, tool_def)
     coercer = TOOL_INPUT_COERCERS_BY_NAME.get(name) or TOOL_INPUT_COERCERS_BY_NORMALIZED_NAME.get(normalized_name)
     if coercer is not None:
-        fixed = coercer(fixed, props)
+        fixed = coercer(fixed if isinstance(fixed, dict) else {}, props)
 
-    return _coerce_query_aliases(fixed, tools)
+    if isinstance(fixed, dict):
+        return _coerce_query_aliases(fixed, tools)
+    return fixed
 
 
 def parse_tool_calls(answer: str, tools: list):
