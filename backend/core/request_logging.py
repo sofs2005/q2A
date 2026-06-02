@@ -90,10 +90,13 @@ def get_request_context() -> dict[str, Any]:
 
 
 def update_request_context(**kwargs: Any) -> dict[str, Any]:
-    ctx = get_request_context()
+    current = get_request_context()
+    ctx = dict(current)
     for key, value in kwargs.items():
         if value is not None:
             ctx[key] = value
+    if ctx == current:
+        return current
     _REQUEST_CONTEXT.set(ctx)
     update_active_request_diagnostic(**ctx)
     return ctx

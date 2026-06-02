@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from backend.core.diagnostics import (
     format_event_loop_lag_warning,
@@ -8,7 +8,7 @@ from backend.core.diagnostics import (
     install_stack_dump_handler,
     reset_active_request_diagnostic,
 )
-from backend.core.request_logging import request_context
+from backend.core.request_logging import request_context, update_request_context
 
 
 class RuntimeDiagnosticsTests(unittest.TestCase):
@@ -90,6 +90,17 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
         self.assertIn("req_id=req_2", message)
         self.assertIn("surface=models", message)
         self.assertIn("stream_stage=watchdog", message)
+
+    def test_update_request_context_skips_redundant_same_stream_stage_updates(self) -> None:
+        with request_context(
+            req_id="req_3",
+            surface="openai",
+            stream_stage="tool_sieve_emit",
+        ):
+            with patch("backend.core.request_logging.update_active_request_diagnostic") as update_diag:
+                update_request_context(stream_stage="tool_sieve_emit")
+
+        update_diag.assert_not_called()
 
 
 if __name__ == "__main__":
