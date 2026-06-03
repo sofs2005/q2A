@@ -3,21 +3,28 @@ import unittest
 from types import SimpleNamespace
 
 from backend.api.models import _build_model_list_payload, list_models
-from backend.core.config import resolve_model, settings
+from backend.core.config import MODEL_MAP, resolve_model, settings
 
 
 class ModelAliasTests(unittest.TestCase):
-    def test_qwen37_plus_preview_resolves_to_invite_beta_upstream_name(self) -> None:
+    def test_model_map_only_keeps_required_qwen_short_aliases(self) -> None:
         self.assertEqual(
-            resolve_model("qwen3.7-plus-preview"),
-            "qwen-latest-series-invite-beta-v16",
+            MODEL_MAP,
+            {
+                "qwen-max": "qwen3.7-max",
+                "qwen-plus": "qwen3.7-plus",
+            },
         )
 
-    def test_model_list_fallback_includes_qwen37_plus_preview_alias(self) -> None:
-        payload = _build_model_list_payload()
-        model_ids = {item["id"] for item in payload["data"]}
+    def test_qwen_short_aliases_resolve_to_qwen37_upstream_names(self) -> None:
+        self.assertEqual(resolve_model("qwen-max"), "qwen3.7-max")
+        self.assertEqual(resolve_model("qwen-plus"), "qwen3.7-plus")
 
-        self.assertIn("qwen3.7-plus-preview", model_ids)
+    def test_model_list_fallback_only_includes_required_qwen_short_aliases(self) -> None:
+        payload = _build_model_list_payload()
+        model_ids = [item["id"] for item in payload["data"]]
+
+        self.assertEqual(model_ids, ["qwen-max", "qwen-plus"])
 
 
 class _FakeUsersDB:
@@ -49,7 +56,31 @@ class ModelListEndpointTests(unittest.IsolatedAsyncioTestCase):
         else:
             settings.MODELS_USE_UPSTREAM = self.original_models_use_upstream
 
-    async def test_model_list_defaults_to_local_models_without_upstream_call(self) -> None:
+    async def test_model_list_defaults_to_upstream_models_and_required_short_aliases(self) -> None:
+        qwen_client = _FakeQwenClient()
+        settings.MODELS_USE_UPSTREAM = True
+        request = SimpleNamespace(
+            headers={"Authorization": "Bearer test-key"},
+            query_params={},
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    users_db=_FakeUsersDB(),
+                    qwen_client=qwen_client,
+                )
+            ),
+        )
+
+        response = await list_models(request)
+        payload = json.loads(response.body.decode("utf-8"))
+        model_ids = [item["id"] for item in payload["data"]]
+
+        self.assertTrue(qwen_client.called)
+        self.assertEqual(
+            model_ids,
+            ["qwen3.6-plus", "qwen3.6-max-preview", "qwen3.7-max", "qwen-max", "qwen-plus"],
+        )
+
+    async def test_model_list_can_disable_upstream_models(self) -> None:
         qwen_client = _FakeQwenClient()
         settings.MODELS_USE_UPSTREAM = False
         request = SimpleNamespace(
@@ -68,31 +99,7 @@ class ModelListEndpointTests(unittest.IsolatedAsyncioTestCase):
         model_ids = {item["id"] for item in payload["data"]}
 
         self.assertFalse(qwen_client.called)
-        self.assertIn("qwen3.7-plus-preview", model_ids)
-
-    async def test_model_list_can_merge_upstream_models_when_enabled(self) -> None:
-        qwen_client = _FakeQwenClient()
-        settings.MODELS_USE_UPSTREAM = True
-        request = SimpleNamespace(
-            headers={"Authorization": "Bearer test-key"},
-            query_params={},
-            app=SimpleNamespace(
-                state=SimpleNamespace(
-                    users_db=_FakeUsersDB(),
-                    qwen_client=qwen_client,
-                )
-            ),
-        )
-
-        response = await list_models(request)
-        payload = json.loads(response.body.decode("utf-8"))
-        model_ids = {item["id"] for item in payload["data"]}
-
-        self.assertTrue(qwen_client.called)
-        self.assertIn("qwen3.6-plus", model_ids)
-        self.assertIn("qwen3.6-max-preview", model_ids)
-        self.assertIn("qwen3.7-max", model_ids)
-        self.assertIn("qwen3.7-plus-preview", model_ids)
+        self.assertEqual(model_ids, {"qwen-max", "qwen-plus"})
 
 
 if __name__ == "__main__":

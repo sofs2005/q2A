@@ -52,7 +52,7 @@ class Settings(BaseSettings):
         os.getenv("QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS", 90)
     )
     QWEN_UPSTREAM_STREAM_DEDICATED_SESSION: bool = os.getenv("QWEN_UPSTREAM_STREAM_DEDICATED_SESSION", "true").lower() in {"1", "true", "yes", "on"}
-    MODELS_USE_UPSTREAM: bool = os.getenv("MODELS_USE_UPSTREAM", "false").lower() in {"1", "true", "yes", "on"}
+    MODELS_USE_UPSTREAM: bool = os.getenv("MODELS_USE_UPSTREAM", "true").lower() in {"1", "true", "yes", "on"}
     OPENAI_JSON_SINGLEFLIGHT_ENABLED: bool = os.getenv("OPENAI_JSON_SINGLEFLIGHT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     OPENAI_JSON_SINGLEFLIGHT_WAIT_TIMEOUT_SECONDS: float = float(os.getenv("OPENAI_JSON_SINGLEFLIGHT_WAIT_TIMEOUT_SECONDS", 600))
     OPENAI_JSON_SINGLEFLIGHT_RESULT_TTL_SECONDS: float = float(os.getenv("OPENAI_JSON_SINGLEFLIGHT_RESULT_TTL_SECONDS", 120))
@@ -102,40 +102,10 @@ VERSION = "2.0.0"
 
 settings = Settings()
 
-# 全局映射
+# 全局映射：仅保留用户指定的 Qwen 短别名，其余模型由上游列表提供。
 MODEL_MAP = {
-    # OpenAI
-    "gpt-4o":            "qwen3.6-plus",
-    "gpt-4o-mini":       "qwen3.5-flash",
-    "gpt-4-turbo":       "qwen3.6-plus",
-    "gpt-4":             "qwen3.6-plus",
-    "gpt-4.1":           "qwen3.6-plus",
-    "gpt-4.1-mini":      "qwen3.5-flash",
-    "gpt-3.5-turbo":     "qwen3.5-flash",
-    "gpt-5":             "qwen3.6-plus",
-    "o1":                "qwen3.6-plus",
-    "o1-mini":           "qwen3.5-flash",
-    "o3":                "qwen3.6-plus",
-    "o3-mini":           "qwen3.5-flash",
-    # Anthropic
-    "claude-opus-4-6":   "qwen3.6-plus",
-    "claude-sonnet-4-5": "qwen3.6-plus",
-    "claude-3-opus":     "qwen3.6-plus",
-    "claude-3.5-sonnet": "qwen3.6-plus",
-    "claude-3-sonnet":   "qwen3.6-plus",
-    "claude-3-haiku":    "qwen3.5-flash",
-    # Gemini
-    "gemini-2.5-pro":    "qwen3.6-plus",
-    "gemini-2.5-flash":  "qwen3.5-flash",
-    # Qwen aliases
-    "qwen":                  "qwen3.6-plus",
-    "qwen-max":              "qwen3.6-plus",
-    "qwen-plus":             "qwen3.6-plus",
-    "qwen-turbo":            "qwen3.5-flash",
-    "qwen3.7-plus-preview":  "qwen-latest-series-invite-beta-v16",
-    # DeepSeek
-    "deepseek-chat":     "qwen3.6-plus",
-    "deepseek-reasoner": "qwen3.6-plus",
+    "qwen-max": "qwen3.7-max",
+    "qwen-plus": "qwen3.7-plus",
 }
 
 def resolve_model(name: str) -> str:
