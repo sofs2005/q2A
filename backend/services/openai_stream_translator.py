@@ -94,6 +94,9 @@ class OpenAIStreamTranslator:
 
         if text_chunk and evt.get("phase") == "answer":
             self.answer_fragments.append(text_chunk)
+            if evt.get("_qwen2api_safe_text"):
+                self._emit_content_chunk(text_chunk)
+                return
             for event in self.state_machine.process_text_delta(text_chunk):
                 if event.type == "content" and event.text:
                     self._emit_content_chunk(event.text)

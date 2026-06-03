@@ -621,13 +621,18 @@ async def collect_completion_run(
         return RuntimeExecutionResult(state=state, chat_id=chat_id, acc=acc)
 
     slow_step_warning_counts: dict[str, int] = {}
+    safe_text_emit_stages = {"tool_sieve_emit", "tool_sieve_flush"}
 
     async def _emit_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None, *, stage: str) -> None:
         update_request_context(stream_stage=stage)
         if on_delta is None:
             return
+        emit_evt = evt
+        if text_chunk is not None and stage in safe_text_emit_stages:
+            emit_evt = dict(evt)
+            emit_evt["_qwen2api_safe_text"] = True
         started = time.perf_counter()
-        await on_delta(evt, text_chunk, tool_calls)
+        await on_delta(emit_evt, text_chunk, tool_calls)
         elapsed = time.perf_counter() - started
         if elapsed > settings.DIAGNOSTIC_SLOW_STEP_SECONDS:
             warning_count = slow_step_warning_counts.get(stage, 0)

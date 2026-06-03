@@ -57,6 +57,33 @@ class OpenAIStreamTranslatorTests(unittest.TestCase):
         self.assertEqual(tool_call_chunks[0]["function"]["name"], "exec")
         self.assertNotEqual(tool_call_chunks[0]["function"]["name"], "bridge-0")
 
+    def test_safe_text_delta_bypasses_state_machine_scanning(self) -> None:
+        translator = OpenAIStreamTranslator(
+            completion_id="chatcmpl_safe",
+            created=1,
+            model_name="gpt-4.1",
+            client_profile="openclaw_openai",
+            allowed_tool_names=["Read"],
+        )
+
+        class FailingStateMachine:
+            def process_text_delta(self, _text):
+                raise AssertionError("safe text should not be parsed again")
+
+        translator.state_machine = FailingStateMachine()
+        text = "<|DSML|tool_calls>safe literal text"
+
+        translator.on_delta({"phase": "answer", "_qwen2api_safe_text": True}, text, None)
+
+        payloads = [json.loads(chunk[6:].strip()) for chunk in translator.pending_chunks if chunk.startswith("data: ")]
+        content_text = "".join(
+            payload["choices"][0]["delta"].get("content", "")
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("content")
+        )
+        self.assertEqual(content_text, text)
+        self.assertEqual(translator.answer_fragments, [text])
+
     def test_finalize_emits_usage_as_separate_empty_choices_chunk(self) -> None:
         translator = OpenAIStreamTranslator(
             completion_id="chatcmpl_usage",

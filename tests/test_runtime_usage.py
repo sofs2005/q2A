@@ -146,10 +146,12 @@ class CollectCompletionRunStreamingTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         deltas: list[str] = []
+        safe_flags: list[bool] = []
 
-        async def on_delta(_evt, text_chunk, _tool_calls):
+        async def on_delta(evt, text_chunk, _tool_calls):
             if text_chunk is not None:
                 deltas.append(text_chunk)
+                safe_flags.append(bool(evt.get("_qwen2api_safe_text")))
 
         with patch.object(runtime_execution.settings, "TOOLCORE_V2_ENABLED", True):
             result = await collect_completion_run(
@@ -161,6 +163,7 @@ class CollectCompletionRunStreamingTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(deltas, ["prefix ", " suffix"])
+        self.assertEqual(safe_flags, [True, True])
         self.assertNotIn("<|DSML|", "".join(deltas))
         self.assertEqual(result.state.tool_calls[0]["name"], "Read")
 
