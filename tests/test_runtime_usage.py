@@ -299,6 +299,49 @@ class CompletionBridgeUsageTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(result.usage["completion_tokens"], 0)
         self.assertEqual(result.usage["total_tokens"], result.usage["prompt_tokens"] + result.usage["completion_tokens"])
 
+    async def test_retryable_bridge_retries_empty_output_before_usage_write(self) -> None:
+        prompt = "prompt"
+        empty_execution = SimpleNamespace(
+            state=runtime_execution.RuntimeAttemptState(answer_text="", reasoning_text="", tool_calls=[]),
+            acc=None,
+            chat_id="chat_empty",
+        )
+        answer_execution = SimpleNamespace(
+            state=runtime_execution.RuntimeAttemptState(answer_text="answer", reasoning_text="", tool_calls=[]),
+            acc=None,
+            chat_id="chat_answer",
+        )
+        standard_request = StandardRequest(
+            prompt=prompt,
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+            tools=[{"name": "Read", "parameters": {}}],
+            tool_names=["Read"],
+            tool_enabled=True,
+        )
+
+        with patch.object(completion_bridge, "collect_completion_run", AsyncMock(side_effect=[empty_execution, answer_execution])) as collect_mock, \
+             patch.object(completion_bridge, "build_tool_directive", return_value=RuntimeToolDirective(stop_reason="end_turn")), \
+             patch.object(completion_bridge, "_apply_terminal_tool_guard", return_value=(answer_execution, RuntimeToolDirective(stop_reason="end_turn"))), \
+             patch.object(completion_bridge, "add_used_tokens", AsyncMock()) as add_tokens_mock, \
+             patch.object(completion_bridge, "cleanup_runtime_resources", AsyncMock()) as cleanup_mock:
+            result = await completion_bridge.run_retryable_completion_bridge(
+                client=SimpleNamespace(account_pool=SimpleNamespace()),
+                standard_request=standard_request,
+                prompt=prompt,
+                users_db=object(),
+                token="tok",
+                history_messages=[],
+                max_attempts=3,
+            )
+
+        self.assertEqual(result.execution, answer_execution)
+        self.assertEqual(result.attempt_index, 1)
+        self.assertEqual(collect_mock.await_count, 2)
+        add_tokens_mock.assert_awaited_once()
+        self.assertEqual(cleanup_mock.await_count, 2)
+
     async def test_retryable_bridge_includes_context_attachment_tokens_in_usage(self) -> None:
         prompt = "prompt"
         attachment_tokens = 23

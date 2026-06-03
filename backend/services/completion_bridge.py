@@ -204,6 +204,7 @@ async def run_completion_bridge(
                 client,
                 execution.acc,
                 execution.chat_id,
+                preserve_chat=False,
             )
 
 
@@ -290,6 +291,7 @@ async def run_retryable_completion_bridge(
                     client,
                     execution.acc,
                     execution.chat_id,
+                    preserve_chat=False,
                 )
 
     raise RuntimeError("Retryable completion bridge exhausted attempts")

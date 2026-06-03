@@ -221,6 +221,29 @@ class ExecutionToolChoiceRetryTests(unittest.TestCase):
     def test_bridge_missing_tool_error_with_empty_mapping_does_not_retry(self) -> None:
         self.assertEqual(extract_blocked_tool_names("Tool bridge-7 does not exists.", []), [])
 
+    def test_empty_output_without_visible_stream_retries(self) -> None:
+        request = self._request()
+        request.tool_choice_mode = "auto"
+        request.required_tool_name = None
+
+        retry = evaluate_retry_directive(
+            request=request,
+            current_prompt="prompt",
+            history_messages=[],
+            attempt_index=0,
+            max_attempts=3,
+            state=RuntimeAttemptState(
+                answer_text="",
+                reasoning_text="",
+                tool_calls=[],
+                emitted_visible_output=False,
+            ),
+        )
+
+        self.assertTrue(retry.retry)
+        self.assertEqual(retry.reason, "empty_output")
+        self.assertEqual(retry.next_prompt, "prompt")
+
     def test_auto_tool_requests_allow_two_recovery_retries(self) -> None:
         request = self._request()
         request.tool_choice_mode = "auto"

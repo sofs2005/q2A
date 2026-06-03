@@ -994,6 +994,14 @@ def evaluate_retry_directive(
         )
         return RuntimeRetryDirective(retry=True, next_prompt=next_prompt, reason=reason)
 
+    if (
+        not state.emitted_visible_output
+        and not (state.answer_text or "").strip()
+        and not (state.reasoning_text or "").strip()
+        and not state.tool_calls
+    ):
+        return _retry("empty_output", current_prompt)
+
     policy_decision = evaluate_tool_policy(
         request=request,
         state=state,
