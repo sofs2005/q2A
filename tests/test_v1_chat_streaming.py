@@ -392,6 +392,70 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"tool_calls"', joined)
         self.assertIn('"finish_reason": "tool_calls"', joined)
 
+    async def test_suppressed_tool_call_after_streamed_content_finishes_as_stop(self) -> None:
+        app = types.SimpleNamespace(
+            state=types.SimpleNamespace(
+                users_db=object(),
+                qwen_client=object(),
+                file_store=None,
+                session_locks=_DummyLocks(),
+                account_pool=types.SimpleNamespace(acquire_wait_preferred=AsyncMock(return_value=None)),
+            )
+        )
+        request = _FakeRequest(app, {"messages": [{"role": "user", "content": "hi"}], "stream": True})
+        standard_request = StandardRequest(
+            prompt="hi",
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+            stream=True,
+            client_profile="openclaw_openai",
+            tool_names=["bridge-2"],
+            tools=[{"name": "bridge-2", "parameters": {}}],
+            tool_enabled=True,
+        )
+        directive = types.SimpleNamespace(
+            stop_reason="tool_use",
+            tool_blocks=[{"type": "tool_use", "id": "call_1", "name": "bridge-2", "input": {"prompt": "cat"}}],
+        )
+        end_turn_directive = types.SimpleNamespace(stop_reason="end_turn", tool_blocks=[])
+
+        async def fake_bridge(**kwargs):
+            await kwargs["on_attempt_start"](0, "prompt")
+            await kwargs["on_delta"]({"phase": "answer"}, "visible content " * 8, None)
+            return types.SimpleNamespace(
+                execution=types.SimpleNamespace(
+                    chat_id="chat_1",
+                    state=types.SimpleNamespace(
+                        finish_reason="tool_calls",
+                        answer_text="",
+                        reasoning_text="",
+                        tool_calls=[{"id": "call_1", "name": "bridge-2", "input": {"prompt": "cat"}}],
+                    ),
+                ),
+                directive=directive,
+                usage={"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+            )
+
+        chunks = []
+        with patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
+             patch.object(v1_chat, "build_request_session_key", return_value="session"), \
+             patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value={"payload": request._payload, "upstream_files": [], "session_key": "session", "context_mode": "inline", "bound_account_email": None, "bound_account": None})), \
+             patch.object(v1_chat, "_build_standard_request", return_value=standard_request), \
+             patch.object(v1_chat, "run_retryable_completion_bridge", new=fake_bridge), \
+             patch.object(v1_chat, "build_tool_directive", return_value=end_turn_directive), \
+             patch.object(v1_chat, "update_request_context"):
+            response = await v1_chat.chat_completions(request)
+            self.assertIsInstance(response, StreamingResponse)
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+
+        joined = "".join(chunks)
+        self.assertIn("visible content", joined)
+        self.assertNotIn('"tool_calls"', joined)
+        self.assertNotIn('"finish_reason": "tool_calls"', joined)
+        self.assertIn('"finish_reason": "stop"', joined)
+
     async def test_final_tool_call_uses_execution_directive_when_no_tool_delta_was_streamed(self) -> None:
         app = types.SimpleNamespace(
             state=types.SimpleNamespace(

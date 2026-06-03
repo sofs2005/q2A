@@ -764,6 +764,14 @@ def _openai_text_stream_chunks(*, completion_id: str, created: int, model_name: 
     yield "data: [DONE]\n\n"
 
 
+def _resolve_openai_stream_finish_reason(*, directive, state_finish_reason: str | None) -> str:
+    if getattr(directive, "stop_reason", None) == "tool_use":
+        return "tool_calls"
+    if state_finish_reason == "tool_calls":
+        return "stop"
+    return state_finish_reason or "stop"
+
+
 def _record_repeated_tool_guard(
     *,
     session_key: str,
@@ -1164,7 +1172,10 @@ async def chat_completions(request: Request):
                                         tool_blocks=[{"type": "text", "text": execution.state.answer_text or ""}],
                                         stop_reason="end_turn",
                                     )
-                                final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else (execution.state.finish_reason or "stop")
+                                final_finish_reason = _resolve_openai_stream_finish_reason(
+                                    directive=directive,
+                                    state_finish_reason=execution.state.finish_reason,
+                                )
                                 tool_names = [block.get("name") for block in directive.tool_blocks if block.get("type") == "tool_use"]
                                 _record_repeated_tool_guard(
                                     session_key=standard_request.session_key or session_key,
@@ -1259,7 +1270,10 @@ async def chat_completions(request: Request):
                                 )
                                 execution = result.execution
                                 directive = result.directive or build_tool_directive(standard_request, execution.state)
-                                final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else (execution.state.finish_reason or "stop")
+                                final_finish_reason = _resolve_openai_stream_finish_reason(
+                                    directive=directive,
+                                    state_finish_reason=execution.state.finish_reason,
+                                )
                                 tool_names = [block.get("name") for block in directive.tool_blocks if block.get("type") == "tool_use"]
                                 _record_repeated_tool_guard(
                                     session_key=standard_request.session_key or session_key,
@@ -1365,7 +1379,10 @@ async def chat_completions(request: Request):
                 execution = result.execution
                 directive = result.directive or build_tool_directive(standard_request, execution.state)
                 tool_names = [block.get("name") for block in directive.tool_blocks if block.get("type") == "tool_use"]
-                final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else (execution.state.finish_reason or "stop")
+                final_finish_reason = _resolve_openai_stream_finish_reason(
+                    directive=directive,
+                    state_finish_reason=execution.state.finish_reason,
+                )
                 _record_repeated_tool_guard(
                     session_key=standard_request.session_key or session_key,
                     diagnostics=guard_diagnostics,
