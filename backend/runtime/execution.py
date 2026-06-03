@@ -485,7 +485,7 @@ async def collect_completion_run(
     # 初始化 Tool Sieve 用于实时检测
     tool_sieve = None
     if request.tools:
-        tool_sieve = ToolStreamSieve(request.tool_names) if settings.TOOLCORE_V2_ENABLED else tool_parser.ToolSieve(request.tool_names)
+        tool_sieve = ToolStreamSieve(request.tool_names)
         log.info("[Collect] Tool Sieve 已启用，工具列表: %s", request.tool_names)
 
     def _strip_textual_tool_wrapper(text: str, detected_calls: list[dict[str, Any]]) -> str:

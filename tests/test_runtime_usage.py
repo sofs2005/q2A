@@ -167,6 +167,57 @@ class CollectCompletionRunStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<|DSML|", "".join(deltas))
         self.assertEqual(result.state.tool_calls[0]["name"], "Read")
 
+    async def test_streaming_dsml_tool_call_is_intercepted_on_default_tool_sieve_path(self) -> None:
+        request = StandardRequest(
+            prompt="prompt",
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+            tools=[{"name": "bridge-24", "parameters": {}}],
+            tool_names=["bridge-24"],
+            tool_enabled=True,
+        )
+        client = _FakeStreamClient(
+            [
+                {"type": "meta", "chat_id": "chat_1", "acc": None},
+                {
+                    "type": "event",
+                    "event": {
+                        "type": "delta",
+                        "phase": "answer",
+                        "content": (
+                            "Handler is complete. Now proceed to task #3: compile, format, and test.\n\n"
+                            '<|DSML|tool_calls>\n'
+                            '<|DSML|invoke name="bridge-24">\n'
+                            '<|DSML|parameter name="taskId"></|DSML|parameter>\n'
+                            '<|DSML|parameter name="status"></|DSML|parameter>\n'
+                            '</|DSML|invoke>\n'
+                            '</|DSML|tool_calls>'
+                        ),
+                    },
+                },
+            ]
+        )
+        deltas: list[str] = []
+
+        async def on_delta(_evt, text_chunk, _tool_calls):
+            if text_chunk is not None:
+                deltas.append(text_chunk)
+
+        with patch.object(runtime_execution.settings, "TOOLCORE_V2_ENABLED", False):
+            result = await collect_completion_run(
+                client,
+                request,
+                request.prompt,
+                capture_events=False,
+                on_delta=on_delta,
+            )
+
+        self.assertNotIn("<|DSML|", "".join(deltas))
+        self.assertNotIn("<|DSML|", result.state.answer_text)
+        self.assertEqual(result.state.tool_calls[0]["name"], "bridge-24")
+        self.assertEqual(result.state.tool_calls[0]["input"], {"taskId": "", "status": ""})
+
 
 class _FakeStreamClient:
     def __init__(self, items):

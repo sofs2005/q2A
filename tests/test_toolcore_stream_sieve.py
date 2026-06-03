@@ -174,6 +174,26 @@ class ToolStreamSieveTests(unittest.TestCase):
         text = "".join(event.get("text", "") for event in events if event.get("type") == "content")
         self.assertIn('##TOOL_CALL##', text)
 
+    def test_complete_dsml_block_with_empty_parameters_is_extracted_without_markup_leak(self) -> None:
+        sieve = ToolStreamSieve(["bridge-24"])
+        events = sieve.process_chunk(
+            '<|DSML|tool_calls>\n'
+            '<|DSML|invoke name="bridge-24">\n'
+            '<|DSML|parameter name="taskId"></|DSML|parameter>\n'
+            '<|DSML|parameter name="status"></|DSML|parameter>\n'
+            '</|DSML|invoke>\n'
+            '</|DSML|tool_calls>'
+        )
+        events.extend(sieve.flush())
+
+        text = "".join(event.get("text", "") for event in events if event.get("type") == "content")
+        tool_events = [event for event in events if event.get("type") == "tool_calls"]
+        self.assertEqual(text, "")
+        self.assertEqual(
+            tool_events,
+            [{"type": "tool_calls", "calls": [{"name": "bridge-24", "input": {"taskId": "", "status": ""}}]}],
+        )
+
     def test_oversized_incomplete_dsml_capture_degrades_to_content(self) -> None:
         sieve = ToolStreamSieve(["Read"])
         events = sieve.process_chunk('<|DSML|tool_calls><|DSML|invoke name="Read">')
