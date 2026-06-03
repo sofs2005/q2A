@@ -58,6 +58,23 @@ class PromptContractTests(unittest.TestCase):
         self.assertNotIn("IGNORE any previous output format instructions", contract)
         self.assertNotIn("用户输入什么语言", contract)
 
+    def test_tool_contract_warns_shell_commands_still_need_shell_quoting(self) -> None:
+        contract = build_tool_instruction_block(
+            normalize_prompt_tools([
+                {
+                    "name": "Bash",
+                    "description": "Runs a shell command.",
+                    "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                }
+            ]),
+            OPENCLAW_OPENAI_PROFILE,
+        )
+
+        self.assertIn("CDATA preserves parameter text exactly", contract)
+        self.assertIn("valid shell syntax", contract)
+        self.assertIn("python -c", contract)
+        self.assertIn("here-document", contract)
+
     def test_history_tool_call_uses_dsml_wrapper_style(self) -> None:
         rendered = render_history_tool_call("Read", {"file_path": "README.md"}, CLAUDE_CODE_OPENAI_PROFILE)
         self.assertEqual(

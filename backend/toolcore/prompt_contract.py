@@ -186,6 +186,8 @@ def build_tool_instruction_block(
         "- Use the exact bridge slot id from the list above in the invoke name attribute.",
         "- Every top-level argument must be a <|DSML|parameter name=\"ARG_NAME\"> node.",
         "- Use <![CDATA[...]]> for string values, including code, paths, prompts, and file contents.",
+        "- CDATA preserves parameter text exactly; it does not add shell escaping, JSON escaping, or quote balancing.",
+        "- Shell command parameters must already be valid shell syntax after JSON parsing. For python -c or code containing nested quotes, prefer a quoted here-document such as python3 <<'PY' ... PY, or explicitly escape inner shell quotes.",
         "- Objects use nested XML elements inside the parameter body. Arrays may repeat <item> children.",
         "- Numbers, booleans, and null stay plain text.",
         "- Do not emit placeholder, blank, or whitespace-only parameters.",
