@@ -116,6 +116,40 @@ class CollectCompletionRunStreamingTests(unittest.IsolatedAsyncioTestCase):
         slow_on_delta_logs = [line for line in captured_logs.output if "slow on_delta" in line]
         self.assertLessEqual(len(slow_on_delta_logs), 3)
 
+    async def test_slow_tool_sieve_warning_is_rate_limited(self) -> None:
+        request = StandardRequest(
+            prompt="prompt",
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+            tools=[{"name": "bridge-24", "parameters": {}}],
+            tool_names=["bridge-24"],
+            tool_enabled=True,
+        )
+        client = _FakeStreamClient(
+            [{"type": "meta", "chat_id": "chat_1", "acc": None}]
+            + [
+                {"type": "event", "event": {"type": "delta", "phase": "answer", "content": "chunk"}}
+                for _ in range(20)
+            ]
+        )
+
+        async def on_delta(_evt, _text_chunk, _tool_calls):
+            return None
+
+        with patch.object(runtime_execution.settings, "DIAGNOSTIC_SLOW_STEP_SECONDS", 0.0):
+            with self.assertLogs("qwen2api.runtime", level="WARNING") as captured_logs:
+                await collect_completion_run(
+                    client,
+                    request,
+                    request.prompt,
+                    capture_events=False,
+                    on_delta=on_delta,
+                )
+
+        slow_sieve_logs = [line for line in captured_logs.output if "slow tool_sieve" in line]
+        self.assertLessEqual(len(slow_sieve_logs), 3)
+
     async def test_streaming_on_delta_receives_safe_text_not_raw_dsml(self) -> None:
         request = StandardRequest(
             prompt="prompt",

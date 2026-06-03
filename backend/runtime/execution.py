@@ -706,16 +706,19 @@ async def collect_completion_run(
                     sieve_events = tool_sieve.process_chunk(content)
                     sieve_elapsed = time.perf_counter() - sieve_started
                     if sieve_elapsed > settings.DIAGNOSTIC_SLOW_STEP_SECONDS:
-                        log.warning(
-                            "[Collect] slow tool_sieve chat_id=%s elapsed=%.3fs chunk_chars=%s pending_chars=%s capture_chars=%s capturing=%s stage=%s",
-                            chat_id,
-                            sieve_elapsed,
-                            len(content),
-                            len(getattr(tool_sieve, "pending", "")),
-                            len(getattr(tool_sieve, "capture", "")),
-                            getattr(tool_sieve, "capturing", False),
-                            getattr(tool_sieve, "fenced_passthrough_fence", None),
-                        )
+                        warning_count = slow_step_warning_counts.get("tool_sieve", 0)
+                        if warning_count < 3:
+                            slow_step_warning_counts["tool_sieve"] = warning_count + 1
+                            log.warning(
+                                "[Collect] slow tool_sieve chat_id=%s elapsed=%.3fs chunk_chars=%s pending_chars=%s capture_chars=%s capturing=%s stage=%s",
+                                chat_id,
+                                sieve_elapsed,
+                                len(content),
+                                len(getattr(tool_sieve, "pending", "")),
+                                len(getattr(tool_sieve, "capture", "")),
+                                getattr(tool_sieve, "capturing", False),
+                                getattr(tool_sieve, "fenced_passthrough_fence", None),
+                            )
                     for sieve_evt in sieve_events:
                         if sieve_evt.get("type") == "content":
                             safe_text = str(sieve_evt.get("text") or "")

@@ -13,10 +13,37 @@ LEGACY_HOLD_CHARS = max(len(marker) for marker in TOOL_START_MARKERS) - 1
 MAX_CAPTURE_CHARS = 64 * 1024
 FENCE_PASSTHROUGH_HOLD_CHARS = 32
 FENCE_OPEN_RE = re.compile(r"(?m)^[ \t]*(```+|~~~+)[^\n]*(?:\n|$)")
+DSML_CLOSE_HINT_TRANSLATION = str.maketrans({
+    "＜": "<",
+    "﹤": "<",
+    "〈": "<",
+    "＞": ">",
+    "﹥": ">",
+    "〉": ">",
+    "／": "/",
+    "∕": "/",
+    "！": "|",
+    "、": "|",
+    "␂": "|",
+})
 
 
 def _inside_spans(pos: int, spans: list[tuple[int, int]]) -> bool:
     return any(start <= pos < end for start, end in spans)
+
+
+def _has_tool_calls_close_hint(text: str) -> bool:
+    folded = text.translate(DSML_CLOSE_HINT_TRANSLATION).replace("\x02", "|").lower()
+    compact = "".join(ch for ch in folded if not ch.isspace())
+    return any(
+        hint in compact
+        for hint in (
+            "</|dsml|tool_calls",
+            "<|/dsml|tool_calls",
+            "<|/dsml|/tool_calls",
+            "</tool_calls",
+        )
+    )
 
 
 def _markdown_code_spans(text: str) -> list[tuple[int, int]]:
@@ -269,9 +296,13 @@ class ToolStreamSieve:
         allowed_names = set(self.tool_names)
         first_tag = find_tool_markup_tag_outside_ignored(self.capture, 0)
         if first_tag is not None and first_tag.name == "tool_calls":
-            prefix, calls, suffix, ready = consume_dsml_tool_capture(self.capture, allowed_names)
-            if not ready or not calls:
+            if not _has_tool_calls_close_hint(self.capture):
                 return "", [], "", False
+            prefix, calls, suffix, ready = consume_dsml_tool_capture(self.capture, allowed_names)
+            if not ready:
+                return "", [], "", False
+            if not calls:
+                return "", [], suffix, True
             return prefix, calls, suffix, True
 
         lowered = self.capture.lower()

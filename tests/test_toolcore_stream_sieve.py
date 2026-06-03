@@ -194,6 +194,36 @@ class ToolStreamSieveTests(unittest.TestCase):
             [{"type": "tool_calls", "calls": [{"name": "bridge-24", "input": {"taskId": "", "status": ""}}]}],
         )
 
+    def test_incomplete_dsml_capture_waits_for_close_before_full_parse(self) -> None:
+        sieve = ToolStreamSieve(["bridge-24"])
+
+        with unittest.mock.patch(
+            "backend.toolcore.stream_sieve.consume_dsml_tool_capture",
+            side_effect=AssertionError("incomplete DSML should not run full capture parse per chunk"),
+        ):
+            self.assertEqual(sieve.process_chunk('<|DSML|tool_calls>\n'), [])
+            self.assertEqual(sieve.process_chunk('<|DSML|invoke name="bridge-24">\n'), [])
+            self.assertEqual(sieve.process_chunk('<|DSML|parameter name="taskId">'), [])
+
+        events = sieve.process_chunk('</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>')
+        tool_events = [event for event in events if event.get("type") == "tool_calls"]
+        self.assertEqual(tool_events[0]["calls"], [{"name": "bridge-24", "input": {"taskId": ""}}])
+
+    def test_closed_dsml_with_unknown_tool_does_not_stay_capturing_or_leak_markup(self) -> None:
+        sieve = ToolStreamSieve(["Read"])
+        events = sieve.process_chunk(
+            '<|DSML|tool_calls>'
+            '<|DSML|invoke name="exec"></|DSML|invoke>'
+            '</|DSML|tool_calls> after'
+        )
+        events.extend(sieve.flush())
+
+        text = "".join(event.get("text", "") for event in events if event.get("type") == "content")
+        self.assertFalse(sieve.capturing)
+        self.assertFalse(any(event.get("type") == "tool_calls" for event in events))
+        self.assertNotIn("DSML", text)
+        self.assertEqual(text, " after")
+
     def test_oversized_incomplete_dsml_capture_degrades_to_content(self) -> None:
         sieve = ToolStreamSieve(["Read"])
         events = sieve.process_chunk('<|DSML|tool_calls><|DSML|invoke name="Read">')
