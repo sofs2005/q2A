@@ -620,6 +620,8 @@ async def collect_completion_run(
         )
         return RuntimeExecutionResult(state=state, chat_id=chat_id, acc=acc)
 
+    slow_step_warning_counts: dict[str, int] = {}
+
     async def _emit_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None, *, stage: str) -> None:
         update_request_context(stream_stage=stage)
         if on_delta is None:
@@ -628,14 +630,17 @@ async def collect_completion_run(
         await on_delta(evt, text_chunk, tool_calls)
         elapsed = time.perf_counter() - started
         if elapsed > settings.DIAGNOSTIC_SLOW_STEP_SECONDS:
-            log.warning(
-                "[Collect] slow on_delta chat_id=%s stage=%s elapsed=%.3fs text_chars=%s tool_calls=%s",
-                chat_id,
-                stage,
-                elapsed,
-                len(text_chunk or ""),
-                len(tool_calls or []),
-            )
+            warning_count = slow_step_warning_counts.get(stage, 0)
+            if warning_count < 3:
+                slow_step_warning_counts[stage] = warning_count + 1
+                log.warning(
+                    "[Collect] slow on_delta chat_id=%s stage=%s elapsed=%.3fs text_chars=%s tool_calls=%s",
+                    chat_id,
+                    stage,
+                    elapsed,
+                    len(text_chunk or ""),
+                    len(tool_calls or []),
+                )
 
     try:
         async for item in client.chat_stream_events_with_retry(
