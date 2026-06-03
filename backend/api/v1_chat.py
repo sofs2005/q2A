@@ -20,7 +20,7 @@ from backend.services.token_calc import calculate_usage
 from backend.services.qwen_client import QwenClient
 from backend.services.standard_request_builder import build_chat_standard_request
 from backend.toolcore.request_singleflight import RequestSingleflight
-from backend.runtime.execution import RuntimeAttemptState, RuntimeToolDirective, build_tool_directive, build_usage_delta_factory, request_max_attempts
+from backend.runtime.execution import RuntimeAttemptState, build_tool_directive, build_usage_delta_factory, request_max_attempts
 
 log = logging.getLogger("qwen2api.chat")
 router = APIRouter()
@@ -709,10 +709,6 @@ def _openai_content_delta_text(chunk: str) -> str | None:
     return str(delta.get("content") or "")
 
 
-def _is_openai_content_delta_chunk(chunk: str) -> bool:
-    return _openai_content_delta_text(chunk) is not None
-
-
 def _is_openai_tool_call_delta_chunk(chunk: str) -> bool:
     if not isinstance(chunk, str) or not chunk.startswith("data: "):
         return False
@@ -729,10 +725,6 @@ def _is_openai_tool_call_delta_chunk(chunk: str) -> bool:
     choice = choices[0] if isinstance(choices[0], dict) else {}
     delta = choice.get("delta") if isinstance(choice, dict) else {}
     return isinstance(delta, dict) and isinstance(delta.get("tool_calls"), list)
-
-
-def _filter_staged_chunks_for_tool_calls(chunks: list[str]) -> list[str]:
-    return [chunk for chunk in chunks if not _is_openai_content_delta_chunk(chunk)]
 
 
 def _openai_text_stream_chunks(*, completion_id: str, created: int, model_name: str, content: str, prompt: str):
@@ -768,7 +760,7 @@ def _resolve_openai_stream_finish_reason(*, directive, state_finish_reason: str 
     if getattr(directive, "stop_reason", None) == "tool_use":
         return "tool_calls"
     if state_finish_reason == "tool_calls":
-        return "stop"
+        return "tool_calls"
     return state_finish_reason or "stop"
 
 
@@ -1125,6 +1117,11 @@ async def chat_completions(request: Request):
                                         chunk = translator.pending_chunks.pop(0)
                                         content_text = _openai_content_delta_text(chunk)
                                         if content_text is None:
+                                            if staged_chunks and _is_openai_tool_call_delta_chunk(chunk):
+                                                for staged_chunk in staged_chunks:
+                                                    await queue.put(staged_chunk)
+                                                staged_chunks = []
+                                                streamed_content_to_client = True
                                             emitted_protocol_chunks.append(chunk)
                                             if _is_openai_tool_call_delta_chunk(chunk):
                                                 emitted_tool_call_chunks.append(chunk)
@@ -1161,17 +1158,6 @@ async def chat_completions(request: Request):
                                 )
                                 execution = result.execution
                                 directive = result.directive or build_tool_directive(standard_request, execution.state)
-                                if streamed_content_to_client and directive.stop_reason == "tool_use":
-                                    log.warning(
-                                        "[OAI] suppress_tool_calls_after_streamed_content req_id=%s completion_id=%s prompt_hash=%s",
-                                        req_id,
-                                        completion_id,
-                                        diagnostics["prompt_hash"],
-                                    )
-                                    directive = RuntimeToolDirective(
-                                        tool_blocks=[{"type": "text", "text": execution.state.answer_text or ""}],
-                                        stop_reason="end_turn",
-                                    )
                                 final_finish_reason = _resolve_openai_stream_finish_reason(
                                     directive=directive,
                                     state_finish_reason=execution.state.finish_reason,
@@ -1201,7 +1187,7 @@ async def chat_completions(request: Request):
                                     len(execution.state.answer_text or ""),
                                     len(staged_chunks),
                                 )
-                                output_staged_chunks = _filter_staged_chunks_for_tool_calls(staged_chunks) if final_finish_reason == "tool_calls" else staged_chunks
+                                output_staged_chunks = staged_chunks
                                 if final_finish_reason == "tool_calls":
                                     _log_outbound_tool_call_diagnostics(
                                         req_id=req_id,

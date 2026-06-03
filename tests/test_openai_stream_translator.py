@@ -116,6 +116,53 @@ class OpenAIStreamTranslatorTests(unittest.TestCase):
         self.assertEqual(content_text, "visible prefix")
         self.assertNotIn("<|DSML|", content_text)
 
+    def test_safe_text_delta_holds_cross_chunk_dsml_prefix(self) -> None:
+        translator = OpenAIStreamTranslator(
+            completion_id="chatcmpl_safe_split_dsml",
+            created=1,
+            model_name="gpt-4.1",
+            client_profile="openclaw_openai",
+            allowed_tool_names=["Read"],
+        )
+
+        translator.on_delta({"phase": "answer", "_qwen2api_safe_text": True}, "visible <|DS", None)
+        translator.on_delta({"phase": "answer", "_qwen2api_safe_text": True}, 'ML|parameter name="file_path"><![CDATA[secret', None)
+
+        payloads = [json.loads(chunk[6:].strip()) for chunk in translator.pending_chunks if chunk.startswith("data: ")]
+        content_text = "".join(
+            payload["choices"][0]["delta"].get("content", "")
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("content")
+        )
+        self.assertEqual(content_text, "visible")
+        self.assertNotIn("<|DS", content_text)
+        self.assertNotIn("<|DSML|", content_text)
+        self.assertNotIn("<![CDATA[", content_text)
+
+    def test_safe_text_delta_holds_cross_chunk_closing_dsml_and_cdata_prefixes(self) -> None:
+        translator = OpenAIStreamTranslator(
+            completion_id="chatcmpl_safe_split_close",
+            created=1,
+            model_name="gpt-4.1",
+            client_profile="openclaw_openai",
+            allowed_tool_names=["Read"],
+        )
+
+        translator.on_delta({"phase": "answer", "_qwen2api_safe_text": True}, "visible </|DS", None)
+        translator.on_delta({"phase": "answer", "_qwen2api_safe_text": True}, "ML|tool_calls>", None)
+        translator.on_delta({"phase": "answer", "_qwen2api_safe_text": True}, " more <![CD", None)
+        translator.on_delta({"phase": "answer", "_qwen2api_safe_text": True}, "ATA[hidden", None)
+
+        payloads = [json.loads(chunk[6:].strip()) for chunk in translator.pending_chunks if chunk.startswith("data: ")]
+        content_text = "".join(
+            payload["choices"][0]["delta"].get("content", "")
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("content")
+        )
+        self.assertEqual(content_text, "visible more")
+        self.assertNotIn("</|DS", content_text)
+        self.assertNotIn("<![CDATA[", content_text)
+
     def test_safe_text_delta_with_plain_angle_bracket_stays_on_fast_path(self) -> None:
         translator = OpenAIStreamTranslator(
             completion_id="chatcmpl_safe_angle",
@@ -184,7 +231,7 @@ class OpenAIStreamTranslatorTests(unittest.TestCase):
             build_final_directive=lambda _text: directive,
             allowed_tool_names=["image_generate"],
         )
-        translator.on_delta({"phase": "answer"}, "<tool markup buffered>", None)
+        translator.on_delta({"phase": "answer"}, "visible progress", None)
         usage = calculate_usage("prompt text", "")
 
         chunks = translator.finalize("stop", usage=usage)
@@ -203,7 +250,23 @@ class OpenAIStreamTranslatorTests(unittest.TestCase):
         self.assertEqual(usage_payload["choices"], [])
         self.assertEqual(usage_payload["usage"], usage)
 
-    def test_stream_tool_call_discards_preceding_content_chunks(self) -> None:
+    def test_finalize_corrects_stop_to_tool_calls_after_tool_call_emitted(self) -> None:
+        translator = OpenAIStreamTranslator(
+            completion_id="chatcmpl_finish_tool",
+            created=1,
+            model_name="gpt-4.1",
+            client_profile="openclaw_openai",
+            allowed_tool_names=["Read"],
+        )
+
+        translator.emit_tool_calls([{"id": "call_1", "name": "Read", "input": {"file_path": "README.md"}}])
+        chunks = translator.finalize("stop")
+
+        payloads = [json.loads(chunk[6:].strip()) for chunk in chunks if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"]
+        finish_payload = payloads[-1]
+        self.assertEqual(finish_payload["choices"][0]["finish_reason"], "tool_calls")
+
+    def test_stream_tool_call_preserves_preceding_content_chunks(self) -> None:
         translator = OpenAIStreamTranslator(
             completion_id="chatcmpl_tool",
             created=1,
@@ -237,7 +300,7 @@ class OpenAIStreamTranslatorTests(unittest.TestCase):
             if payload["choices"]
         ]
 
-        self.assertEqual(content_text, "")
+        self.assertEqual(content_text, "temporary answer")
         self.assertTrue(tool_call_chunks)
         self.assertIn("tool_calls", finish_reasons)
 
@@ -274,6 +337,29 @@ class OpenAIStreamTranslatorTests(unittest.TestCase):
 
         self.assertEqual(content_text, "")
         self.assertTrue(emitted_tool_calls)
+
+    def test_content_chunks_strip_broken_dsml_control_markup(self) -> None:
+        translator = OpenAIStreamTranslator(
+            completion_id="chatcmpl_broken_dsml",
+            created=1,
+            model_name="gpt-4.1",
+            client_profile="openclaw_openai",
+            allowed_tool_names=["Read"],
+        )
+
+        translator.on_delta({"phase": "answer"}, "visible text <|DSML|parameter name=\"x\"><![CDATA[secret", None)
+        chunks = translator.finalize("stop")
+
+        payloads = [json.loads(chunk[6:].strip()) for chunk in chunks if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"]
+        content_text = "".join(
+            payload["choices"][0]["delta"].get("content", "")
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("content")
+        )
+
+        self.assertEqual(content_text, "visible text ")
+        self.assertNotIn("<|DSML|", content_text)
+        self.assertNotIn("<![CDATA[", content_text)
 
 
 if __name__ == "__main__":

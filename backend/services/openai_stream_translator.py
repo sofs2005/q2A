@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any, Callable
 
@@ -15,9 +16,11 @@ BUFFERED_TOOL_CALLS_ONLY = "buffered_tool_calls_only"
 DIRECTIVE_DRIVEN_TOOL_CALLS = "directive_driven_tool_calls"
 TOOL_ARGUMENT_CHUNK_SIZE = 128
 TEXTUAL_TOOL_MARKERS = ("##TOOL_CALL##", "<tool_call>")
+SAFE_TEXT_HOLD_MARKERS = ("<|DSML|", "</|DSML|", "<![CDATA[")
 TOOL_MARKUP_SCAN_HINTS = (
     "<|dsml|",
     "</|dsml|",
+    "<![cdata[",
     "＜！dsml！",
     "＜/！dsml！",
     "〈！dsml！",
@@ -27,11 +30,36 @@ TOOL_MARKUP_SCAN_HINTS = (
     "<invoke",
     "</invoke",
 )
+DSML_CONTROL_TAG_RE = re.compile(
+    r"[<＜﹤〈]\s*/?\s*[|！、␂]\s*/?\s*DSML\s*[|！、␂][^>＞﹥〉]*(?:[>＞﹥〉]|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+CDATA_MARKER_RE = re.compile(
+    r"[<＜﹤〈]\s*[!！]\s*\[\s*CDATA\s*\[|\]\s*\]\s*[>＞﹥〉]",
+    re.IGNORECASE,
+)
+DSML_CONTROL_START_RE = re.compile(
+    r"[<＜﹤〈]\s*/?\s*[|！、␂]\s*/?\s*DSML\s*[|！、␂]",
+    re.IGNORECASE,
+)
+
+
+def strip_dsml_control_markup(text: str) -> str:
+    if not text:
+        return ""
+    dsml_start = DSML_CONTROL_START_RE.search(text)
+    if dsml_start is not None:
+        text = text[:dsml_start.start()]
+    return CDATA_MARKER_RE.sub("", DSML_CONTROL_TAG_RE.sub("", text))
 
 
 def _first_tool_markup_index(text: str) -> int:
     positions = [text.index(marker) for marker in TEXTUAL_TOOL_MARKERS if marker in text]
     lowered = text.lower()
+    for marker in SAFE_TEXT_HOLD_MARKERS:
+        pos = lowered.find(marker.lower())
+        if pos >= 0:
+            positions.append(pos)
     if any(hint in lowered for hint in TOOL_MARKUP_SCAN_HINTS):
         tag = find_tool_markup_tag_outside_ignored(text, 0)
         while tag is not None:
@@ -40,6 +68,20 @@ def _first_tool_markup_index(text: str) -> int:
                 break
             tag = find_tool_markup_tag_outside_ignored(text, tag.end)
     return min(positions) if positions else -1
+
+
+def _split_safe_text_tail(text: str) -> tuple[str, str]:
+    lowered = text.lower()
+    longest_hold = ""
+    for marker in SAFE_TEXT_HOLD_MARKERS:
+        marker_lower = marker.lower()
+        max_prefix_len = min(len(marker) - 1, len(text))
+        for prefix_len in range(1, max_prefix_len + 1):
+            if lowered.endswith(marker_lower[:prefix_len]) and prefix_len > len(longest_hold):
+                longest_hold = text[-prefix_len:]
+    if not longest_hold:
+        return text, ""
+    return text[:-len(longest_hold)], longest_hold
 
 
 class OpenAIStreamTranslator:
@@ -67,7 +109,7 @@ class OpenAIStreamTranslator:
         self.role_chunk_sent = False
         self.emitted_tool_index = 0
         self.answer_fragments: list[str] = []
-        self.pending_content_chunks: list[str] = []
+        self.safe_text_hold = ""
         self.tool_calls_emitted = False
         self.tool_text_detection_mode = self._resolve_tool_text_detection_mode(client_profile)
         self.tool_call_finalize_mode = self._resolve_tool_call_finalize_mode(client_profile)
@@ -102,18 +144,13 @@ class OpenAIStreamTranslator:
         self.role_chunk_sent = True
 
     def _emit_content_chunk(self, text_chunk: str) -> None:
+        text_chunk = strip_dsml_control_markup(text_chunk)
+        if not text_chunk:
+            return
         chunk = (
             f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'content': text_chunk}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
         )
         self.pending_chunks.append(chunk)
-        self.pending_content_chunks.append(chunk)
-
-    def _discard_pending_content_chunks(self) -> None:
-        if not self.pending_content_chunks:
-            return
-        pending_content_ids = {id(chunk) for chunk in self.pending_content_chunks}
-        self.pending_chunks = [chunk for chunk in self.pending_chunks if id(chunk) not in pending_content_ids]
-        self.pending_content_chunks = []
 
     def on_delta(self, evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
         self._ensure_role_chunk()
@@ -123,8 +160,15 @@ class OpenAIStreamTranslator:
 
         if text_chunk and evt.get("phase") == "answer":
             if evt.get("_qwen2api_safe_text"):
-                markup_index = _first_tool_markup_index(text_chunk)
-                safe_text = text_chunk[:markup_index].rstrip() if markup_index >= 0 else text_chunk
+                safe_candidate = f"{self.safe_text_hold}{text_chunk}"
+                self.safe_text_hold = ""
+                markup_index = _first_tool_markup_index(safe_candidate)
+                if markup_index >= 0:
+                    safe_text = safe_candidate[:markup_index].rstrip()
+                else:
+                    safe_text, self.safe_text_hold = _split_safe_text_tail(safe_candidate)
+                    if self.safe_text_hold:
+                        safe_text = safe_text.rstrip()
                 if safe_text:
                     self.answer_fragments.append(safe_text)
                     self._emit_content_chunk(safe_text)
@@ -138,6 +182,11 @@ class OpenAIStreamTranslator:
             return
 
         if tool_calls:
+            for event in self.state_machine.flush(final_tool_use=True):
+                if event.type == "content" and event.text:
+                    self._emit_content_chunk(event.text)
+                elif event.type == "tool_calls" and event.calls:
+                    self.emit_tool_calls(event.calls)
             for event in self.state_machine.process_tool_calls(tool_calls):
                 if event.type == "tool_calls" and event.calls:
                     self.emit_tool_calls(event.calls)
@@ -159,8 +208,6 @@ class OpenAIStreamTranslator:
 
     def emit_tool_calls(self, tool_calls: list[dict[str, Any]], *, split_arguments: bool = False) -> None:
         self._ensure_role_chunk()
-        if tool_calls and not self.tool_calls_emitted:
-            self._discard_pending_content_chunks()
         for tool_call in tool_calls:
             idx = self.emitted_tool_index
             self.emitted_tool_index += 1
@@ -191,7 +238,6 @@ class OpenAIStreamTranslator:
                 elif event.type == "tool_calls" and event.calls:
                     self.emit_tool_calls(event.calls)
             if self._should_finalize_tool_calls(directive):
-                self._discard_pending_content_chunks()
                 tool_calls = [
                     {
                         "id": block["id"],
@@ -204,14 +250,15 @@ class OpenAIStreamTranslator:
                 if tool_calls:
                     self.emit_tool_calls(tool_calls, split_arguments=False)
                     final_finish_reason = "tool_calls"
-        elif self.tool_calls_emitted and finish_reason == "tool_calls":
-            self._discard_pending_content_chunks()
         else:
             for event in self.state_machine.flush(final_tool_use=finish_reason == "tool_calls"):
                 if event.type == "content" and event.text:
                     self._emit_content_chunk(event.text)
                 elif event.type == "tool_calls" and event.calls:
                     self.emit_tool_calls(event.calls)
+
+        if self.tool_calls_emitted and final_finish_reason in (None, "stop"):
+            final_finish_reason = "tool_calls"
 
         chunks = list(self.pending_chunks)
         finish_payload = {

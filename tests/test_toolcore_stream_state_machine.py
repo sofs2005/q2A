@@ -41,7 +41,7 @@ class ToolCoreStreamStateMachineTests(unittest.TestCase):
         self.assertEqual(events, [])
         self.assertFalse(any(event.type == "content" and event.text and "DSML" in event.text for event in flushed))
 
-    def test_unknown_dsml_wrapper_flushes_as_text_without_final_tool_use(self) -> None:
+    def test_unknown_dsml_wrapper_does_not_flush_as_text_without_final_tool_use(self) -> None:
         machine = ToolStreamStateMachine(["Read"])
         content = '<|DSML|tool_calls><|DSML|invoke name="exec"></|DSML|invoke></|DSML|tool_calls>'
 
@@ -49,7 +49,7 @@ class ToolCoreStreamStateMachineTests(unittest.TestCase):
         flushed = machine.flush(final_tool_use=False)
 
         text = "".join(event.text or "" for event in flushed if event.type == "content")
-        self.assertEqual(text, content)
+        self.assertEqual(text, "")
 
     def test_failed_attempt_output_is_isolated_from_later_success(self) -> None:
         machine = ToolStreamStateMachine(["Read"])

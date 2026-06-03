@@ -13,6 +13,10 @@ LEGACY_HOLD_CHARS = max(len(marker) for marker in TOOL_START_MARKERS) - 1
 MAX_CAPTURE_CHARS = 64 * 1024
 FENCE_PASSTHROUGH_HOLD_CHARS = 32
 FENCE_OPEN_RE = re.compile(r"(?m)^[ \t]*(```+|~~~+)[^\n]*(?:\n|$)")
+DSML_CONTROL_START_RE = re.compile(
+    r"[<＜﹤〈]\s*/?\s*[|！、␂]\s*/?\s*DSML\s*[|！、␂]",
+    re.IGNORECASE,
+)
 DSML_CLOSE_HINT_TRANSLATION = str.maketrans({
     "＜": "<",
     "﹤": "<",
@@ -44,6 +48,12 @@ def _has_tool_calls_close_hint(text: str) -> bool:
             "</tool_calls",
         )
     )
+
+
+def _is_dsml_control_prefix_fragment(text: str) -> bool:
+    folded = text.translate(DSML_CLOSE_HINT_TRANSLATION).replace("\x02", "|").lower()
+    compact = "".join(ch for ch in folded if not ch.isspace())
+    return bool(compact) and any(marker.startswith(compact) for marker in ("<|dsml|", "</|dsml|", "<|/dsml|"))
 
 
 def _markdown_code_spans(text: str) -> list[tuple[int, int]]:
@@ -160,10 +170,13 @@ class ToolStreamSieve:
         self.pending = ""
         self.capture = ""
         self.capturing = False
+        self.dropping_dsml_remainder = False
         self.fenced_passthrough_fence: str | None = None
 
     def process_chunk(self, chunk: str) -> list[dict[str, Any]]:
         if not chunk:
+            return []
+        if self.dropping_dsml_remainder:
             return []
 
         self.pending += chunk
@@ -185,7 +198,10 @@ class ToolStreamSieve:
                 prefix, calls, suffix, ready = self._consume_capture()
                 if not ready:
                     if len(self.capture) > MAX_CAPTURE_CHARS:
-                        events.append({"type": "content", "text": self.capture})
+                        if self._is_dsml_capture(self.capture):
+                            self.dropping_dsml_remainder = True
+                        else:
+                            events.append({"type": "content", "text": self.capture})
                         self.capture = ""
                         self.capturing = False
                     return events
@@ -251,7 +267,9 @@ class ToolStreamSieve:
 
     def flush(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
+        drop_pending_dsml_suffix = False
         if self.capturing and self.capture:
+            is_dsml_capture = self._is_dsml_capture(self.capture)
             prefix, calls, suffix, ready = self._consume_capture()
             if ready:
                 if prefix:
@@ -259,19 +277,40 @@ class ToolStreamSieve:
                 if calls:
                     events.append({"type": "tool_calls", "calls": calls})
                 if suffix:
-                    events.append({"type": "content", "text": suffix})
-            elif not self._is_dsml_capture(self.capture):
+                    partial_suffix_start = find_partial_tool_markup_start(suffix)
+                    if is_dsml_capture and (
+                        (partial_suffix_start >= 0 and not suffix[:partial_suffix_start].strip())
+                        or _is_dsml_control_prefix_fragment(suffix)
+                    ):
+                        safe_suffix = suffix[:partial_suffix_start] if partial_suffix_start >= 0 else ""
+                        if safe_suffix.strip():
+                            events.append({"type": "content", "text": safe_suffix})
+                        drop_pending_dsml_suffix = True
+                    else:
+                        events.append({"type": "content", "text": suffix})
+            elif not is_dsml_capture:
                 events.append({"type": "content", "text": self.capture})
+            else:
+                drop_pending_dsml_suffix = True
             self.capture = ""
             self.capturing = False
         if self.pending:
-            events.append({"type": "content", "text": self.pending})
+            partial_pending_start = find_partial_tool_markup_start(self.pending)
+            drop_pending = drop_pending_dsml_suffix and (
+                (partial_pending_start >= 0 and not self.pending[:partial_pending_start].strip())
+                or _is_dsml_control_prefix_fragment(self.pending)
+            )
+            if not drop_pending:
+                events.append({"type": "content", "text": self.pending})
             self.pending = ""
         self.fenced_passthrough_fence = None
+        self.dropping_dsml_remainder = False
         return events
 
     def _is_dsml_capture(self, text: str) -> bool:
-        return "<|DSML|" in text or "＜！DSML！" in text
+        folded = text.translate(DSML_CLOSE_HINT_TRANSLATION).replace("\x02", "|").lower()
+        compact = "".join(ch for ch in folded if not ch.isspace())
+        return any(marker in compact for marker in ("<|dsml|", "</|dsml|", "<|/dsml|"))
 
     def _find_tool_start(self, text: str) -> int:
         positions: list[int] = []
@@ -279,10 +318,18 @@ class ToolStreamSieve:
         scan_text = text[:unclosed_code_start] if unclosed_code_start >= 0 else text
         tag = find_tool_markup_tag_outside_ignored(scan_text, 0)
         while tag is not None:
-            if not tag.closing and tag.name in {"tool_calls", "invoke"}:
+            if not tag.closing and tag.name in {"tool_calls", "invoke", "parameter"}:
                 positions.append(tag.start)
                 break
             tag = find_tool_markup_tag_outside_ignored(scan_text, tag.end)
+
+        ignored = _markdown_code_spans(scan_text)
+        dsml_start = DSML_CONTROL_START_RE.search(scan_text)
+        while dsml_start is not None:
+            if not _inside_spans(dsml_start.start(), ignored):
+                positions.append(dsml_start.start())
+                break
+            dsml_start = DSML_CONTROL_START_RE.search(scan_text, dsml_start.end())
 
         legacy_start = _find_legacy_tool_start(scan_text)
         if legacy_start >= 0:

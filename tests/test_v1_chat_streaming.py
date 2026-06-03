@@ -327,7 +327,7 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_chunk, "data: plain chunk\n\n")
         self.assertEqual(remaining[-1], "data: FINAL-stop-5\n\n")
 
-    async def test_final_tool_call_discards_staged_content_chunks(self) -> None:
+    async def test_final_tool_call_preserves_staged_content_chunks(self) -> None:
         app = types.SimpleNamespace(
             state=types.SimpleNamespace(
                 users_db=object(),
@@ -388,11 +388,11 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
             if payload.get("choices") and payload["choices"][0]["delta"].get("content")
         )
         joined = "".join(chunks)
-        self.assertEqual(content_text, "")
+        self.assertEqual(content_text, "temporary answer")
         self.assertIn('"tool_calls"', joined)
         self.assertIn('"finish_reason": "tool_calls"', joined)
 
-    async def test_suppressed_tool_call_after_streamed_content_finishes_as_stop(self) -> None:
+    async def test_tool_call_after_streamed_content_finishes_as_tool_calls(self) -> None:
         app = types.SimpleNamespace(
             state=types.SimpleNamespace(
                 users_db=object(),
@@ -452,9 +452,88 @@ class V1ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         joined = "".join(chunks)
         self.assertIn("visible content", joined)
-        self.assertNotIn('"tool_calls"', joined)
-        self.assertNotIn('"finish_reason": "tool_calls"', joined)
-        self.assertIn('"finish_reason": "stop"', joined)
+        self.assertIn('"tool_calls"', joined)
+        self.assertIn('"finish_reason": "tool_calls"', joined)
+
+    async def test_staged_short_content_is_flushed_before_streamed_tool_call(self) -> None:
+        app = types.SimpleNamespace(
+            state=types.SimpleNamespace(
+                users_db=object(),
+                qwen_client=object(),
+                file_store=None,
+                session_locks=_DummyLocks(),
+                account_pool=types.SimpleNamespace(acquire_wait_preferred=AsyncMock(return_value=None)),
+            )
+        )
+        request = _FakeRequest(app, {"messages": [{"role": "user", "content": "hi"}], "stream": True})
+        standard_request = StandardRequest(
+            prompt="hi",
+            response_model="gpt-4.1",
+            resolved_model="qwen3.6-plus",
+            surface="openai",
+            stream=True,
+            client_profile="openclaw_openai",
+            tool_names=["Read"],
+            tools=[{"name": "Read", "parameters": {}}],
+            tool_enabled=True,
+        )
+        end_turn_directive = types.SimpleNamespace(stop_reason="end_turn", tool_blocks=[])
+
+        async def fake_bridge(**kwargs):
+            await kwargs["on_attempt_start"](0, "prompt")
+            await kwargs["on_delta"]({"phase": "answer"}, "short text", None)
+            await kwargs["on_delta"](
+                {"phase": "tool_call"},
+                None,
+                [{"id": "call_1", "name": "Read", "input": {"file_path": "README.md"}}],
+            )
+            return types.SimpleNamespace(
+                execution=types.SimpleNamespace(
+                    chat_id="chat_1",
+                    state=types.SimpleNamespace(
+                        finish_reason="tool_calls",
+                        answer_text="short text",
+                        reasoning_text="",
+                        tool_calls=[{"id": "call_1", "name": "Read", "input": {"file_path": "README.md"}}],
+                    ),
+                ),
+                directive=end_turn_directive,
+                usage={"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+            )
+
+        chunks = []
+        with patch.object(v1_chat, "resolve_auth_context", AsyncMock(return_value=types.SimpleNamespace(token="tok"))), \
+             patch.object(v1_chat, "build_request_session_key", return_value="session"), \
+             patch.object(v1_chat, "prepare_context_attachments", AsyncMock(return_value={"payload": request._payload, "upstream_files": [], "session_key": "session", "context_mode": "inline", "bound_account_email": None, "bound_account": None})), \
+             patch.object(v1_chat, "_build_standard_request", return_value=standard_request), \
+             patch.object(v1_chat, "run_retryable_completion_bridge", new=fake_bridge), \
+             patch.object(v1_chat, "build_tool_directive", return_value=end_turn_directive), \
+             patch.object(v1_chat, "update_request_context"):
+            response = await v1_chat.chat_completions(request)
+            self.assertIsInstance(response, StreamingResponse)
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+
+        payloads = [
+            json.loads(chunk[6:].strip())
+            for chunk in chunks
+            if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"
+        ]
+        content_positions = [
+            index
+            for index, payload in enumerate(payloads)
+            if payload.get("choices") and payload["choices"][0]["delta"].get("content")
+        ]
+        tool_positions = [
+            index
+            for index, payload in enumerate(payloads)
+            if payload.get("choices") and payload["choices"][0]["delta"].get("tool_calls")
+        ]
+        self.assertTrue(content_positions)
+        self.assertTrue(tool_positions)
+        self.assertLess(content_positions[0], tool_positions[0])
+        self.assertEqual(payloads[content_positions[0]]["choices"][0]["delta"]["content"], "short text")
+        self.assertIn('"finish_reason": "tool_calls"', "".join(chunks))
 
     async def test_final_tool_call_uses_execution_directive_when_no_tool_delta_was_streamed(self) -> None:
         app = types.SimpleNamespace(

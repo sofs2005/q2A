@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from backend.toolcore.stream_sieve import ToolStreamSieve
 
@@ -151,6 +152,34 @@ class ToolStreamSieveTests(unittest.TestCase):
         text = "".join(event.get("text", "") for event in events if event.get("type") == "content")
         self.assertEqual(text, '`<|DSML|tool_calls><|DSML|invoke name="Read"></|DSML|invoke></|DSML|tool_calls>`')
 
+    def test_incomplete_lowercase_dsml_tool_block_does_not_flush_as_text(self) -> None:
+        sieve = ToolStreamSieve(["bridge-23"])
+        sieve.process_chunk(
+            '<|dsml|tool_calls>\n'
+            '  <|DsMl|invoke name="bridge-23">\n'
+            '    <|dsml|parameter name="query"><![CDATA[AI news]]></|dsml|parameter>\n'
+            '    <'
+        )
+        events = sieve.flush()
+
+        self.assertFalse(any(event.get("type") == "tool_calls" for event in events))
+        text = "".join(event.get("text", "") for event in events if event.get("type") == "content")
+        self.assertEqual(text, "")
+
+    def test_incomplete_drifted_dsml_tool_block_does_not_flush_as_text(self) -> None:
+        sieve = ToolStreamSieve(["bridge-23"])
+        sieve.process_chunk(
+            '＜！dsml！tool_calls＞\n'
+            '  ＜！DsMl！invoke name＝“bridge-23”＞\n'
+            '    ＜！dsml！parameter name＝“query”＞AI news＜！/dsml！parameter＞\n'
+            '    ＜'
+        )
+        events = sieve.flush()
+
+        self.assertFalse(any(event.get("type") == "tool_calls" for event in events))
+        text = "".join(event.get("text", "") for event in events if event.get("type") == "content")
+        self.assertEqual(text, "")
+
     def test_incomplete_dsml_tool_block_does_not_flush_as_text(self) -> None:
         sieve = ToolStreamSieve(["bridge-23"])
         sieve.process_chunk(
@@ -197,7 +226,7 @@ class ToolStreamSieveTests(unittest.TestCase):
     def test_incomplete_dsml_capture_waits_for_close_before_full_parse(self) -> None:
         sieve = ToolStreamSieve(["bridge-24"])
 
-        with unittest.mock.patch(
+        with mock.patch(
             "backend.toolcore.stream_sieve.consume_dsml_tool_capture",
             side_effect=AssertionError("incomplete DSML should not run full capture parse per chunk"),
         ):
@@ -224,7 +253,7 @@ class ToolStreamSieveTests(unittest.TestCase):
         self.assertNotIn("DSML", text)
         self.assertEqual(text, " after")
 
-    def test_oversized_incomplete_dsml_capture_degrades_to_content(self) -> None:
+    def test_oversized_incomplete_dsml_capture_is_dropped_without_markup_leak(self) -> None:
         sieve = ToolStreamSieve(["Read"])
         events = sieve.process_chunk('<|DSML|tool_calls><|DSML|invoke name="Read">')
         self.assertEqual(events, [])
@@ -238,8 +267,7 @@ class ToolStreamSieveTests(unittest.TestCase):
         self.assertFalse(sieve.capturing)
         self.assertFalse(any(event.get("type") == "tool_calls" for event in emitted))
         text = "".join(str(event.get("text", "")) for event in emitted if event.get("type") == "content")
-        self.assertIn('<|DSML|tool_calls>', text)
-        self.assertGreater(len(text), 64 * 1024)
+        self.assertEqual(text, "")
 
     def test_unclosed_fenced_code_streams_content_without_pending_growth(self) -> None:
         sieve = ToolStreamSieve(["Read"])
