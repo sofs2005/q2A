@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import patch
 
 from backend.services.openai_stream_translator import OpenAIStreamTranslator
 from backend.services.token_calc import calculate_usage
@@ -71,7 +72,7 @@ class OpenAIStreamTranslatorTests(unittest.TestCase):
                 raise AssertionError("safe text should not be parsed again")
 
         translator.state_machine = FailingStateMachine()
-        text = "<|DSML|tool_calls>safe literal text"
+        text = "plain safe literal text"
 
         translator.on_delta({"phase": "answer", "_qwen2api_safe_text": True}, text, None)
 
@@ -83,6 +84,61 @@ class OpenAIStreamTranslatorTests(unittest.TestCase):
         )
         self.assertEqual(content_text, text)
         self.assertEqual(translator.answer_fragments, [text])
+
+    def test_safe_text_delta_does_not_emit_raw_dsml_tool_markup(self) -> None:
+        translator = OpenAIStreamTranslator(
+            completion_id="chatcmpl_safe_dsml",
+            created=1,
+            model_name="gpt-4.1",
+            client_profile="openclaw_openai",
+            allowed_tool_names=["Read"],
+        )
+        text = (
+            "visible prefix\n"
+            '<|DSML|tool_calls>\n'
+            '  <|DSML|invoke name="bridge-15">\n'
+            '    <|DSML|parameter name="file_path"></|DSML|parameter>\n'
+            '    <|DSML|parameter name="limit"></|DSML|parameter>\n'
+            '    <|DSML|parameter name="offset"></|DSML|parameter>\n'
+            '  </|DSML|invoke>\n'
+            '</|DSML|tool_calls>\n'
+            "visible suffix"
+        )
+
+        translator.on_delta({"phase": "answer", "_qwen2api_safe_text": True}, text, None)
+
+        payloads = [json.loads(chunk[6:].strip()) for chunk in translator.pending_chunks if chunk.startswith("data: ")]
+        content_text = "".join(
+            payload["choices"][0]["delta"].get("content", "")
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("content")
+        )
+        self.assertEqual(content_text, "visible prefix")
+        self.assertNotIn("<|DSML|", content_text)
+
+    def test_safe_text_delta_with_plain_angle_bracket_stays_on_fast_path(self) -> None:
+        translator = OpenAIStreamTranslator(
+            completion_id="chatcmpl_safe_angle",
+            created=1,
+            model_name="gpt-4.1",
+            client_profile="openclaw_openai",
+            allowed_tool_names=["Read"],
+        )
+        text = "plain comparison: a < b"
+
+        with patch(
+            "backend.services.openai_stream_translator.find_tool_markup_tag_outside_ignored",
+            side_effect=AssertionError("plain safe text should not be scanned"),
+        ):
+            translator.on_delta({"phase": "answer", "_qwen2api_safe_text": True}, text, None)
+
+        payloads = [json.loads(chunk[6:].strip()) for chunk in translator.pending_chunks if chunk.startswith("data: ")]
+        content_text = "".join(
+            payload["choices"][0]["delta"].get("content", "")
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("content")
+        )
+        self.assertEqual(content_text, text)
 
     def test_finalize_emits_usage_as_separate_empty_choices_chunk(self) -> None:
         translator = OpenAIStreamTranslator(

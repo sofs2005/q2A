@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW_OPENAI_PROFILE
 from backend.runtime.execution import RuntimeToolDirective
+from backend.toolcall.markup_scan import find_tool_markup_tag_outside_ignored
 from backend.toolcore.stream_state_machine import ToolStreamStateMachine
 
 
@@ -13,6 +14,34 @@ STRICT_TOOL_TEXT_PREFIXES = ("{", "[", "`", "<")
 BUFFERED_TOOL_CALLS_ONLY = "buffered_tool_calls_only"
 DIRECTIVE_DRIVEN_TOOL_CALLS = "directive_driven_tool_calls"
 TOOL_ARGUMENT_CHUNK_SIZE = 128
+TEXTUAL_TOOL_MARKERS = ("##TOOL_CALL##", "<tool_call>")
+TOOL_MARKUP_SCAN_HINTS = (
+    "<|dsml|",
+    "</|dsml|",
+    "＜！dsml！",
+    "＜/！dsml！",
+    "〈！dsml！",
+    "〈/！dsml！",
+    "<tool_calls",
+    "</tool_calls",
+    "<invoke",
+    "</invoke",
+)
+
+
+def _first_tool_markup_index(text: str) -> int:
+    positions = [text.index(marker) for marker in TEXTUAL_TOOL_MARKERS if marker in text]
+    lowered = text.lower()
+    if any(hint in lowered for hint in TOOL_MARKUP_SCAN_HINTS):
+        tag = find_tool_markup_tag_outside_ignored(text, 0)
+        while tag is not None:
+            if tag.name in {"tool_calls", "invoke"}:
+                positions.append(tag.start)
+                break
+            tag = find_tool_markup_tag_outside_ignored(text, tag.end)
+    return min(positions) if positions else -1
+
+
 class OpenAIStreamTranslator:
     def __init__(
         self,
@@ -93,10 +122,14 @@ class OpenAIStreamTranslator:
             return
 
         if text_chunk and evt.get("phase") == "answer":
-            self.answer_fragments.append(text_chunk)
             if evt.get("_qwen2api_safe_text"):
-                self._emit_content_chunk(text_chunk)
+                markup_index = _first_tool_markup_index(text_chunk)
+                safe_text = text_chunk[:markup_index].rstrip() if markup_index >= 0 else text_chunk
+                if safe_text:
+                    self.answer_fragments.append(safe_text)
+                    self._emit_content_chunk(safe_text)
                 return
+            self.answer_fragments.append(text_chunk)
             for event in self.state_machine.process_text_delta(text_chunk):
                 if event.type == "content" and event.text:
                     self._emit_content_chunk(event.text)
