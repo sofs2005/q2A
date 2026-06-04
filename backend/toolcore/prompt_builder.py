@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 
 from backend.adapter.standard_request import normalize_tool_choice
+from backend.services.command_environment import CommandEnvironment
 from backend.services.client_profiles import (
     CLAUDE_CODE_OPENAI_PROFILE,
     OPENCLAW_OPENAI_PROFILE,
@@ -213,6 +214,7 @@ def build_prompt_with_tools(
     required_tool_name: str | None = None,
     tool_catalog=None,
     skill_context: str = "",
+    command_environment: CommandEnvironment | None = None,
 ) -> str:
     tool_reference_replacements = _tool_reference_rewrite_map(tool_catalog)
     rendered_system_prompt = _rewrite_tool_name_references(system_prompt, tool_reference_replacements)
@@ -225,6 +227,7 @@ def build_prompt_with_tools(
             client_profile,
             tool_choice_mode=tool_choice_mode,
             required_tool_name=required_tool_name,
+            command_environment=command_environment,
         )
     opencode_override = bool(tools and client_profile == OPENCLAW_OPENAI_PROFILE and looks_like_opencode_system_prompt(system_prompt))
     if opencode_override and tools_part:
@@ -419,6 +422,9 @@ def messages_to_prompt(req_data: dict, *, client_profile: str = OPENCLAW_OPENAI_
     tool_choice = normalize_tool_choice(req_data.get("tool_choice"))
     system_prompt = extract_system_prompt(req_data, client_profile=resolved_client_profile)
     skill_context = build_skill_context(req_data, client_profile=resolved_client_profile)
+    command_environment = req_data.get("_command_environment")
+    if not isinstance(command_environment, CommandEnvironment):
+        command_environment = None
     return PromptBuildResult(
         prompt=build_prompt_with_tools(
             system_prompt,
@@ -429,6 +435,7 @@ def messages_to_prompt(req_data: dict, *, client_profile: str = OPENCLAW_OPENAI_
             required_tool_name=tool_choice.required_tool_name,
             tool_catalog=tool_catalog,
             skill_context=skill_context,
+            command_environment=command_environment,
         ),
         tools=tools,
         tool_enabled=tool_enabled,

@@ -15,6 +15,7 @@ from backend.core.request_logging import new_request_id, request_context, update
 from backend.runtime.execution import RuntimeAttemptState, build_tool_directive, build_usage_delta_factory, request_max_attempts
 from backend.services.attachment_preprocessor import preprocess_attachments
 from backend.services.auth_quota import resolve_auth_context
+from backend.services.command_environment import detect_command_environment, format_command_environment_hint
 from backend.services.completion_bridge import run_retryable_completion_bridge
 from backend.services.context_attachment_manager import build_request_session_key, prepare_context_attachments
 from backend.services.qwen_client import QwenClient
@@ -39,12 +40,13 @@ def _detect_openai_client_profile(request: Request | WebSocket, req_data: dict) 
     return detect_openai_client_profile(request.headers, req_data)
 
 
-def _build_standard_request(req_data: dict, *, client_profile: str) -> StandardRequest:
+def _build_standard_request(req_data: dict, *, client_profile: str, command_environment=None) -> StandardRequest:
     return build_chat_standard_request(
         req_data,
         default_model="gpt-4.1",
         surface="responses",
         client_profile=client_profile,
+        command_environment=command_environment,
     )
 
 
@@ -100,6 +102,8 @@ async def create_response(request: Request):
 
     req_id = new_request_id()
     session_key = build_request_session_key("responses", req_id)
+    command_environment = detect_command_environment(headers=request.headers, request_data=raw_req_data)
+    command_environment_hint = format_command_environment_hint(command_environment)
 
     prepared: PreparedResponsesRequest = await prepare_responses_request(
         response_store=request.app.state.response_store,
@@ -126,7 +130,7 @@ async def create_response(request: Request):
     )
     transformed_req = context_prepared["payload"]
 
-    standard_request = _build_standard_request(transformed_req, client_profile=client_profile)
+    standard_request = _build_standard_request(transformed_req, client_profile=client_profile, command_environment=command_environment)
     if preprocessed is not None:
         standard_request.attachments = preprocessed.attachments
         standard_request.uploaded_file_ids = preprocessed.uploaded_file_ids
@@ -143,7 +147,7 @@ async def create_response(request: Request):
     created = int(time.time())
     history_messages = prepared.combined_messages
 
-    with request_context(req_id=req_id, surface="responses", requested_model=model_name, resolved_model=standard_request.resolved_model):
+    with request_context(req_id=req_id, surface="responses", requested_model=model_name, resolved_model=standard_request.resolved_model, command_environment=command_environment_hint):
         if standard_request.stream:
             async def generate():
                 translator = ResponsesStreamTranslator(response_id=response_id, created=created, model_name=model_name, tool_catalog=standard_request.tool_catalog)
@@ -290,6 +294,8 @@ async def create_response_websocket(websocket: WebSocket):
 
     req_id = new_request_id()
     session_key = build_request_session_key("responses", req_id)
+    command_environment = detect_command_environment(headers=websocket.headers, request_data=raw_req_data)
+    command_environment_hint = format_command_environment_hint(command_environment)
 
     try:
         prepared: PreparedResponsesRequest = await prepare_responses_request(
@@ -317,7 +323,7 @@ async def create_response_websocket(websocket: WebSocket):
         )
         transformed_req = context_prepared["payload"]
 
-        standard_request = _build_standard_request(transformed_req, client_profile=client_profile)
+        standard_request = _build_standard_request(transformed_req, client_profile=client_profile, command_environment=command_environment)
         if preprocessed is not None:
             standard_request.attachments = preprocessed.attachments
             standard_request.uploaded_file_ids = preprocessed.uploaded_file_ids
@@ -334,7 +340,7 @@ async def create_response_websocket(websocket: WebSocket):
         created = int(time.time())
         history_messages = prepared.combined_messages
 
-        with request_context(req_id=req_id, surface="responses_ws", requested_model=model_name, resolved_model=standard_request.resolved_model):
+        with request_context(req_id=req_id, surface="responses_ws", requested_model=model_name, resolved_model=standard_request.resolved_model, command_environment=command_environment_hint):
             translator = ResponsesStreamTranslator(response_id=response_id, created=created, model_name=model_name, tool_catalog=standard_request.tool_catalog)
             translator.start()
             for chunk in translator.pending_chunks:

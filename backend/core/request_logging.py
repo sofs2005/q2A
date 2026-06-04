@@ -27,6 +27,7 @@ _REQUEST_DEFAULTS: dict[str, Any] = {
     "path": "-",
     "client": "-",
     "status": "-",
+    "command_environment": "-",
 }
 
 _LOG_FORMAT = (

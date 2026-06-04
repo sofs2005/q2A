@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from backend.services.client_profiles import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW_OPENAI_PROFILE, QWEN_CODE_OPENAI_PROFILE
+from backend.services.command_environment import CommandEnvironment
 from backend.services.standard_request_builder import build_chat_standard_request
 from backend.toolcore.context_offload import ContextOffloader
 from backend.toolcore.prompt_builder import _extract_text, _extract_user_text_only, messages_to_prompt
@@ -89,6 +90,24 @@ class ToolCorePromptBuilderTests(unittest.TestCase):
 
         self.assertLess(result.prompt.index("=== MANDATORY TOOL CALL INSTRUCTIONS ==="), result.prompt.index("Human: Who are you?"))
         self.assertLess(result.prompt.index("Always answer as a pirate captain."), result.prompt.index("=== MANDATORY TOOL CALL INSTRUCTIONS ==="))
+
+    def test_messages_to_prompt_threads_command_environment_into_tool_contract(self) -> None:
+        req_data = {
+            "messages": [{"role": "user", "content": "Run a Python snippet."}],
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": "Runs a shell command.",
+                    "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                }
+            ],
+            "_command_environment": CommandEnvironment(shell="powershell", platform="windows", source="explicit"),
+        }
+
+        result = messages_to_prompt(req_data, client_profile=OPENCLAW_OPENAI_PROFILE)
+
+        self.assertIn("PowerShell", result.prompt)
+        self.assertIn("@' ... '@ | python -", result.prompt)
 
     def test_messages_to_prompt_preserves_assistant_history_with_review_markers(self) -> None:
         req_data = {

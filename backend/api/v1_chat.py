@@ -13,6 +13,7 @@ from backend.core.request_logging import new_request_id, request_context, update
 from backend.services.attachment_preprocessor import preprocess_attachments
 from backend.services.context_attachment_manager import build_request_session_key, prepare_context_attachments
 from backend.services.auth_quota import resolve_auth_context
+from backend.services.command_environment import detect_command_environment, format_command_environment_hint
 from backend.services.completion_bridge import run_retryable_completion_bridge
 from backend.services.openai_stream_translator import OpenAIStreamTranslator
 from backend.services.response_formatters import build_openai_completion_payload
@@ -821,12 +822,13 @@ def _stage_directive_tool_calls_if_missing(
         staged_chunks.append(translator.pending_chunks.pop(0))
 
 
-def _build_standard_request(req_data: dict, *, client_profile: str) -> StandardRequest:
+def _build_standard_request(req_data: dict, *, client_profile: str, command_environment=None) -> StandardRequest:
     standard_request = build_chat_standard_request(
         req_data,
         default_model="gpt-3.5-turbo",
         surface="openai",
         client_profile=client_profile,
+        command_environment=command_environment,
     )
     log.info("[OAI] normalized tools=%s profile=%s", standard_request.tool_names, client_profile)
     return standard_request
@@ -848,6 +850,8 @@ async def chat_completions(request: Request):
         raise HTTPException(400, {"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}})
 
     client_profile = _detect_openai_client_profile(request, req_data)
+    command_environment = detect_command_environment(headers=request.headers, request_data=req_data)
+    command_environment_hint = format_command_environment_hint(command_environment)
     original_history_messages = req_data.get("messages", [])
     file_store = getattr(app.state, "file_store", None)
     preprocessed = None
@@ -860,7 +864,7 @@ async def chat_completions(request: Request):
     req_id = new_request_id()
     session_key = build_request_session_key("openai", req_id)
     client_host = request.client.host if request.client else "-"
-    early_standard_request = _build_standard_request(req_data, client_profile=client_profile)
+    early_standard_request = _build_standard_request(req_data, client_profile=client_profile, command_environment=command_environment)
     early_context_fingerprint = _build_openai_context_fingerprint(req_data=req_data)
     early_diagnostics = _build_openai_request_diagnostics(
         req_data,
@@ -873,7 +877,7 @@ async def chat_completions(request: Request):
     )
     if repeated_tool_names:
         notice = _build_repeated_tool_request_notice(repeated_tool_names, prompt=early_standard_request.prompt)
-        with request_context(req_id=req_id, surface="openai", requested_model=early_standard_request.response_model, resolved_model=early_standard_request.resolved_model):
+        with request_context(req_id=req_id, surface="openai", requested_model=early_standard_request.response_model, resolved_model=early_standard_request.resolved_model, command_environment=command_environment_hint):
             log.warning(
                 "[OAI] repeated_user_only_tool_request req_id=%s completion_id=%s session=%s prompt_hash=%s context_fingerprint=%s tool_names=%s before_context_upload=True",
                 req_id,
@@ -955,7 +959,7 @@ async def chat_completions(request: Request):
             await _openai_json_singleflight.fail(singleflight_key, e)
         raise
     req_data = context_prepared["payload"]
-    standard_request = _build_standard_request(req_data, client_profile=client_profile)
+    standard_request = _build_standard_request(req_data, client_profile=client_profile, command_environment=command_environment)
     if preprocessed is not None:
         standard_request.attachments = preprocessed.attachments
         standard_request.uploaded_file_ids = preprocessed.uploaded_file_ids
@@ -980,7 +984,7 @@ async def chat_completions(request: Request):
     )
     guard_diagnostics = early_diagnostics
 
-    with request_context(req_id=req_id, surface="openai", requested_model=model_name, resolved_model=qwen_model):
+    with request_context(req_id=req_id, surface="openai", requested_model=model_name, resolved_model=qwen_model, command_environment=command_environment_hint):
         log.info(
             "[OAI] model=%s stream=%s tool_enabled=%s profile=%s tools=%s prompt_len=%s prompt_tail=%r",
             qwen_model,

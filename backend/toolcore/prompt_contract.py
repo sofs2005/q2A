@@ -5,6 +5,7 @@ import json
 import re
 from typing import Any
 
+from backend.services.command_environment import CommandEnvironment
 from backend.services.client_profiles import (
     CLAUDE_CODE_OPENAI_PROFILE,
     OPENCLAW_OPENAI_PROFILE,
@@ -138,12 +139,27 @@ def _tool_usage_line(tool: dict[str, Any], *, max_desc: int = 40, max_keys: int 
     return line
 
 
+def _shell_command_guidance(command_environment: CommandEnvironment | None) -> list[str]:
+    shell = str(getattr(command_environment, "shell", "unknown") or "unknown").strip().lower()
+    lines = [
+        "- Shell command parameters must already be valid shell syntax after JSON parsing. Match the client's actual shell before choosing syntax.",
+    ]
+    if shell == "powershell":
+        lines.append("- PowerShell note: POSIX here-documents are invalid. For multiline Python, prefer @' ... '@ | python - or create a temporary .py file.")
+    elif shell in {"bash", "zsh", "sh"}:
+        lines.append("- POSIX shell note: quoted here-documents are allowed only when the target shell is explicitly POSIX; otherwise prefer stdin or a temporary script file.")
+    else:
+        lines.append("- Unknown shell note: prefer stdin or a temporary script file over shell-specific syntax, and avoid complex nested inline quotes.")
+    return lines
+
+
 def build_tool_instruction_block(
     tools: list[dict[str, Any]],
     client_profile: str,
     *,
     tool_choice_mode: str = "auto",
     required_tool_name: str | None = None,
+    command_environment: CommandEnvironment | None = None,
 ) -> str:
     names = [t.get("name", "") for t in tools if t.get("name")]
     force_constraint_lines: list[str] = []
@@ -187,7 +203,7 @@ def build_tool_instruction_block(
         "- Every top-level argument must be a <|DSML|parameter name=\"ARG_NAME\"> node.",
         "- Use <![CDATA[...]]> for string values, including code, paths, prompts, and file contents.",
         "- CDATA preserves parameter text exactly; it does not add shell escaping, JSON escaping, or quote balancing.",
-        "- Shell command parameters must already be valid shell syntax after JSON parsing. For python -c or code containing nested quotes, prefer a quoted here-document such as python3 <<'PY' ... PY, or explicitly escape inner shell quotes.",
+        *_shell_command_guidance(command_environment),
         "- Objects use nested XML elements inside the parameter body. Arrays may repeat <item> children.",
         "- Numbers, booleans, and null stay plain text.",
         "- Do not emit placeholder, blank, or whitespace-only parameters.",

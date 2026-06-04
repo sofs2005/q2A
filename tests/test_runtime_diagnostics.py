@@ -18,6 +18,20 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
     def tearDown(self) -> None:
         reset_active_request_diagnostic()
 
+    def test_request_context_carries_command_environment(self) -> None:
+        with request_context(req_id="req_env", surface="openai", command_environment="powershell/windows"):
+            snapshot = get_active_request_diagnostic()
+
+        self.assertEqual(snapshot.req_id, "req_env")
+        self.assertEqual(snapshot.surface, "openai")
+        self.assertEqual(snapshot.command_environment, "powershell/windows")
+
+    def test_update_request_context_keeps_command_environment(self) -> None:
+        update_request_context(req_id="req_env_2", surface="responses", command_environment="bash/linux")
+        snapshot = get_active_request_diagnostic()
+
+        self.assertEqual(snapshot.command_environment, "bash/linux")
+
     def test_installs_sigusr1_stack_dump_handler_when_enabled(self) -> None:
         faulthandler = SimpleNamespace(enable=Mock(), register=Mock())
         signal_module = SimpleNamespace(SIGUSR1=object())

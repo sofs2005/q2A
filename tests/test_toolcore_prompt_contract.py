@@ -1,6 +1,7 @@
 import unittest
 
 from backend.services.client_profiles import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW_OPENAI_PROFILE
+from backend.services.command_environment import CommandEnvironment
 from backend.toolcall.formats_dsml import parse_dsml_format
 from backend.toolcore.prompt_contract import build_tool_instruction_block, normalize_prompt_tools, render_history_tool_call
 
@@ -72,8 +73,26 @@ class PromptContractTests(unittest.TestCase):
 
         self.assertIn("CDATA preserves parameter text exactly", contract)
         self.assertIn("valid shell syntax", contract)
-        self.assertIn("python -c", contract)
-        self.assertIn("here-document", contract)
+        self.assertIn("stdin or a temporary script file", contract)
+        self.assertNotIn("PowerShell", contract)
+        self.assertNotIn("python3 <<'PY'", contract)
+
+    def test_tool_contract_mentions_powershell_multiline_python_when_environment_is_explicit(self) -> None:
+        contract = build_tool_instruction_block(
+            normalize_prompt_tools([
+                {
+                    "name": "Bash",
+                    "description": "Runs a shell command.",
+                    "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                }
+            ]),
+            OPENCLAW_OPENAI_PROFILE,
+            command_environment=CommandEnvironment(shell="powershell", platform="windows", source="explicit"),
+        )
+
+        self.assertIn("PowerShell", contract)
+        self.assertIn("@' ... '@ | python -", contract)
+        self.assertNotIn("python3 <<'PY'", contract)
 
     def test_history_tool_call_uses_dsml_wrapper_style(self) -> None:
         rendered = render_history_tool_call("Read", {"file_path": "README.md"}, CLAUDE_CODE_OPENAI_PROFILE)

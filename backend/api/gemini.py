@@ -7,6 +7,7 @@ from typing import Any
 from backend.core.config import resolve_model
 from backend.core.request_logging import new_request_id, request_context, update_request_context
 from backend.runtime import stream_presenter
+from backend.services.command_environment import detect_command_environment, format_command_environment_hint
 from backend.services.completion_bridge import run_retryable_completion_bridge
 from backend.services.auth_quota import resolve_auth_context
 from backend.services.response_formatters import build_gemini_generate_payload
@@ -78,10 +79,16 @@ def _is_gemini_stream_request(body: dict[str, Any]) -> bool:
     return False
 
 
-def _build_standard_request(model: str, body: dict, *, stream: bool | None = None):
+def _build_standard_request(model: str, body: dict, *, stream: bool | None = None, command_environment=None):
     normalized_request = normalize_gemini_request(body, model=model, force_stream=stream)
     payload = to_prompt_payload(normalized_request, model=model, stream=_is_gemini_stream_request(body) if stream is None else stream)
-    return build_chat_standard_request(payload, default_model=model, surface="gemini", client_profile="openclaw_openai")
+    return build_chat_standard_request(
+        payload,
+        default_model=model,
+        surface="gemini",
+        client_profile="openclaw_openai",
+        command_environment=command_environment,
+    )
 
 
 def _gemini_chunk_payload(text: str) -> dict[str, Any]:
@@ -106,8 +113,12 @@ async def _load_and_validate_request(request: Request, model: str, *, force_stre
     token = auth.token
 
     body = await request.json()
-    standard_request = _build_standard_request(model, body, stream=force_stream)
-    update_request_context(resolved_model=standard_request.resolved_model)
+    command_environment = detect_command_environment(headers=request.headers, request_data=body)
+    standard_request = _build_standard_request(model, body, stream=force_stream, command_environment=command_environment)
+    update_request_context(
+        resolved_model=standard_request.resolved_model,
+        command_environment=format_command_environment_hint(command_environment),
+    )
     return users_db, client, token, standard_request
 
 

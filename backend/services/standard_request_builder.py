@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from backend.adapter.standard_request import StandardRequest, enforce_declared_tool_choice, normalize_tool_choice
 from backend.core.config import resolve_request_model
+from backend.services.command_environment import CommandEnvironment
 from backend.services.client_profiles import infer_client_profile, request_looks_like_coding_task
 from backend.toolcore.prompt_builder import messages_to_prompt
 from backend.toolcore.request_normalizer import normalize_chat_request, to_prompt_payload
@@ -32,7 +33,14 @@ def _excluded_command_like_tool_names(req_data: dict) -> set[str] | None:
     return None
 
 
-def build_chat_standard_request(req_data: dict, *, default_model: str, surface: str, client_profile: str = "openclaw_openai") -> StandardRequest:
+def build_chat_standard_request(
+    req_data: dict,
+    *,
+    default_model: str,
+    surface: str,
+    client_profile: str = "openclaw_openai",
+    command_environment: CommandEnvironment | None = None,
+) -> StandardRequest:
     requested_model = req_data.get("model", default_model)
     effective_client_profile = infer_client_profile(req_data, fallback_profile=client_profile)
     normalized_request = normalize_chat_request(req_data, excluded_tool_names=_excluded_command_like_tool_names(req_data))
@@ -43,6 +51,9 @@ def build_chat_standard_request(req_data: dict, *, default_model: str, surface: 
     for field_name in ("system", "developer", "instructions"):
         if field_name in req_data:
             normalized_payload[field_name] = req_data.get(field_name, "")
+    if command_environment is None:
+        command_environment = CommandEnvironment()
+    normalized_payload["_command_environment"] = command_environment
     prompt_result = messages_to_prompt(normalized_payload, client_profile=effective_client_profile)
     tools = prompt_result.tools
     tool_names = [tool_name for tool_name in (tool.get("name") for tool in tools) if isinstance(tool_name, str) and tool_name]
@@ -70,4 +81,5 @@ def build_chat_standard_request(req_data: dict, *, default_model: str, surface: 
         tool_choice_mode=tool_choice.mode,
         required_tool_name=tool_choice.required_tool_name,
         tool_choice_raw=normalized_request.raw_tool_choice,
+        command_environment=command_environment,
     )

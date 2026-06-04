@@ -1,6 +1,7 @@
 import unittest
 
 from backend.adapter.standard_request import StandardRequest
+from backend.services.command_environment import CommandEnvironment
 from backend.runtime.execution import RuntimeAttemptState, evaluate_retry_directive, extract_blocked_tool_names, request_max_attempts, should_retry_textual_tool_contract
 
 
@@ -250,6 +251,151 @@ class ExecutionToolChoiceRetryTests(unittest.TestCase):
         request.required_tool_name = None
 
         self.assertEqual(request_max_attempts(request), 3)
+
+    def test_read_only_command_error_triggers_repair_retry(self) -> None:
+        request = self._request()
+        request.tool_choice_mode = "auto"
+        request.required_tool_name = None
+        request.command_environment = CommandEnvironment(shell="powershell", platform="windows", source="explicit")
+        history_messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "Read", "arguments": '{"file_path": "demo.py"}'},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "name": "Read",
+                "content": "ParserError: Missing file specification after redirection operator.",
+            },
+        ]
+
+        retry = evaluate_retry_directive(
+            request=request,
+            current_prompt="prompt",
+            history_messages=history_messages,
+            attempt_index=0,
+            max_attempts=3,
+            state=RuntimeAttemptState(answer_text="The previous command failed.", emitted_visible_output=True),
+            allow_after_visible_output=True,
+        )
+
+        self.assertTrue(retry.retry)
+        self.assertEqual(retry.reason, "command_error:shell_syntax_error:powershell")
+        self.assertIn("PowerShell", retry.next_prompt)
+        self.assertIn("@' ... '@ | python -", retry.next_prompt)
+
+    def test_command_error_repair_only_retries_once(self) -> None:
+        request = self._request()
+        request.tool_choice_mode = "auto"
+        request.required_tool_name = None
+        request.command_environment = CommandEnvironment(shell="powershell", platform="windows", source="explicit")
+        history_messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "Read", "arguments": '{"file_path": "demo.py"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "name": "Read", "content": "ParserError: Missing file specification after redirection operator."},
+        ]
+
+        retry = evaluate_retry_directive(
+            request=request,
+            current_prompt="prompt",
+            history_messages=history_messages,
+            attempt_index=1,
+            max_attempts=3,
+            state=RuntimeAttemptState(answer_text="The previous command failed.", emitted_visible_output=True),
+            allow_after_visible_output=True,
+        )
+
+        self.assertFalse(retry.retry)
+
+    def test_successful_tool_output_with_error_words_does_not_auto_retry(self) -> None:
+        request = self._request()
+        request.tool_choice_mode = "auto"
+        request.required_tool_name = None
+        history_messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_3",
+                        "type": "function",
+                        "function": {"name": "Read", "arguments": '{"file_path": "notes.txt"}'},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_3",
+                "name": "Read",
+                "content": "The documentation says command not found can happen on PATH issues.",
+            },
+        ]
+
+        retry = evaluate_retry_directive(
+            request=request,
+            current_prompt="prompt",
+            history_messages=history_messages,
+            attempt_index=0,
+            max_attempts=3,
+            state=RuntimeAttemptState(answer_text="I found a note about shell errors.", emitted_visible_output=True),
+            allow_after_visible_output=True,
+        )
+
+        self.assertFalse(retry.retry)
+
+    def test_write_like_command_error_does_not_auto_retry(self) -> None:
+        request = self._request()
+        request.tool_choice_mode = "auto"
+        request.required_tool_name = None
+        request.command_environment = CommandEnvironment(shell="powershell", platform="windows", source="explicit")
+        history_messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "Write", "arguments": '{"file_path": "demo.py", "content": "x"}'},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "name": "Write",
+                "content": "ParserError: Missing file specification after redirection operator.",
+            },
+        ]
+
+        retry = evaluate_retry_directive(
+            request=request,
+            current_prompt="prompt",
+            history_messages=history_messages,
+            attempt_index=0,
+            max_attempts=3,
+            state=RuntimeAttemptState(answer_text="The previous write command failed.", emitted_visible_output=True),
+            allow_after_visible_output=True,
+        )
+
+        self.assertFalse(retry.retry)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from backend.runtime.attachment_types import NormalizedAttachment
+from backend.services.command_environment import CommandEnvironment
 from backend.services.client_profiles import (
     CLAUDE_CODE_OPENAI_PROFILE,
     OPENCLAW_OPENAI_PROFILE,
@@ -84,6 +85,7 @@ class StandardRequest:
     tool_choice_mode: str = "auto"
     required_tool_name: str | None = None
     tool_choice_raw: Any | None = None
+    command_environment: CommandEnvironment = field(default_factory=CommandEnvironment)
     attachments: list[NormalizedAttachment] = field(default_factory=list)
     uploaded_file_ids: list[str] = field(default_factory=list)
     upstream_files: list[dict[str, Any]] = field(default_factory=list)

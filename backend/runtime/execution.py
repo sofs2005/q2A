@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable
 from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, StandardRequest
 from backend.core.config import settings
 from backend.core.request_logging import update_request_context
+from backend.runtime.command_error_adaptation import classify_command_error, build_command_error_retry_prompt, looks_like_command_error
 from backend.runtime.stream_metrics import StreamMetrics
 from backend.services import tool_parser
 from backend.services.token_calc import completion_text_for_usage, count_tokens
@@ -263,6 +264,61 @@ def has_recent_search_no_results(messages: list[dict[str, Any]] | None) -> bool:
         if "did 0 searches" in lowered or '"results": []' in lowered or '"matches": []' in lowered:
             return True
     return False
+
+
+def _tool_result_text(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text") or ""))
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(text for text in parts if text)
+    return str(content or "")
+
+
+def _safe_retryable_command_tool(tool_name: str, tool_input: Any) -> bool:
+    if is_read_tool_name(tool_name) or is_list_directory_tool_name(tool_name):
+        return True
+    if is_shell_tool_name(tool_name) and isinstance(tool_input, dict):
+        command, _ = shell_command_signature(tool_input)
+        return looks_like_listing_shell_command(command)
+    return False
+
+
+def _recent_command_error_candidate(messages: list[dict[str, Any]] | None) -> tuple[str, str, Any] | None:
+    tool_uses_by_id: dict[str, tuple[str, Any]] = {}
+    candidate: tuple[str, str, Any] | None = None
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            for tool_call in message.get("tool_calls", []) or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                call_id = str(tool_call.get("id") or "")
+                fn = tool_call.get("function", {}) if isinstance(tool_call.get("function"), dict) else {}
+                name = str(fn.get("name") or "")
+                if call_id and name:
+                    tool_uses_by_id[call_id] = (name, parse_tool_call_arguments(tool_call))
+            continue
+        if message.get("role") != "tool":
+            continue
+        error_text = _tool_result_text(message)
+        if not error_text.strip() or not looks_like_command_error(error_text):
+            continue
+        call_id = str(message.get("tool_call_id") or "")
+        tool_name = str(message.get("name") or "")
+        tool_input: Any = {}
+        if call_id and call_id in tool_uses_by_id:
+            tool_name, tool_input = tool_uses_by_id[call_id]
+        if tool_name:
+            candidate = (error_text, tool_name, tool_input)
+    return candidate
 
 
 def _assistant_tool_uses(message: dict[str, Any]) -> list[tuple[str, Any]]:
@@ -993,6 +1049,24 @@ def evaluate_retry_directive(
             state.emitted_visible_output,
         )
         return RuntimeRetryDirective(retry=True, next_prompt=next_prompt, reason=reason)
+
+    if attempt_index == 0 and can_retry_after_output and request.tools:
+        command_error = _recent_command_error_candidate(history_messages)
+        if command_error is not None:
+            error_text, tool_name, tool_input = command_error
+            classification = classify_command_error(
+                error_text,
+                command_environment=getattr(request, "command_environment", None),
+            )
+            if classification.confidence in {"high", "medium"} and _safe_retryable_command_tool(tool_name, tool_input):
+                return _retry(
+                    f"command_error:{classification.kind}:{classification.shell}",
+                    build_command_error_retry_prompt(
+                        classification=classification,
+                        current_prompt=current_prompt,
+                        command_environment=getattr(request, "command_environment", None),
+                    ),
+                )
 
     if (
         not state.emitted_visible_output

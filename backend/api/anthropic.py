@@ -19,6 +19,7 @@ from backend.runtime.execution import (
     request_max_attempts,
 )
 from backend.services.auth_quota import resolve_auth_context
+from backend.services.command_environment import detect_command_environment, format_command_environment_hint
 from backend.services.context_attachment_manager import build_request_session_key, prepare_context_attachments
 from backend.services.attachment_preprocessor import preprocess_attachments
 from backend.services.client_profiles import CLAUDE_CODE_OPENAI_PROFILE
@@ -128,7 +129,7 @@ class _AnthropicStreamState:
         self.answer_text_buffer = []
 
 
-def _build_standard_request(req_data: dict) -> StandardRequest:
+def _build_standard_request(req_data: dict, *, command_environment=None) -> StandardRequest:
     model_name = req_data.get("model", "claude-3-5-sonnet")
     normalized_request = normalize_anthropic_request(req_data)
     normalized_payload = to_prompt_payload(normalized_request, model=model_name, stream=bool(req_data.get("stream", False)))
@@ -156,6 +157,7 @@ def _build_standard_request(req_data: dict) -> StandardRequest:
         tool_choice_mode=tool_choice.mode,
         required_tool_name=tool_choice.required_tool_name,
         tool_choice_raw=tool_choice.raw,
+        command_environment=command_environment,
     )
 
 
@@ -224,6 +226,8 @@ async def anthropic_messages(request: Request):
 
     req_id = new_request_id()
     session_key = build_request_session_key("anthropic", req_id)
+    command_environment = detect_command_environment(headers=request.headers, request_data=req_data)
+    command_environment_hint = format_command_environment_hint(command_environment)
     original_history_messages = req_data.get("messages", [])
 
     async def prepare_locked_request(payload: dict) -> tuple[StandardRequest, dict, str, str, str, str]:
@@ -243,7 +247,7 @@ async def anthropic_messages(request: Request):
             existing_attachments=(preprocessed.attachments if preprocessed is not None else None),
         )
         working_payload = context_prepared["payload"]
-        standard_request = _build_standard_request(working_payload)
+        standard_request = _build_standard_request(working_payload, command_environment=command_environment)
         if preprocessed is not None:
             standard_request.attachments = preprocessed.attachments
             standard_request.uploaded_file_ids = preprocessed.uploaded_file_ids
@@ -260,7 +264,7 @@ async def anthropic_messages(request: Request):
         msg_id = f"msg_{uuid.uuid4().hex[:12]}"
         return standard_request, working_payload, model_name, qwen_model, prompt, msg_id
 
-    with request_context(req_id=req_id, surface="anthropic", requested_model=req_data.get("model", "claude-3-5-sonnet"), resolved_model="-"):
+    with request_context(req_id=req_id, surface="anthropic", requested_model=req_data.get("model", "claude-3-5-sonnet"), resolved_model="-", command_environment=command_environment_hint):
         if request.headers.get("x-debug-session-key"):
             pass
 

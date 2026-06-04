@@ -23,6 +23,7 @@ class ActiveRequestDiagnostic:
     path: str = "-"
     client: str = "-"
     status: str = "-"
+    command_environment: str = "-"
     updated_at: float = 0.0
 
 
@@ -94,6 +95,7 @@ def format_active_request_diagnostic(snapshot: ActiveRequestDiagnostic | None = 
         ("path", current.path),
         ("client", current.client),
         ("status", current.status),
+        ("command_environment", current.command_environment),
     )
     rendered = [f"{key}={value}" for key, value in items if value not in ("", "-", None)]
     return " ".join(rendered) if rendered else "-"
