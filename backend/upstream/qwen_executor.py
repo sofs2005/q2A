@@ -18,6 +18,11 @@ def _has_textual_tool_contract_marker(prompt: str) -> bool:
     return "##TOOL_CALL##" in prompt or "<|DSML|tool_calls>" in prompt
 
 
+def _is_waf_blocked_body(body: str) -> bool:
+    body_lower = str(body or "").lower()
+    return "aliyun_waf" in body_lower or "aliyun_waf_aa" in body_lower or "aliyun_waf_bb" in body_lower or "<!doctypehtml" in body_lower
+
+
 class QwenExecutor:
     def __init__(self, engine, account_pool):
         self.engine = engine
@@ -61,6 +66,8 @@ class QwenExecutor:
         body_text = r.get("body", "")
         if r["status"] != 200:
             body_lower = body_text.lower()
+            if _is_waf_blocked_body(body_text):
+                raise Exception(f"waf_blocked: create_chat HTTP {r['status']}: {body_text[:200]}")
             if (
                 r["status"] in (401, 403)
                 or "unauthorized" in body_lower
@@ -82,6 +89,8 @@ class QwenExecutor:
             return data["data"]["id"]
         except Exception as e:
             body_lower = body_text.lower()
+            if _is_waf_blocked_body(body_text):
+                raise Exception(f"waf_blocked: create_chat returned WAF page: {body_text[:200]}")
             if any(
                 kw in body_lower
                 for kw in (
@@ -290,6 +299,8 @@ class QwenExecutor:
                     exclude.add(acc.email)
                 elif "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
                     self.account_pool.mark_rate_limited(acc)
+                    exclude.add(acc.email)
+                elif "waf_blocked" in err_msg or "aliyun_waf" in err_msg:
                     exclude.add(acc.email)
                 elif "unauthorized" in err_msg or "401" in err_msg or "403" in err_msg:
                     self.account_pool.mark_invalid(acc)

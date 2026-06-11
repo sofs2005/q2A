@@ -63,6 +63,17 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer token-1")
         self.assertEqual(session.calls[0]["json"], {"memory": {"enable_memory": True}})
 
+    def test_build_headers_uses_account_cookies_without_dropping_authorization(self) -> None:
+        account = Account(email="alice@example.com", token="token-1", cookies="waf=ok; session=browser")
+        account.fingerprint_id = "chrome136_windows"
+
+        headers = QwenClient._build_headers(account=account, token=account.token)
+
+        fingerprint = fingerprint_for_account(account)
+        self.assertEqual(headers["User-Agent"], fingerprint.user_agent)
+        self.assertEqual(headers["Cookie"], "waf=ok; session=browser")
+        self.assertEqual(headers["Authorization"], "Bearer token-1")
+
 
 if __name__ == "__main__":
     unittest.main()

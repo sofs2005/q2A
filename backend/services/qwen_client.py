@@ -37,13 +37,17 @@ class QwenClient:
         extra_headers: dict[str, str] | None = None,
     ) -> dict[str, str]:
         fingerprint = fingerprint_for_account(account)
+        account_cookies = str(getattr(account, "cookies", "") or "").strip() if account is not None else ""
+        effective_cookies = cookies if cookies is not None else account_cookies or None
         headers = fingerprint.build_headers(
             token=token,
-            cookies=cookies,
+            cookies=effective_cookies,
             referer=referer,
             content_type=content_type,
             accept=accept,
         )
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         if extra_headers:
             headers.update(extra_headers)
         return headers
@@ -246,7 +250,7 @@ class QwenClient:
             token_res = await self._request_raw_json(
                 method,
                 path,
-                self._build_personalization_headers(account=account, token=token_value),
+                self._build_personalization_headers(account=account, token=token_value, cookies=""),
                 body,
                 timeout=request_timeout,
                 account=account,
