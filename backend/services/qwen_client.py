@@ -26,6 +26,15 @@ class QwenClient:
         self.executor = QwenExecutor(self, account_pool)
 
     @staticmethod
+    def _web_client_headers() -> dict[str, str]:
+        return {
+            "Version": "0.2.57",
+            "source": "web",
+            "X-Request-Id": str(uuid.uuid4()),
+            "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT%z", time.localtime()),
+        }
+
+    @staticmethod
     def _build_headers(
         *,
         account: Account | None = None,
@@ -46,6 +55,7 @@ class QwenClient:
             content_type=content_type,
             accept=accept,
         )
+        headers.update(QwenClient._web_client_headers())
         if token:
             headers["Authorization"] = f"Bearer {token}"
         if extra_headers:
@@ -59,12 +69,6 @@ class QwenClient:
             token=token,
             cookies=cookies,
             referer=f"{BASE_URL}/settings/chats",
-            extra_headers={
-                "Version": "0.2.57",
-                "source": "web",
-                "X-Request-Id": str(uuid.uuid4()),
-                "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT%z", time.localtime()),
-            },
         )
 
     @staticmethod
@@ -79,12 +83,6 @@ class QwenClient:
             token=token,
             cookies=cookies,
             referer=f"{BASE_URL}/settings/personalization",
-            extra_headers={
-                "Version": "0.2.57",
-                "source": "web",
-                "X-Request-Id": str(uuid.uuid4()),
-                "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT%z", time.localtime()),
-            },
         )
 
     @staticmethod
