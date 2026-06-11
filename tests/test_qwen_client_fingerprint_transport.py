@@ -88,6 +88,20 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("X-Request-Id", headers)
         self.assertIn("Timezone", headers)
 
+    def test_header_diagnostics_are_redacted(self) -> None:
+        account = Account(email="alice@example.com", token="token-1", cookies="waf=ok; session=browser")
+        account.fingerprint_id = "chrome136_windows"
+
+        headers = QwenClient._build_headers(account=account, token=account.token)
+        diagnostics = QwenClient._header_diagnostics(account=account, headers=headers)
+
+        self.assertTrue(diagnostics["has_cookie"])
+        self.assertTrue(diagnostics["has_authorization"])
+        self.assertEqual(diagnostics["cookie_names"], ["waf", "session"])
+        self.assertEqual(diagnostics["fingerprint_id"], "chrome136_windows")
+        self.assertNotIn("token-1", str(diagnostics))
+        self.assertNotIn("browser", str(diagnostics))
+
 
 if __name__ == "__main__":
     unittest.main()

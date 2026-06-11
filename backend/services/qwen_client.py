@@ -35,6 +35,28 @@ class QwenClient:
         }
 
     @staticmethod
+    def _header_diagnostics(*, account: Account | None, headers: dict[str, str]) -> dict[str, Any]:
+        fingerprint = fingerprint_for_account(account)
+        cookie_header = str(headers.get("Cookie", "") or "")
+        cookie_names = []
+        for part in cookie_header.split(";"):
+            name = part.strip().split("=", 1)[0].strip()
+            if name:
+                cookie_names.append(name)
+        return {
+            "email": getattr(account, "email", "") if account is not None else "",
+            "fingerprint_id": getattr(account, "fingerprint_id", "") if account is not None else fingerprint.id,
+            "impersonate": fingerprint.impersonate,
+            "has_cookie": bool(cookie_header),
+            "cookie_names": cookie_names,
+            "has_authorization": bool(headers.get("Authorization")),
+            "has_sec_ch_ua": bool(headers.get("sec-ch-ua")),
+            "user_agent_family": fingerprint.browser,
+            "version": headers.get("Version", ""),
+            "source": headers.get("source", ""),
+        }
+
+    @staticmethod
     def _build_headers(
         *,
         account: Account | None = None,
@@ -132,6 +154,7 @@ class QwenClient:
         request_timeout = timeout if timeout is not None else settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS
         headers = self._build_headers(account=account, token=token)
         session = await get_session(fingerprint_for_account(account))
+        log.info("[QwenClient] request_headers path=%s diag=%s", path, self._header_diagnostics(account=account, headers=headers))
         try:
             resp = await session.request(
                 method,
@@ -366,6 +389,12 @@ class QwenClient:
         dedicated_session = bool(getattr(settings, "QWEN_UPSTREAM_STREAM_DEDICATED_SESSION", True))
         session = new_session(fingerprint, timeout=timeout) if dedicated_session else await get_session(fingerprint)
         headers = self._build_headers(account=account, token=token, accept="text/event-stream")
+        log.info(
+            "[QwenClient] stream_headers chat_id=%s dedicated_session=%s diag=%s",
+            chat_id,
+            dedicated_session,
+            self._header_diagnostics(account=account, headers=headers),
+        )
         try:
             async with session.stream(
                 "POST",
