@@ -23,6 +23,13 @@ def _is_waf_blocked_body(body: str) -> bool:
     return "aliyun_waf" in body_lower or "aliyun_waf_aa" in body_lower or "aliyun_waf_bb" in body_lower or "<!doctypehtml" in body_lower
 
 
+def _preview_text(value: object, limit: int = 500) -> str:
+    text = str(value or "").replace("\r", "\\r").replace("\n", "\\n")
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
+
+
 class QwenExecutor:
     def __init__(self, engine, account_pool):
         self.engine = engine
@@ -132,6 +139,7 @@ class QwenExecutor:
         stream_chars = 0
         parsed_event_count = 0
         last_heartbeat_at = started_at
+        first_chunk_preview = ""
 
         feature_config = payload.get("messages", [{}])[0].get("feature_config", {})
         log.info(f"[Executor] stream start chat_id={chat_id} model={model} has_custom_tools={has_custom_tools}")
@@ -188,6 +196,8 @@ class QwenExecutor:
                     chunk = chunk_result["chunk"]
                     chunk_count += 1
                     stream_chars += len(chunk)
+                    if not first_chunk_preview:
+                        first_chunk_preview = _preview_text(chunk)
                     now = time.perf_counter()
                     if chunk_count % 100 == 0 or now - last_heartbeat_at >= 60:
                         last_heartbeat_at = now
@@ -230,6 +240,15 @@ class QwenExecutor:
                         f"[Executor] first parsed event after {(time.perf_counter() - started_at):.3f}s chat_id={chat_id}"
                     )
                 yield evt
+
+        if chunk_count > 0 and parsed_event_count == 0:
+            log.warning(
+                "[Executor] stream_unparsed_preview chat_id=%s chunks=%s chars=%s preview=%r",
+                chat_id,
+                chunk_count,
+                stream_chars,
+                first_chunk_preview,
+            )
 
         log.info(
             "[Executor] stream finish chat_id=%s total=%.3fs chunks=%s chars=%s parsed_events=%s",

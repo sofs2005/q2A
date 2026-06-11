@@ -320,6 +320,21 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(TimeoutError, "total timeout"):
             await asyncio.wait_for(consume_stream(), timeout=0.2)
 
+    async def test_executor_logs_preview_when_stream_chunks_do_not_parse(self) -> None:
+        class FakeEngine:
+            async def stream_chat_once(self, *_args, **_kwargs):
+                yield {"chunk": "upstream plain response without sse data"}
+
+        executor = QwenExecutor(FakeEngine(), account_pool=None)
+
+        with self.assertLogs("qwen2api.executor", level="WARNING") as logs:
+            events = [event async for event in executor.stream("tok", "chat-1", "qwen3.6-plus", "hello")]
+
+        self.assertEqual(events, [])
+        output = "\n".join(logs.output)
+        self.assertIn("stream_unparsed_preview", output)
+        self.assertIn("upstream plain response without sse data", output)
+
 
 if __name__ == "__main__":
     unittest.main()
