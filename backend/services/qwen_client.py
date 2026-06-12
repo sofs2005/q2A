@@ -6,6 +6,8 @@ import time
 import uuid
 from typing import Any, AsyncIterator
 
+import httpx
+
 from backend.core.account_pool import Account
 from backend.core.browser_fingerprint import fingerprint_for_account, get_session, new_session
 from backend.core.config import settings
@@ -113,15 +115,30 @@ class QwenClient:
 
     @staticmethod
     def _build_chat_transport_headers(*, account: Account | None = None, token: str | None = None, accept: str = "application/json, text/plain, */*") -> dict[str, str]:
-        cookies = ""
+        headers = {
+            "Authorization": f"Bearer {token}" if token else "",
+            "X-Request-Id": str(uuid.uuid4()),
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": accept,
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Referer": f"{BASE_URL}/",
+            "Origin": BASE_URL,
+            "Connection": "keep-alive",
+            "Content-Type": "application/json",
+            "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+        }
+        if not token:
+            headers.pop("Authorization", None)
         if bool(getattr(settings, "QWEN_CHAT_TRANSPORT_SEND_COOKIES", False)):
-            cookies = str(getattr(account, "cookies", "") or "").strip() or None
-        return QwenClient._build_headers(
-            account=account,
-            token=token,
-            cookies=cookies,
-            accept=accept,
-        )
+            cookies = str(getattr(account, "cookies", "") or "").strip()
+            if cookies:
+                headers["Cookie"] = cookies
+        return headers
 
     @staticmethod
     def _looks_like_upstream_auth_failure(status: int, body: str) -> bool:
@@ -402,10 +419,44 @@ class QwenClient:
 
     async def stream_chat_once(self, token: str, chat_id: str, payload: dict, account: Account | None = None) -> AsyncIterator[dict]:
         timeout = settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS
+        headers = self._build_chat_transport_headers(account=account, token=token, accept="text/event-stream")
+        if bool(getattr(settings, "QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP", True)):
+            log.info(
+                "[QwenClient] stream_headers chat_id=%s dedicated_session=%s diag=%s",
+                chat_id,
+                False,
+                self._header_diagnostics(account=account, headers=headers),
+            )
+            try:
+                async with httpx.AsyncClient(http2=False, follow_redirects=True, timeout=timeout) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
+                        headers=headers,
+                        json=payload,
+                        timeout=timeout,
+                    ) as resp:
+                        if resp.status_code != 200:
+                            body_chunks = []
+                            async for chunk in resp.aiter_bytes():
+                                body_chunks.append(chunk)
+                            body_text = b"".join(body_chunks).decode(errors="replace")[:2000]
+                            yield {"status": resp.status_code, "body": body_text}
+                            return
+
+                        async for chunk in resp.aiter_bytes():
+                            decoded = chunk.decode("utf-8", errors="replace")
+                            if decoded:
+                                yield {"chunk": decoded}
+                        yield {"status": "streamed"}
+            except Exception as e:
+                log.error(f"[QwenClient] stream_chat_once error: {e}")
+                yield {"status": 0, "body": str(e)}
+            return
+
         fingerprint = fingerprint_for_account(account)
         dedicated_session = bool(getattr(settings, "QWEN_UPSTREAM_STREAM_DEDICATED_SESSION", True))
         session = new_session(fingerprint, timeout=timeout) if dedicated_session else await get_session(fingerprint)
-        headers = self._build_chat_transport_headers(account=account, token=token, accept="text/event-stream")
         log.info(
             "[QwenClient] stream_headers chat_id=%s dedicated_session=%s diag=%s",
             chat_id,

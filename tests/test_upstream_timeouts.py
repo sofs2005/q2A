@@ -67,6 +67,7 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
             "QWEN_UPSTREAM_STREAM_DEDICATED_SESSION",
             None,
         )
+        self.original_go_like_http = getattr(settings, "QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP", None)
         browser_fingerprint._sessions.clear()
         browser_fingerprint._session_lock = None
 
@@ -90,6 +91,11 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 delattr(settings, "QWEN_UPSTREAM_STREAM_DEDICATED_SESSION")
         else:
             settings.QWEN_UPSTREAM_STREAM_DEDICATED_SESSION = self.original_stream_dedicated_session
+        if self.original_go_like_http is None:
+            if hasattr(settings, "QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP"):
+                delattr(settings, "QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP")
+        else:
+            settings.QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP = self.original_go_like_http
         browser_fingerprint._sessions.clear()
         browser_fingerprint._session_lock = None
 
@@ -269,6 +275,7 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
         settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS = 420.0
         settings.QWEN_UPSTREAM_STREAM_DEDICATED_SESSION = True
+        settings.QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP = False
         new_session = patch("backend.services.qwen_client.new_session", return_value=FakeSession())
         get_session = patch("backend.services.qwen_client.get_session", AsyncMock())
 

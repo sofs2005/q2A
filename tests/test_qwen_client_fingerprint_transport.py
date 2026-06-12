@@ -45,6 +45,38 @@ class _FakeSession:
         return _FakeResponse()
 
 
+class _FakeStreamResponse:
+    status_code = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def aiter_bytes(self):
+        yield b"data: {\"text\":\"ok\"}\n\n"
+
+
+class _FakeAsyncClient:
+    instances = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.calls = []
+        _FakeAsyncClient.instances.append(self)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def stream(self, method, url, headers=None, json=None, timeout=None):
+        self.calls.append({"method": method, "url": url, "headers": headers or {}, "json": json, "timeout": timeout})
+        return _FakeStreamResponse()
+
+
 class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_personalization_uses_account_fingerprint_session_and_headers(self) -> None:
         account = Account(email="alice@example.com", token="token-1")
@@ -83,6 +115,19 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Cookie", headers)
         self.assertEqual(headers["Authorization"], "Bearer token-1")
 
+    def test_build_chat_transport_headers_use_go_like_static_browser_headers(self) -> None:
+        account = Account(email="alice@example.com", token="token-1", cookies="waf=ok; session=browser")
+        account.fingerprint_id = "chrome136_windows"
+
+        headers = QwenClient._build_chat_transport_headers(account=account, token=account.token, accept="text/event-stream")
+
+        self.assertEqual(headers["Accept"], "text/event-stream")
+        self.assertEqual(headers["User-Agent"], "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        self.assertEqual(headers["sec-ch-ua"], '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"')
+        self.assertNotIn("Version", headers)
+        self.assertNotIn("source", headers)
+        self.assertNotIn("Timezone", headers)
+
     async def test_request_json_sends_web_client_headers_for_chat_requests(self) -> None:
         account = Account(email="alice@example.com", token="token-1")
         client = QwenClient(SimpleNamespace())
@@ -108,6 +153,22 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         headers = session.calls[0]["headers"]
         self.assertNotIn("Cookie", headers)
         self.assertEqual(headers["Authorization"], "Bearer token-1")
+
+    async def test_stream_chat_once_uses_go_like_http_transport_by_default(self) -> None:
+        account = Account(email="alice@example.com", token="token-1", cookies="waf=ok; session=browser")
+        client = QwenClient(SimpleNamespace())
+        _FakeAsyncClient.instances = []
+
+        with patch("backend.services.qwen_client.httpx.AsyncClient", _FakeAsyncClient), patch("backend.services.qwen_client.new_session") as new_session:
+            chunks = [item async for item in client.stream_chat_once(account.token, "chat-1", {"stream": True}, account=account)]
+
+        self.assertFalse(new_session.called)
+        self.assertEqual(chunks[-1], {"status": "streamed"})
+        self.assertEqual(_FakeAsyncClient.instances[0].kwargs["http2"], False)
+        call = _FakeAsyncClient.instances[0].calls[0]
+        self.assertEqual(call["method"], "POST")
+        self.assertIn("/api/v2/chat/completions?chat_id=chat-1", call["url"])
+        self.assertNotIn("Cookie", call["headers"])
 
     def test_header_diagnostics_are_redacted(self) -> None:
         account = Account(email="alice@example.com", token="token-1", cookies="waf=ok; session=browser")

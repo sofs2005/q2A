@@ -22,6 +22,8 @@ CUSTOM_TOOL_LOW_LATENCY_OVERRIDES = {
 
 def build_chat_payload(chat_id: str, model: str, content: str, has_custom_tools: bool = False, files: list[dict] | None = None) -> dict:
     ts = int(time.time())
+    fid = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
     feature_config = {
         **CUSTOM_TOOL_COMPAT_FEATURE_CONFIG,
         **(CUSTOM_TOOL_LOW_LATENCY_OVERRIDES if has_custom_tools else {}),
@@ -45,9 +47,9 @@ def build_chat_payload(chat_id: str, model: str, content: str, has_custom_tools:
         "parent_id": None,
         "messages": [
             {
-                "fid": str(uuid.uuid4()),
+                "fid": fid,
                 "parentId": None,
-                "childrenIds": [str(uuid.uuid4())],
+                "childrenIds": [child_id],
                 "role": "user",
                 "content": content,
                 "user_action": "chat",
