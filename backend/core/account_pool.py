@@ -409,6 +409,7 @@ class AccountPool:
 
             ready.sort(key=lambda a: (
                 a.inflight,
+                0 if str(getattr(a, "cookies", "") or "").strip() else 1,
                 a.last_request_started or 0.0,
                 a.last_used or 0.0,
                 a.email or "",

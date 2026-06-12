@@ -36,9 +36,20 @@ class ChatIDPool:
         self.client = client
         self.account_pool = account_pool
         self._items: dict[str, list[WarmChat]] = {}
-        self._desired: dict[str, tuple[str, str]] = {}
+        self._desired: dict[str, tuple[str, str]] = self._configured_desired_models()
         self._lock = asyncio.Lock()
         self._fill_task: asyncio.Task | None = None
+
+    def _configured_desired_models(self) -> dict[str, tuple[str, str]]:
+        desired: dict[str, tuple[str, str]] = {}
+        raw_models = str(getattr(settings, "CHAT_ID_PREWARM_MODELS", "") or "")
+        for raw_model in raw_models.split(","):
+            model = raw_model.strip()
+            if not model:
+                continue
+            chat_type = "t2t"
+            desired[f"{model}|{chat_type}"] = (model, chat_type)
+        return desired
 
     def enabled(self) -> bool:
         return int(getattr(settings, "CHAT_ID_PREWARM_TARGET_PER_ACCOUNT", 0) or 0) > 0
@@ -68,7 +79,6 @@ class ChatIDPool:
             else:
                 self._items.pop(key, None)
         log.info("[ChatIDPool] reused email=%s model=%s chat_type=%s chat_id=%s", email, model, normalize_chat_type(chat_type), item.chat_id)
-        self.trigger_fill()
         return item.chat_id, True
 
     def trigger_fill(self) -> None:
@@ -87,7 +97,15 @@ class ChatIDPool:
             desired = list(self._desired.values())
         if not desired:
             return
-        accounts = [acc for acc in getattr(self.account_pool, "accounts", []) if acc.is_available()]
+        now = time.time()
+        max_inflight = int(getattr(self.account_pool, "max_inflight", 1) or 1)
+        accounts = [
+            acc
+            for acc in getattr(self.account_pool, "accounts", [])
+            if acc.is_available()
+            and int(getattr(acc, "inflight", 0) or 0) < max_inflight
+            and float(getattr(acc, "next_available_at", lambda: 0.0)()) <= now
+        ]
         semaphore = asyncio.Semaphore(max_concurrency)
         tasks = []
         for acc in accounts:

@@ -121,6 +121,21 @@ class AccountPoolDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected.email, "a-first@example.com")
         self.assertEqual(pool.last_acquire_diagnostics["strategy"], "least_loaded")
 
+    async def test_acquire_prefers_cookie_account_for_equal_load_and_usage(self) -> None:
+        no_cookie = Account(email="a-no-cookie@example.com", token="token-1")
+        no_cookie.last_request_started = 10.0
+        no_cookie.last_used = 20.0
+        with_cookie = Account(email="z-cookie@example.com", token="token-2", cookies="aui=1; cna=2")
+        with_cookie.last_request_started = 10.0
+        with_cookie.last_used = 20.0
+        pool = self._pool(no_cookie, with_cookie)
+
+        with patch("backend.core.account_pool.time.time", return_value=100.0), patch("backend.core.account_pool._jitter_seconds", return_value=0.0):
+            selected = await pool.acquire()
+
+        self.assertEqual(selected.email, "z-cookie@example.com")
+        self.assertEqual(pool.last_acquire_diagnostics["strategy"], "least_loaded")
+
     async def test_acquire_preferred_records_preferred_and_fallback_diagnostics(self) -> None:
         preferred = Account(email="preferred@example.com")
         fallback = Account(email="fallback@example.com")
