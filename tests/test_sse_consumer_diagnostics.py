@@ -24,6 +24,20 @@ class SseConsumerDiagnosticsTests(unittest.TestCase):
         self.assertIn("non-json data line", "\n".join(logs.output))
         self.assertIn("upstream plain text response", "\n".join(logs.output))
 
+    def test_parses_plain_content_event_like_upstream_go_version(self) -> None:
+        chunk = 'data: {"content": "hello"}\n\n'
+
+        parsed = parse_sse_chunk(chunk)
+
+        self.assertEqual(parsed, [{"type": "delta", "phase": "answer", "content": "hello", "status": "", "extra": {}}])
+
+    def test_parses_nested_data_event_like_upstream_go_version(self) -> None:
+        chunk = 'data: {"data": {"answer": "hello"}}\n\n'
+
+        parsed = parse_sse_chunk(chunk)
+
+        self.assertEqual(parsed, [{"type": "delta", "phase": "answer", "content": "hello", "status": "", "extra": {}}])
+
 
 if __name__ == "__main__":
     unittest.main()

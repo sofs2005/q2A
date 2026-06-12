@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 
 from backend.core.config import settings
@@ -20,11 +21,22 @@ def _has_textual_tool_contract_marker(prompt: str) -> bool:
 
 def _is_waf_blocked_body(body: str) -> bool:
     body_lower = str(body or "").lower()
-    return "aliyun_waf" in body_lower or "aliyun_waf_aa" in body_lower or "aliyun_waf_bb" in body_lower or "<!doctypehtml" in body_lower
+    return (
+        "aliyun_waf" in body_lower
+        or "aliyun_waf_aa" in body_lower
+        or "aliyun_waf_bb" in body_lower
+        or "<!doctypehtml" in body_lower
+        or "fail_sys_user_validate" in body_lower
+        or "rgv587_error" in body_lower
+        or ("_____tmd_____" in body_lower and "captcha" in body_lower)
+        or ("/punish" in body_lower and "x5secdata" in body_lower)
+    )
 
 
 def _preview_text(value: object, limit: int = 500) -> str:
     text = str(value or "").replace("\r", "\\r").replace("\n", "\\n")
+    text = re.sub(r"(x5secdata=)[^&\s\"']+", r"\1<redacted>", text, flags=re.IGNORECASE)
+    text = re.sub(r"(pureCaptcha=)[^&\s\"']*", r"\1<redacted>", text, flags=re.IGNORECASE)
     if len(text) <= limit:
         return text
     return f"{text[:limit]}..."
@@ -194,6 +206,8 @@ class QwenExecutor:
 
                 if "chunk" in chunk_result:
                     chunk = chunk_result["chunk"]
+                    if _is_waf_blocked_body(chunk):
+                        raise Exception(f"waf_blocked: stream validation challenge: {_preview_text(chunk)}")
                     chunk_count += 1
                     stream_chars += len(chunk)
                     if not first_chunk_preview:

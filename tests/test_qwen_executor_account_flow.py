@@ -26,7 +26,7 @@ if "curl_cffi" not in sys.modules:
     sys.modules["curl_cffi.requests"] = fake_curl_cffi_requests
 
 from backend.core.account_pool import Account
-from backend.upstream.qwen_executor import QwenExecutor
+from backend.upstream.qwen_executor import QwenExecutor, _is_waf_blocked_body, _preview_text
 
 
 class _Pool:
@@ -122,6 +122,34 @@ class QwenExecutorAccountFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(pool.invalidated, [])
         self.assertEqual(pool.released, [account])
+
+    def test_qwen_validation_challenge_is_waf_blocked(self) -> None:
+        body = '{"ret":["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::SM::被挤爆啦"],"data":{"url":"https://chat.qwen.ai/api/v2/chat/completions/_____tmd_____/punish?x5secdata=secret&action=captcha"}}'
+
+        self.assertTrue(_is_waf_blocked_body(body))
+
+    def test_preview_redacts_qwen_challenge_tokens(self) -> None:
+        body = "punish?x5secdata=secret-value&action=captcha&pureCaptcha=secret-captcha"
+
+        preview = _preview_text(body)
+
+        self.assertIn("x5secdata=<redacted>", preview)
+        self.assertIn("pureCaptcha=<redacted>", preview)
+        self.assertNotIn("secret-value", preview)
+        self.assertNotIn("secret-captcha", preview)
+
+    async def test_stream_raises_waf_blocked_for_qwen_validation_challenge(self) -> None:
+        class FakeEngine:
+            async def stream_chat_once(self, *_args, **_kwargs):
+                yield {
+                    "chunk": '{"ret":["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::SM::被挤爆啦"],"data":{"url":"https://chat.qwen.ai/api/v2/chat/completions/_____tmd_____/punish?x5secdata=secret&action=captcha"}}'
+                }
+
+        executor = QwenExecutor(FakeEngine(), _Pool())
+
+        with self.assertRaisesRegex(Exception, "waf_blocked"):
+            async for _ in executor.stream("tok", "chat-1", "qwen3.7-plus", "hello"):
+                pass
 
 
 if __name__ == "__main__":

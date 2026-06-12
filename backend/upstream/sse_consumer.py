@@ -11,6 +11,52 @@ def _preview(value: object, limit: int = 300) -> str:
     return f"{text[:limit]}..."
 
 
+def _first_string(*values: object) -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def _parse_qwen_event(evt: dict) -> list[dict]:
+    if evt.get("choices"):
+        delta = evt["choices"][0].get("delta", {})
+        content = delta.get("content", "")
+
+        if content and "Tool" in content and "does not exist" in content:
+            log.warning(f"[SSE] Detected tool interception: content={content!r} phase={delta.get('phase')} status={delta.get('status')} extra={delta.get('extra')}")
+
+        return [
+            {
+                "type": "delta",
+                "phase": delta.get("phase", "answer"),
+                "content": content,
+                "status": delta.get("status", ""),
+                "extra": delta.get("extra", {}),
+            }
+        ]
+
+    parsed = []
+    content = _first_string(evt.get("content"), evt.get("answer"), evt.get("text"), evt.get("delta"))
+    status = _first_string(evt.get("status"))
+    event_type = _first_string(evt.get("event"), evt.get("type"), status)
+    if content or event_type:
+        parsed.append(
+            {
+                "type": event_type or "delta",
+                "phase": event_type or "answer",
+                "content": content,
+                "status": status,
+                "extra": {},
+            }
+        )
+    for key in ("data", "message"):
+        nested = evt.get(key)
+        if isinstance(nested, dict):
+            parsed.extend(_parse_qwen_event(nested))
+    return parsed
+
+
 def parse_sse_chunk(chunk: str) -> list[dict]:
     events = []
     data_lines = []
@@ -31,23 +77,7 @@ def parse_sse_chunk(chunk: str) -> list[dict]:
 
     parsed = []
     for evt in events:
-        if evt.get("choices"):
-            delta = evt["choices"][0].get("delta", {})
-            content = delta.get("content", "")
-
-            # Log if content contains "Tool" and "does not exist"
-            if content and "Tool" in content and "does not exist" in content:
-                log.warning(f"[SSE] Detected tool interception: content={content!r} phase={delta.get('phase')} status={delta.get('status')} extra={delta.get('extra')}")
-
-            parsed.append(
-                {
-                    "type": "delta",
-                    "phase": delta.get("phase", "answer"),
-                    "content": content,
-                    "status": delta.get("status", ""),
-                    "extra": delta.get("extra", {}),
-                }
-            )
+        parsed.extend(_parse_qwen_event(evt))
     if not parsed and data_lines:
         if invalid_data_lines:
             log.warning(
