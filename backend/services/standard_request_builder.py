@@ -12,6 +12,10 @@ from backend.toolcall.normalize import build_tool_name_registry
 
 SUBAGENT_COMMAND_ALIAS_NAMES = frozenset({"subagents"})
 SUBAGENT_EXECUTABLE_TOOL_NAMES = frozenset({"agents_list", "sessions_spawn"})
+NO_CLIENT_TOOLS_AUTHENTICITY_NOTICE = (
+    "[System]\n"
+    "Client-side tools are not available in this request. If the task requires file access, command execution, web access, browser actions, agents, skills, or artifact verification, do not claim that you performed those actions. Answer only from the supplied conversation context and clearly state any execution or verification that remains unavailable."
+)
 
 
 def _raw_declared_tool_names(req_data: dict) -> set[str]:
@@ -31,6 +35,23 @@ def _excluded_command_like_tool_names(req_data: dict) -> set[str] | None:
     if names & SUBAGENT_COMMAND_ALIAS_NAMES and names & SUBAGENT_EXECUTABLE_TOOL_NAMES:
         return set(SUBAGENT_COMMAND_ALIAS_NAMES)
     return None
+
+
+def _go_compatible_no_tool_prompt(prompt: str) -> str:
+    parts = [NO_CLIENT_TOOLS_AUTHENTICITY_NOTICE]
+    for block in str(prompt or "").split("\n\n"):
+        block = block.strip()
+        if not block or block == "Assistant:":
+            continue
+        if block.startswith("Human: "):
+            parts.append("[User]\n" + block[len("Human: "):])
+        elif block.startswith("Assistant: "):
+            parts.append("[Assistant]\n" + block[len("Assistant: "):])
+        elif block.startswith("System: "):
+            parts.append("[System]\n" + block[len("System: "):])
+        else:
+            parts.append(block)
+    return "\n\n".join(parts)
 
 
 def build_chat_standard_request(
@@ -60,8 +81,12 @@ def build_chat_standard_request(
     coding_intent = request_looks_like_coding_task(req_data, client_profile=effective_client_profile)
     tool_choice = normalize_tool_choice(normalized_payload.get("tool_choice"))
     tool_choice = enforce_declared_tool_choice(tool_choice, tool_names)
+    prompt = prompt_result.prompt
+    if not prompt_result.tool_enabled and surface == "openai":
+        prompt = _go_compatible_no_tool_prompt(prompt)
+
     return StandardRequest(
-        prompt=prompt_result.prompt,
+        prompt=prompt,
         response_model=requested_model,
         resolved_model=resolve_request_model(
             requested_model,

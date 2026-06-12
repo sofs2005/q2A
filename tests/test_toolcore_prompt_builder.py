@@ -13,6 +13,19 @@ from backend.toolcore.prompt_builder import _extract_text, _extract_user_text_on
 
 
 class ToolCorePromptBuilderTests(unittest.TestCase):
+    def test_standard_request_aligns_no_tool_chat_prompt_with_go_runtime(self) -> None:
+        result = build_chat_standard_request(
+            {"model": "qwen3.7-plus", "messages": [{"role": "user", "content": "在嘛"}], "tools": []},
+            default_model="qwen3.7-plus",
+            surface="openai",
+            client_profile=OPENCLAW_OPENAI_PROFILE,
+        )
+
+        self.assertFalse(result.tool_enabled)
+        self.assertIn("Client-side tools are not available in this request.", result.prompt)
+        self.assertIn("[User]\n在嘛", result.prompt)
+        self.assertNotIn("Human: 在嘛", result.prompt)
+
     def test_extract_user_text_only_joins_text_blocks(self) -> None:
         content = [
             {"type": "text", "text": "first"},
