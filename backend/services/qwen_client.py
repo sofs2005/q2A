@@ -10,6 +10,7 @@ from backend.core.account_pool import Account
 from backend.core.browser_fingerprint import fingerprint_for_account, get_session, new_session
 from backend.core.config import settings
 from backend.services.auth_resolver import BASE_URL, AuthResolver
+from backend.services.chat_id_pool import ChatIDPool
 from backend.upstream.payload_builder import build_chat_payload
 from backend.upstream.sse_consumer import parse_sse_chunk
 
@@ -20,6 +21,7 @@ class QwenClient:
     def __init__(self, account_pool):
         self.account_pool = account_pool
         self.auth_resolver = AuthResolver(account_pool) if account_pool is not None else None
+        self.chat_id_pool = ChatIDPool(self, account_pool) if account_pool is not None else None
         self.executor = None
         from backend.upstream.qwen_executor import QwenExecutor
 

@@ -41,6 +41,21 @@ install_stack_dump_handler(
 )
 log = logging.getLogger("qwen2api")
 
+
+async def chat_id_pool_loop(app: FastAPI):
+    chat_pool = getattr(app.state.qwen_client, "chat_id_pool", None)
+    if chat_pool is None:
+        return
+    while True:
+        try:
+            await chat_pool.cleanup(delete_all=False)
+            await chat_pool.fill()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("[ChatIDPool] loop failed: %s", exc)
+        await asyncio.sleep(max(5, int(getattr(settings, "CHAT_ID_PREWARM_TTL_SECONDS", 120) or 120) // 4))
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     with request_context(surface="startup"):
@@ -73,6 +88,7 @@ async def lifespan(app: FastAPI):
         await app.state.upstream_file_cache.load()
         asyncio.create_task(garbage_collect_chats(app))
         asyncio.create_task(context_cleanup_loop(app))
+        app.state.chat_id_pool_task = asyncio.create_task(chat_id_pool_loop(app))
 
         app.state.event_loop_watchdog_stop = asyncio.Event()
         app.state.event_loop_watchdog_task = None
@@ -99,6 +115,16 @@ async def lifespan(app: FastAPI):
                 await watchdog_task
             except asyncio.CancelledError:
                 pass
+        chat_pool_task = getattr(app.state, "chat_id_pool_task", None)
+        if chat_pool_task is not None:
+            chat_pool_task.cancel()
+            try:
+                await chat_pool_task
+            except asyncio.CancelledError:
+                pass
+        chat_pool = getattr(getattr(app.state, "qwen_client", None), "chat_id_pool", None)
+        if chat_pool is not None:
+            await chat_pool.cleanup(delete_all=True)
         await close_all_sessions()
 
 app = FastAPI(title="qwen2API Enterprise Gateway", version="v3.0.0（modified by softs2005）", lifespan=lifespan)

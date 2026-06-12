@@ -127,6 +127,17 @@ class QwenExecutor:
                 raise Exception(f"unauthorized: account issue: {body_text[:200]}")
             raise Exception(f"create_chat parse error: {e}, body={body_text[:200]}")
 
+    async def get_chat_id(self, acc, model: str, chat_type: str = "t2t") -> tuple[str, bool]:
+        chat_pool = getattr(self.engine, "chat_id_pool", None)
+        if chat_pool is not None:
+            await chat_pool.remember_model(model, chat_type)
+            chat_id, reused = await chat_pool.take(acc.email, model, chat_type)
+            if reused and chat_id:
+                return chat_id, True
+        if chat_type == "t2t":
+            return await self.create_chat(acc, model), False
+        return await self.create_chat(acc, model, chat_type=chat_type), False
+
     async def stream(
         self,
         account_or_token,
@@ -287,9 +298,9 @@ class QwenExecutor:
             acc = fixed_account
             try:
                 log.info(f"[Executor] using fixed account={acc.email} model={model}")
-                chat_id = await self.create_chat(acc, model)
+                chat_id, reused = await self.get_chat_id(acc, model)
                 update_request_context(chat_id=chat_id)
-                log.info(f"[Executor] created chat_id={chat_id} account={acc.email}")
+                log.info(f"[Executor] created chat_id={chat_id} account={acc.email} prewarmed={reused}")
                 yield {"type": "meta", "chat_id": chat_id, "acc": acc}
                 async for evt in self.stream(acc, chat_id, model, content, has_custom_tools, files=files):
                     yield {"type": "event", "event": evt}
@@ -309,9 +320,9 @@ class QwenExecutor:
 
             try:
                 log.info(f"[Executor] acquired account={acc.email} model={model} attempt={attempt + 1}")
-                chat_id = await self.create_chat(acc, model)
+                chat_id, reused = await self.get_chat_id(acc, model)
                 update_request_context(chat_id=chat_id)
-                log.info(f"[Executor] created chat_id={chat_id} account={acc.email}")
+                log.info(f"[Executor] created chat_id={chat_id} account={acc.email} prewarmed={reused}")
                 yield {"type": "meta", "chat_id": chat_id, "acc": acc}
 
                 async for evt in self.stream(acc, chat_id, model, content, has_custom_tools, files=files):

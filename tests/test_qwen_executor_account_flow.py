@@ -151,6 +151,23 @@ class QwenExecutorAccountFlowTests(unittest.IsolatedAsyncioTestCase):
             async for _ in executor.stream("tok", "chat-1", "qwen3.7-plus", "hello"):
                 pass
 
+    async def test_get_chat_id_reuses_prewarmed_chat_before_create_chat(self) -> None:
+        account = Account(email="alice@example.com", token="token-1")
+        chat_pool = SimpleNamespace(
+            remember_model=AsyncMock(),
+            take=AsyncMock(return_value=("warm-chat-1", True)),
+        )
+        executor = QwenExecutor(SimpleNamespace(chat_id_pool=chat_pool), _Pool())
+        executor.create_chat = AsyncMock(return_value="new-chat")
+
+        chat_id, reused = await executor.get_chat_id(account, "qwen3.7-plus")
+
+        self.assertEqual(chat_id, "warm-chat-1")
+        self.assertTrue(reused)
+        chat_pool.remember_model.assert_awaited_once_with("qwen3.7-plus", "t2t")
+        chat_pool.take.assert_awaited_once_with("alice@example.com", "qwen3.7-plus", "t2t")
+        executor.create_chat.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()
