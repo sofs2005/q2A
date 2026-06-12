@@ -52,8 +52,10 @@ class QwenClient:
             "has_cookie": bool(cookie_header),
             "cookie_names": cookie_names,
             "has_authorization": bool(headers.get("Authorization")),
+            "authorization_mode": "bearer" if headers.get("Authorization") else "none",
             "has_sec_ch_ua": bool(headers.get("sec-ch-ua")),
             "user_agent_family": fingerprint.browser,
+            "user_agent": headers.get("User-Agent", ""),
             "version": headers.get("Version", ""),
             "source": headers.get("source", ""),
         }
@@ -110,6 +112,18 @@ class QwenClient:
         )
 
     @staticmethod
+    def _build_chat_transport_headers(*, account: Account | None = None, token: str | None = None, accept: str = "application/json, text/plain, */*") -> dict[str, str]:
+        cookies = ""
+        if bool(getattr(settings, "QWEN_CHAT_TRANSPORT_SEND_COOKIES", False)):
+            cookies = str(getattr(account, "cookies", "") or "").strip() or None
+        return QwenClient._build_headers(
+            account=account,
+            token=token,
+            cookies=cookies,
+            accept=accept,
+        )
+
+    @staticmethod
     def _looks_like_upstream_auth_failure(status: int, body: str) -> bool:
         body_lower = (body or "").lower()
         return (
@@ -152,9 +166,10 @@ class QwenClient:
         body: dict | None = None,
         timeout: float | None = None,
         account: Account | None = None,
+        chat_transport: bool = False,
     ) -> dict:
         request_timeout = timeout if timeout is not None else settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS
-        headers = self._build_headers(account=account, token=token)
+        headers = self._build_chat_transport_headers(account=account, token=token) if chat_transport else self._build_headers(account=account, token=token)
         session = await get_session(fingerprint_for_account(account))
         log.info("[QwenClient] request_headers path=%s diag=%s", path, self._header_diagnostics(account=account, headers=headers))
         try:
@@ -390,7 +405,7 @@ class QwenClient:
         fingerprint = fingerprint_for_account(account)
         dedicated_session = bool(getattr(settings, "QWEN_UPSTREAM_STREAM_DEDICATED_SESSION", True))
         session = new_session(fingerprint, timeout=timeout) if dedicated_session else await get_session(fingerprint)
-        headers = self._build_headers(account=account, token=token, accept="text/event-stream")
+        headers = self._build_chat_transport_headers(account=account, token=token, accept="text/event-stream")
         log.info(
             "[QwenClient] stream_headers chat_id=%s dedicated_session=%s diag=%s",
             chat_id,

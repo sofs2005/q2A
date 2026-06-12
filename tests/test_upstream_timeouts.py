@@ -97,9 +97,10 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
         captured = {}
 
         class FakeEngine:
-            async def _request_json(self, method, path, token, body, timeout, account=None):
+            async def _request_json(self, method, path, token, body, timeout, account=None, chat_transport=False):
                 del method, path, token, body, account
                 captured["timeout"] = timeout
+                captured["chat_transport"] = chat_transport
                 return {"status": 200, "body": '{"success": true, "data": {"id": "chat-1"}}'}
 
         settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS = 75.0
@@ -109,6 +110,7 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(chat_id, "chat-1")
         self.assertEqual(captured["timeout"], 75.0)
+        self.assertTrue(captured["chat_transport"])
 
     async def test_fingerprint_session_uses_configured_upstream_stream_timeout(self) -> None:
         captured = {}

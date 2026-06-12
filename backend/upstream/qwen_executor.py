@@ -79,6 +79,7 @@ class QwenExecutor:
                 body,
                 timeout=settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS,
                 account=account,
+                chat_transport=True,
             )
         else:
             r = await request_fn("POST", "/api/v2/chats/new", token, body)

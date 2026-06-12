@@ -74,6 +74,15 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers["Cookie"], "waf=ok; session=browser")
         self.assertEqual(headers["Authorization"], "Bearer token-1")
 
+    def test_build_chat_transport_headers_default_to_token_only(self) -> None:
+        account = Account(email="alice@example.com", token="token-1", cookies="waf=ok; session=browser")
+        account.fingerprint_id = "chrome136_windows"
+
+        headers = QwenClient._build_chat_transport_headers(account=account, token=account.token)
+
+        self.assertNotIn("Cookie", headers)
+        self.assertEqual(headers["Authorization"], "Bearer token-1")
+
     async def test_request_json_sends_web_client_headers_for_chat_requests(self) -> None:
         account = Account(email="alice@example.com", token="token-1")
         client = QwenClient(SimpleNamespace())
@@ -87,6 +96,18 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers["source"], "web")
         self.assertIn("X-Request-Id", headers)
         self.assertIn("Timezone", headers)
+
+    async def test_request_json_omits_cookie_for_chat_transport(self) -> None:
+        account = Account(email="alice@example.com", token="token-1", cookies="waf=ok; session=browser")
+        client = QwenClient(SimpleNamespace())
+        session = _FakeSession()
+
+        with patch("backend.services.qwen_client.get_session", AsyncMock(return_value=session)):
+            await client._request_json("POST", "/api/v2/chats/new", account.token, {}, account=account, chat_transport=True)
+
+        headers = session.calls[0]["headers"]
+        self.assertNotIn("Cookie", headers)
+        self.assertEqual(headers["Authorization"], "Bearer token-1")
 
     def test_header_diagnostics_are_redacted(self) -> None:
         account = Account(email="alice@example.com", token="token-1", cookies="waf=ok; session=browser")
