@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from dataclasses import dataclass
@@ -116,8 +117,18 @@ class ChatIDPool:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    @staticmethod
+    def _jitter_seconds(email: str, model: str, chat_type: str) -> float:
+        """基于 email+model+chat_type 哈希的确定性抖动延迟（0~2s），分散预热请求脉冲。"""
+        key = f"{str(email or '').strip().lower()}|{str(model or '').strip()}|{normalize_chat_type(chat_type)}"
+        digest = hashlib.sha256(key.encode("utf-8", errors="ignore")).hexdigest()
+        return (int(digest, 16) % 2000) / 1000.0
+
     async def _create_warm_chat(self, semaphore: asyncio.Semaphore, acc, model: str, chat_type: str) -> None:
         async with semaphore:
+            jitter = self._jitter_seconds(getattr(acc, "email", ""), model, chat_type)
+            if jitter > 0:
+                await asyncio.sleep(jitter)
             try:
                 chat_id = await self.client.executor.create_chat(acc, model, chat_type=chat_type)
             except Exception as exc:
