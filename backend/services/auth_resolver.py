@@ -114,6 +114,18 @@ class AuthResolver:
         acc.activation_pending = False
         acc.status_code = "valid"
         acc.last_error = ""
+
+        # 自动捕获 acw_tc WAF cookie（登录响应 Set-Cookie）
+        import time as _time
+        acw_tc = resp.cookies.get("acw_tc", "")
+        if acw_tc:
+            acc.waf_cookies = f"acw_tc={acw_tc}"
+            acc.waf_cookies_expires_at = _time.time() + 1500
+            log.info(f"[Refresh] {acc.email} acw_tc 已同步刷新")
+        else:
+            # 登录没返回 acw_tc，标记过期让下次请求自动获取
+            acc.waf_cookies_expires_at = 0
+
         await self.pool.save()
         log.info(f"[Refresh] {acc.email} token 已更新")
         return True

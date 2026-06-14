@@ -48,6 +48,8 @@ class Account:
         self.consecutive_failures = int(kwargs.get("consecutive_failures", 0) or 0)
         self.rate_limit_strikes = int(kwargs.get("rate_limit_strikes", 0) or 0)
         self.fingerprint_id = str(kwargs.get("fingerprint_id", "") or "").strip()
+        self.waf_cookies = str(kwargs.get("waf_cookies", "") or "").strip()
+        self.waf_cookies_expires_at = float(kwargs.get("waf_cookies_expires_at", 0) or 0)
 
     def is_rate_limited(self) -> bool:
         return self.rate_limited_until > time.time()

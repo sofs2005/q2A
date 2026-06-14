@@ -36,6 +36,7 @@ class QwenClient:
             "source": "web",
             "X-Request-Id": str(uuid.uuid4()),
             "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT%z", time.localtime()),
+            "X-Accel-Buffering": "no",
         }
 
     @staticmethod
@@ -132,6 +133,7 @@ class QwenClient:
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
         }
+        headers.update(QwenClient._web_client_headers())
         if not token:
             headers.pop("Authorization", None)
         if bool(getattr(settings, "QWEN_CHAT_TRANSPORT_SEND_COOKIES", False)):

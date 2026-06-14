@@ -124,9 +124,11 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers["Accept"], "text/event-stream")
         self.assertEqual(headers["User-Agent"], "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         self.assertEqual(headers["sec-ch-ua"], '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"')
-        self.assertNotIn("Version", headers)
-        self.assertNotIn("source", headers)
-        self.assertNotIn("Timezone", headers)
+        # Chat transport now includes web client headers for WAF bypass
+        self.assertIn("Version", headers)
+        self.assertIn("source", headers)
+        self.assertIn("Timezone", headers)
+        self.assertEqual(headers["X-Accel-Buffering"], "no")
 
     async def test_request_json_sends_web_client_headers_for_chat_requests(self) -> None:
         account = Account(email="alice@example.com", token="token-1")
@@ -170,6 +172,33 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/api/v2/chat/completions?chat_id=chat-1", call["url"])
         self.assertNotIn("Cookie", call["headers"])
 
+    async def test_refresh_token_captures_acw_tc_cookie(self) -> None:
+        """auth_resolver.refresh_token should capture acw_tc from login response Set-Cookie."""
+        from backend.services.auth_resolver import AuthResolver
+        from backend.core.account_pool import Account, AccountPool
+
+        account = Account(email="test@example.com", password="pass123", token="old-token")
+        pool = SimpleNamespace(save=AsyncMock())
+
+        resolver = AuthResolver(pool)
+
+        fake_resp = SimpleNamespace(
+            status_code=200,
+            cookies={"acw_tc": "captured-acw-tc-value"},
+            json=lambda: {"token": "new-token-xyz"},
+        )
+
+        fake_session = AsyncMock()
+        fake_session.post = AsyncMock(return_value=fake_resp)
+
+        with patch("backend.services.auth_resolver.get_session", AsyncMock(return_value=fake_session)):
+            result = await resolver.refresh_token(account)
+
+        self.assertTrue(result)
+        self.assertEqual(account.token, "new-token-xyz")
+        self.assertIn("acw_tc=captured-acw-tc-value", getattr(account, "waf_cookies", ""))
+        self.assertGreater(getattr(account, "waf_cookies_expires_at", 0), 0)
+
     def test_header_diagnostics_are_redacted(self) -> None:
         account = Account(email="alice@example.com", token="token-1", cookies="waf=ok; session=browser")
         account.fingerprint_id = "chrome136_windows"
@@ -183,6 +212,23 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diagnostics["fingerprint_id"], "chrome136_windows")
         self.assertNotIn("token-1", str(diagnostics))
         self.assertNotIn("browser", str(diagnostics))
+
+    def test_web_client_headers_include_x_accel_buffering(self) -> None:
+        headers = QwenClient._web_client_headers()
+        self.assertEqual(headers["X-Accel-Buffering"], "no")
+        self.assertIn("Version", headers)
+        self.assertIn("source", headers)
+        self.assertIn("X-Request-Id", headers)
+        self.assertIn("Timezone", headers)
+
+    def test_build_chat_transport_headers_include_web_client_headers(self) -> None:
+        account = Account(email="alice@example.com", token="token-1")
+        headers = QwenClient._build_chat_transport_headers(account=account, token=account.token)
+        self.assertEqual(headers["X-Accel-Buffering"], "no")
+        self.assertIn("Version", headers)
+        self.assertEqual(headers["source"], "web")
+        self.assertIn("X-Request-Id", headers)
+        self.assertIn("Timezone", headers)
 
 
 if __name__ == "__main__":
