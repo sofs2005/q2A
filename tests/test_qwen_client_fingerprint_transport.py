@@ -172,6 +172,65 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/api/v2/chat/completions?chat_id=chat-1", call["url"])
         self.assertNotIn("Cookie", call["headers"])
 
+    def test_build_chat_transport_headers_injects_valid_waf_cookie(self) -> None:
+        """有效的 waf_cookies(acw_tc) 应注入 stream 请求，且不受 SEND_COOKIES 开关限制。"""
+        import time as _t
+
+        account = Account(email="alice@example.com", token="token-1")
+        account.fingerprint_id = "chrome136_windows"
+        account.waf_cookies = "acw_tc=abc123"
+        account.waf_cookies_expires_at = _t.time() + 600
+
+        headers = QwenClient._build_chat_transport_headers(account=account, token=account.token)
+
+        self.assertIn("acw_tc=abc123", headers.get("Cookie", ""))
+
+    def test_build_chat_transport_headers_skips_expired_waf_cookie(self) -> None:
+        """过期的 waf_cookies 不应注入。"""
+        import time as _t
+
+        account = Account(email="alice@example.com", token="token-1")
+        account.fingerprint_id = "chrome136_windows"
+        account.waf_cookies = "acw_tc=stale"
+        account.waf_cookies_expires_at = _t.time() - 10
+
+        headers = QwenClient._build_chat_transport_headers(account=account, token=account.token)
+
+        self.assertNotIn("Cookie", headers)
+
+    def test_build_headers_merges_waf_cookie_with_account_cookies(self) -> None:
+        """通用 header 应把 acw_tc 与账号 cookie 合并。"""
+        import time as _t
+
+        account = Account(email="alice@example.com", token="token-1", cookies="cna=xyz; session=browser")
+        account.fingerprint_id = "chrome136_windows"
+        account.waf_cookies = "acw_tc=abc123"
+        account.waf_cookies_expires_at = _t.time() + 600
+
+        headers = QwenClient._build_headers(account=account, token=account.token)
+
+        cookie = headers["Cookie"]
+        self.assertIn("acw_tc=abc123", cookie)
+        self.assertIn("cna=xyz", cookie)
+        self.assertIn("session=browser", cookie)
+
+    def test_build_headers_dedupes_acw_tc_preferring_waf_cookie(self) -> None:
+        """account.cookies 与 waf_cookies 同时含 acw_tc 时去重，保留 waf_cookies 的新值。"""
+        import time as _t
+
+        account = Account(email="alice@example.com", token="token-1", cookies="acw_tc=old; cna=xyz")
+        account.fingerprint_id = "chrome136_windows"
+        account.waf_cookies = "acw_tc=fresh"
+        account.waf_cookies_expires_at = _t.time() + 600
+
+        headers = QwenClient._build_headers(account=account, token=account.token)
+
+        cookie = headers["Cookie"]
+        self.assertEqual(cookie.count("acw_tc="), 1)
+        self.assertIn("acw_tc=fresh", cookie)
+        self.assertNotIn("acw_tc=old", cookie)
+        self.assertIn("cna=xyz", cookie)
+
     async def test_refresh_token_captures_acw_tc_cookie(self) -> None:
         """auth_resolver.refresh_token should capture acw_tc from login response Set-Cookie."""
         from backend.services.auth_resolver import AuthResolver

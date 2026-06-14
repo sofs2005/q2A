@@ -40,6 +40,34 @@ class QwenClient:
         }
 
     @staticmethod
+    def _valid_waf_cookie(account: Account | None) -> str:
+        """返回账号未过期的 WAF cookie（acw_tc），过期或缺失则返回空串。"""
+        if account is None:
+            return ""
+        waf = str(getattr(account, "waf_cookies", "") or "").strip()
+        if not waf:
+            return ""
+        expires = float(getattr(account, "waf_cookies_expires_at", 0) or 0)
+        if expires and expires <= time.time():
+            return ""
+        return waf
+
+    @staticmethod
+    def _merge_cookie_header(*cookie_strings: str) -> str:
+        """按 cookie 名合并多个 cookie 串并去重，靠后的同名值覆盖靠前的。"""
+        merged: dict[str, str] = {}
+        for cookie_string in cookie_strings:
+            for part in str(cookie_string or "").split(";"):
+                part = part.strip()
+                if not part or "=" not in part:
+                    continue
+                name, value = part.split("=", 1)
+                name = name.strip()
+                if name:
+                    merged[name] = value.strip()
+        return "; ".join(f"{name}={value}" for name, value in merged.items())
+
+    @staticmethod
     def _header_diagnostics(*, account: Account | None, headers: dict[str, str]) -> dict[str, Any]:
         fingerprint = fingerprint_for_account(account)
         cookie_header = str(headers.get("Cookie", "") or "")
@@ -76,7 +104,9 @@ class QwenClient:
     ) -> dict[str, str]:
         fingerprint = fingerprint_for_account(account)
         account_cookies = str(getattr(account, "cookies", "") or "").strip() if account is not None else ""
-        effective_cookies = cookies if cookies is not None else account_cookies or None
+        base_cookies = cookies if cookies is not None else account_cookies
+        # acw_tc 等 WAF cookie 始终合并注入，绕过阿里风控接入层
+        effective_cookies = QwenClient._merge_cookie_header(base_cookies, QwenClient._valid_waf_cookie(account)) or None
         headers = fingerprint.build_headers(
             token=token,
             cookies=effective_cookies,
@@ -136,10 +166,19 @@ class QwenClient:
         headers.update(QwenClient._web_client_headers())
         if not token:
             headers.pop("Authorization", None)
+        cookie_parts: list[str] = []
+        # 登录态 cookie 仍受开关控制
         if bool(getattr(settings, "QWEN_CHAT_TRANSPORT_SEND_COOKIES", False)):
-            cookies = str(getattr(account, "cookies", "") or "").strip()
-            if cookies:
-                headers["Cookie"] = cookies
+            account_cookies = str(getattr(account, "cookies", "") or "").strip()
+            if account_cookies:
+                cookie_parts.append(account_cookies)
+        # acw_tc 等 WAF cookie 不受开关限制，始终注入以绕过阿里风控
+        waf_cookie = QwenClient._valid_waf_cookie(account)
+        if waf_cookie:
+            cookie_parts.append(waf_cookie)
+        merged_cookie = QwenClient._merge_cookie_header(*cookie_parts)
+        if merged_cookie:
+            headers["Cookie"] = merged_cookie
         return headers
 
     @staticmethod

@@ -109,6 +109,7 @@ class QwenExecutorAccountFlowTests(unittest.IsolatedAsyncioTestCase):
         account = Account(email="alice@example.com", token="token-1")
         pool = _RetryPool(account)
         executor = QwenExecutor(SimpleNamespace(), pool)
+        executor.auth_resolver.auto_heal_account = AsyncMock()
 
         async def fake_create_chat(acc, model, chat_type="t2t"):
             raise Exception("waf_blocked: aliyun_waf_aa")
@@ -122,6 +123,31 @@ class QwenExecutorAccountFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(pool.invalidated, [])
         self.assertEqual(pool.released, [account])
+
+    async def test_retry_refreshes_waf_cookie_on_waf_blocked(self) -> None:
+        """WAF 命中时应标记该账号 acw_tc 失效并后台触发刷新。"""
+        import asyncio
+
+        account = Account(email="alice@example.com", token="token-1")
+        account.waf_cookies = "acw_tc=stale"
+        account.waf_cookies_expires_at = 9999999999.0
+        pool = _RetryPool(account)
+        executor = QwenExecutor(SimpleNamespace(), pool)
+        executor.auth_resolver.auto_heal_account = AsyncMock()
+
+        async def fake_create_chat(acc, model, chat_type="t2t"):
+            raise Exception("waf_blocked: stream validation challenge")
+
+        executor.create_chat = fake_create_chat
+
+        with patch("backend.upstream.qwen_executor.settings.MAX_RETRIES", 1):
+            with self.assertRaisesRegex(Exception, "All 1 attempts failed"):
+                async for _ in executor.chat_stream_events_with_retry("qwen3.7-plus", "hello"):
+                    pass
+
+        await asyncio.sleep(0)
+        executor.auth_resolver.auto_heal_account.assert_called_once_with(account)
+        self.assertEqual(account.waf_cookies_expires_at, 0)
 
     def test_qwen_validation_challenge_is_waf_blocked(self) -> None:
         body = '{"ret":["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::SM::被挤爆啦"],"data":{"url":"https://chat.qwen.ai/api/v2/chat/completions/_____tmd_____/punish?x5secdata=secret&action=captcha"}}'

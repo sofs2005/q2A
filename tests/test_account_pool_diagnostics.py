@@ -222,6 +222,23 @@ class AccountPoolDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(account.activation_pending)
         self.assertIs(selected, account)
 
+    def test_to_dict_persists_waf_cookies_for_round_trip(self) -> None:
+        """to_dict 必须序列化 waf_cookies/expires_at，否则落盘后 acw_tc 丢失。"""
+        account = Account(email="waf@example.com", token="tok")
+        account.waf_cookies = "acw_tc=persist-me"
+        account.waf_cookies_expires_at = 1234567890.0
+
+        payload = account.to_dict()
+
+        self.assertIn("waf_cookies", payload)
+        self.assertIn("waf_cookies_expires_at", payload)
+        self.assertEqual(payload["waf_cookies"], "acw_tc=persist-me")
+        self.assertEqual(payload["waf_cookies_expires_at"], 1234567890.0)
+
+        restored = Account(**payload)
+        self.assertEqual(restored.waf_cookies, "acw_tc=persist-me")
+        self.assertEqual(restored.waf_cookies_expires_at, 1234567890.0)
+
 
 if __name__ == "__main__":
     unittest.main()

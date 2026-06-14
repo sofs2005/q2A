@@ -42,6 +42,7 @@ class _FakeResponse:
         self.status_code = status_code
         self._payload = payload
         self.text = text
+        self.cookies = {}
 
     def json(self):
         if self._payload is None:

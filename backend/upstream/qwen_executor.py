@@ -347,6 +347,10 @@ class QwenExecutor:
                     exclude.add(acc.email)
                 elif "waf_blocked" in err_msg or "aliyun_waf" in err_msg:
                     exclude.add(acc.email)
+                    # WAF 命中：标记该账号 acw_tc 失效并后台刷新，为后续请求恢复风控 cookie
+                    acc.waf_cookies_expires_at = 0
+                    if self.auth_resolver is not None:
+                        asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
                 elif "unauthorized" in err_msg or "401" in err_msg or "403" in err_msg:
                     self.account_pool.mark_invalid(acc)
                     exclude.add(acc.email)

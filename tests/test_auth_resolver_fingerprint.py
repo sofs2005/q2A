@@ -37,6 +37,7 @@ class _DummyPool:
 class _FakeResponse:
     def __init__(self):
         self.status_code = 200
+        self.cookies = {}
 
     def json(self):
         return {"token": "new-token"}

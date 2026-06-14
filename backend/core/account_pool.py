@@ -105,6 +105,8 @@ class Account:
             "consecutive_failures": self.consecutive_failures,
             "rate_limit_strikes": self.rate_limit_strikes,
             "fingerprint_id": self.fingerprint_id,
+            "waf_cookies": self.waf_cookies,
+            "waf_cookies_expires_at": self.waf_cookies_expires_at,
         }
 
 
