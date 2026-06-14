@@ -512,13 +512,13 @@ async def delete_account(email: str, request: Request):
 @router.get("/settings", dependencies=[Depends(verify_admin)])
 async def get_settings():
     from backend.core.config import MODEL_MAP
-    # 从 settings.py 所在的同级导入 VERSION，避免循环导入或未定义报错
-    from backend.core.config import settings as backend_settings
+    # 版本标签统一从 config 的单一来源导入，避免多处硬编码漂移
+    from backend.core.config import settings as backend_settings, VERSION_LABEL
 
     # 强制将 dict 转换，确保能被 JSON 序列化
     safe_map = {k: v for k, v in MODEL_MAP.items()}
     return {
-        "version": "v3.0.0（modified by softs2005）",
+        "version": VERSION_LABEL,
         "max_inflight_per_account": backend_settings.MAX_INFLIGHT_PER_ACCOUNT,
         "model_aliases": safe_map
     }

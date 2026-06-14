@@ -239,6 +239,63 @@ class AccountPoolDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.waf_cookies, "acw_tc=persist-me")
         self.assertEqual(restored.waf_cookies_expires_at, 1234567890.0)
 
+    def test_file_upload_blocked_state_is_independent_from_chat_rate_limit(self) -> None:
+        """上传超限状态独立于 chat 限流：上传被封的号 chat 仍可用。"""
+        account = Account(email="up@example.com", token="tok")
+        account.file_upload_blocked_until = 200.0
+
+        with patch("backend.core.account_pool.time.time", return_value=100.0):
+            self.assertTrue(account.is_file_upload_blocked())
+            self.assertFalse(account.is_rate_limited())
+            self.assertTrue(account.is_available())
+
+    def test_to_dict_persists_file_upload_blocked_until_for_round_trip(self) -> None:
+        """to_dict 必须序列化 file_upload_blocked_until，否则落盘后上传限额丢失。"""
+        account = Account(email="up@example.com", token="tok")
+        account.file_upload_blocked_until = 1234567890.0
+
+        payload = account.to_dict()
+
+        self.assertIn("file_upload_blocked_until", payload)
+        self.assertEqual(payload["file_upload_blocked_until"], 1234567890.0)
+
+        restored = Account(**payload)
+        self.assertEqual(restored.file_upload_blocked_until, 1234567890.0)
+
+    def test_mark_file_upload_limited_sets_block_window(self) -> None:
+        """标记上传超限后，在 retry_after 秒内该号 is_file_upload_blocked。"""
+        account = Account(email="up@example.com", token="tok")
+        pool = self._pool(account)
+
+        with patch("backend.core.account_pool.time.time", return_value=100.0):
+            pool.mark_file_upload_limited(account, 3600)
+            self.assertTrue(account.is_file_upload_blocked())
+            self.assertEqual(account.file_upload_blocked_until, 3700.0)
+
+    def test_mark_file_upload_limited_keeps_chat_available(self) -> None:
+        """上传超限不影响 chat：该号仍 is_available、未 rate_limited。"""
+        account = Account(email="up@example.com", token="tok")
+        pool = self._pool(account)
+
+        with patch("backend.core.account_pool.time.time", return_value=100.0):
+            pool.mark_file_upload_limited(account, 3600)
+            self.assertFalse(account.is_rate_limited())
+            self.assertTrue(account.is_available())
+
+    def test_file_upload_blocked_emails_returns_only_currently_blocked(self) -> None:
+        """blocked_emails 只返回当前仍超限的号，过期/未超限的不返回。"""
+        blocked = Account(email="blocked@example.com", token="t1")
+        blocked.file_upload_blocked_until = 200.0
+        ready = Account(email="ready@example.com", token="t2")
+        expired = Account(email="expired@example.com", token="t3")
+        expired.file_upload_blocked_until = 50.0
+        pool = self._pool(blocked, ready, expired)
+
+        with patch("backend.core.account_pool.time.time", return_value=100.0):
+            emails = pool.file_upload_blocked_emails()
+
+        self.assertEqual(emails, {"blocked@example.com"})
+
 
 if __name__ == "__main__":
     unittest.main()

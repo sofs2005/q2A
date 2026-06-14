@@ -104,7 +104,9 @@ def save_api_keys(keys: set):
 # 在内存中存储管理的 API Keys
 API_KEYS = load_api_keys()
 
-VERSION = "2.0.0"
+VERSION = "3.0.1"
+# 对外展示用的版本标签，统一从 VERSION 派生，避免多处硬编码漂移
+VERSION_LABEL = f"v{VERSION}（modified by softs2005）"
 
 settings = Settings()
 

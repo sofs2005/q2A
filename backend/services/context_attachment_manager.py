@@ -10,6 +10,7 @@ from backend.core.upstream_file_cache import UpstreamFileCacheEntry
 from backend.services.client_profiles import user_role_system_text
 from backend.services.token_calc import count_tokens
 from backend.services.standard_request_builder import _excluded_command_like_tool_names
+from backend.services.upstream_file_uploader import FileUploadRateLimitedError
 from backend.toolcore.context_offload import SYSTEM_CONTEXT_FILE_PREFIX, SYSTEM_CONTEXT_PROMPT_NOTE
 from backend.toolcore.request_normalizer import normalize_chat_request, to_prompt_payload
 
@@ -31,6 +32,14 @@ def _is_retryable_attachment_upload_error(exc: Exception) -> bool:
         "timeout",
     )
     return any(marker in lowered for marker in markers)
+
+
+def _upload_account_excludes(account_pool) -> set:
+    """已知文件上传超限的账号邮箱集合；旧账号池无此方法时返回空集。"""
+    getter = getattr(account_pool, "file_upload_blocked_emails", None)
+    if callable(getter):
+        return set(getter() or ())
+    return set()
 
 
 def _text_from_content(content: Any) -> str:
@@ -180,10 +189,17 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
     requires_sticky_account = bool(manual_attachments or payload.get("upstream_files"))
     record = await affinity.get(session_key) if requires_sticky_account else None
     preferred_email = record.account_email if record else None
+    upload_excludes = _upload_account_excludes(account_pool)
     if preferred_email:
-        acc = await account_pool.acquire_wait_preferred(preferred_email, timeout=60)
+        preferred_kwargs: dict[str, Any] = {"timeout": 60}
+        if upload_excludes:
+            preferred_kwargs["exclude"] = set(upload_excludes)
+        acc = await account_pool.acquire_wait_preferred(preferred_email, **preferred_kwargs)
     else:
-        acc = await account_pool.acquire_wait(timeout=60)
+        acquire_kwargs: dict[str, Any] = {"timeout": 60}
+        if upload_excludes:
+            acquire_kwargs["exclude"] = set(upload_excludes)
+        acc = await account_pool.acquire_wait(**acquire_kwargs)
     if not acc:
         log.warning(
             "[ContextAttachment] no upstream account available; falling back inline session_key=%s surface=%s manual_attachments=%s generated_files=%s",
@@ -208,26 +224,74 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
     upstream_files = list(payload.get("upstream_files", []) or [])
     local_file_records: list[dict[str, Any]] = []
     context_attachment_tokens = 0
+    attachment_ttl = context_offloader.settings.CONTEXT_ATTACHMENT_TTL_SECONDS
 
     async def _switch_account_on_retry(current_acc, upload_exc: Exception):
         if not _is_retryable_attachment_upload_error(upload_exc):
             raise upload_exc
 
-        exclude = {getattr(current_acc, "email", None)}
         account_pool.release(current_acc)
+        exclude = set(upload_excludes)
+        current_email = getattr(current_acc, "email", None)
+        if current_email:
+            exclude.add(current_email)
         next_acc = await account_pool.acquire_wait(timeout=10, exclude=exclude)
         if not next_acc:
             raise upload_exc
-        await affinity.bind_account(session_key, surface, next_acc.email, context_offloader.settings.CONTEXT_ATTACHMENT_TTL_SECONDS)
+        await affinity.bind_account(session_key, surface, next_acc.email, attachment_ttl)
         log.warning(
             "[ContextAttachment] retrying upload with alternate account session_key=%s surface=%s previous_account=%s new_account=%s error=%s",
             session_key,
             surface,
-            getattr(current_acc, "email", None),
+            current_email,
             getattr(next_acc, "email", None),
             upload_exc,
         )
         return next_acc
+
+    async def _switch_account_on_upload_limit(current_acc, rate_exc: FileUploadRateLimitedError):
+        account_pool.mark_file_upload_limited(current_acc, rate_exc.retry_after_seconds, str(rate_exc))
+        await account_pool.save()
+        current_email = getattr(current_acc, "email", None)
+        if current_email:
+            upload_excludes.add(current_email)
+        account_pool.release(current_acc)
+        next_acc = await account_pool.acquire_wait(timeout=10, exclude=set(upload_excludes))
+        if not next_acc:
+            raise rate_exc
+        await affinity.bind_account(session_key, surface, next_acc.email, attachment_ttl)
+        log.warning(
+            "[ContextAttachment] upload quota exceeded; switching account session_key=%s surface=%s previous_account=%s new_account=%s retry_after=%ss",
+            session_key,
+            surface,
+            current_email,
+            getattr(next_acc, "email", None),
+            int(getattr(rate_exc, "retry_after_seconds", 0) or 0),
+        )
+        return next_acc
+
+    async def _upload_with_failover(current_acc, local_meta, ext):
+        """上传单文件并处理换号回退，返回 (remote, acc, uploaded)。
+
+        - 命中缓存：直接返回 (remote, acc, False)
+        - RateLimited（每日上传配额）：标记超限号→落盘→排除→换号循环，无号可用则抛出（外层回退内联）
+        - 网络类错误：换号重试一次，仍失败则抛出
+        """
+        network_retry_used = False
+        while True:
+            cache_entry = await cache.get(session_key, current_acc.email, local_meta["sha256"], ext)
+            if cache_entry is not None:
+                return cache_entry.remote_file_meta, current_acc, False
+            try:
+                remote = await uploader.upload_local_file(current_acc, local_meta)
+                return remote, current_acc, True
+            except FileUploadRateLimitedError as rate_exc:
+                current_acc = await _switch_account_on_upload_limit(current_acc, rate_exc)
+            except Exception as upload_exc:
+                if network_retry_used:
+                    raise
+                network_retry_used = True
+                current_acc = await _switch_account_on_retry(current_acc, upload_exc)
 
     try:
         for attachment in manual_attachments:
@@ -245,19 +309,8 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                 "created_at": __import__("time").time(),
             }
             ext = Path(attachment.filename).suffix.lstrip(".").lower()
-            cache_entry = await cache.get(session_key, acc.email, local_meta["sha256"], ext)
-            if cache_entry is not None:
-                remote = cache_entry.remote_file_meta
-            else:
-                try:
-                    remote = await uploader.upload_local_file(acc, local_meta)
-                except Exception as upload_exc:
-                    acc = await _switch_account_on_retry(acc, upload_exc)
-                    cache_entry = await cache.get(session_key, acc.email, local_meta["sha256"], ext)
-                    if cache_entry is not None:
-                        remote = cache_entry.remote_file_meta
-                    else:
-                        remote = await uploader.upload_local_file(acc, local_meta)
+            remote, acc, uploaded = await _upload_with_failover(acc, local_meta, ext)
+            if uploaded:
                 await cache.set(UpstreamFileCacheEntry(
                     session_key=session_key,
                     account_email=acc.email,
@@ -266,7 +319,7 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                     filename=attachment.filename,
                     remote_file_meta=remote,
                     created_at=local_meta["created_at"],
-                    expires_at=local_meta["created_at"] + context_offloader.settings.CONTEXT_ATTACHMENT_TTL_SECONDS,
+                    expires_at=local_meta["created_at"] + attachment_ttl,
                 ))
             upstream_files.append(remote["remote_ref"])
             await affinity.add_uploaded_file(session_key, remote)
@@ -276,19 +329,8 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
             for generated in plan.generated_files:
                 filename = _generated_context_filename(generated.ext)
                 local_meta = await file_store.save_text(filename, generated.text, generated.content_type, purpose="context")
-                cache_entry = await cache.get(session_key, acc.email, local_meta["sha256"], generated.ext)
-                if cache_entry is not None:
-                    remote = cache_entry.remote_file_meta
-                else:
-                    try:
-                        remote = await uploader.upload_local_file(acc, local_meta)
-                    except Exception as upload_exc:
-                        acc = await _switch_account_on_retry(acc, upload_exc)
-                        cache_entry = await cache.get(session_key, acc.email, local_meta["sha256"], generated.ext)
-                        if cache_entry is not None:
-                            remote = cache_entry.remote_file_meta
-                        else:
-                            remote = await uploader.upload_local_file(acc, local_meta)
+                remote, acc, uploaded = await _upload_with_failover(acc, local_meta, generated.ext)
+                if uploaded:
                     await cache.set(UpstreamFileCacheEntry(
                         session_key=session_key,
                         account_email=acc.email,
@@ -297,7 +339,7 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                         filename=filename,
                         remote_file_meta=remote,
                         created_at=local_meta["created_at"],
-                        expires_at=local_meta["created_at"] + context_offloader.settings.CONTEXT_ATTACHMENT_TTL_SECONDS,
+                        expires_at=local_meta["created_at"] + attachment_ttl,
                     ))
                 upstream_files.append(remote["remote_ref"])
                 context_attachment_tokens += count_tokens(generated.text)

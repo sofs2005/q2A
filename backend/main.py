@@ -12,7 +12,7 @@ import sys
 # 将项目根目录加入到 sys.path，解决直接运行 main.py 时找不到 backend 模块的问题
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backend.core.config import settings
+from backend.core.config import settings, VERSION_LABEL
 from backend.core.database import AsyncJsonDB
 from backend.core.account_pool import AccountPool
 from backend.core.session_affinity import SessionAffinityStore
@@ -59,7 +59,7 @@ async def chat_id_pool_loop(app: FastAPI):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     with request_context(surface="startup"):
-        log.info("正在启动 qwen2API v3.0.0（modified by softs2005） 企业网关...")
+        log.info(f"正在启动 qwen2API {VERSION_LABEL} 企业网关...")
 
         # 初始化数据存储 (带锁 JSON)
         app.state.accounts_db = AsyncJsonDB(settings.ACCOUNTS_FILE, default_data=[])
@@ -127,7 +127,7 @@ async def lifespan(app: FastAPI):
             await chat_pool.cleanup(delete_all=True)
         await close_all_sessions()
 
-app = FastAPI(title="qwen2API Enterprise Gateway", version="v3.0.0（modified by softs2005）", lifespan=lifespan)
+app = FastAPI(title="qwen2API Enterprise Gateway", version=VERSION_LABEL, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -154,7 +154,7 @@ async def root():
     return {
         "status": "qwen2API Enterprise Gateway is running",
         "docs": "/docs",
-        "version": "v3.0.0（modified by softs2005）"
+        "version": VERSION_LABEL
     }
 
 # 托管前端构建产物

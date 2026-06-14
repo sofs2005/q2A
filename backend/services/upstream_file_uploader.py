@@ -10,6 +10,20 @@ from typing import Any
 import oss2
 
 
+_DEFAULT_UPLOAD_RATE_LIMIT_RETRY_SECONDS = 3600.0
+
+
+class FileUploadRateLimitedError(Exception):
+    """上游文件上传命中每日配额（getstsToken 返回 code=RateLimited）。
+
+    retry_after_seconds 表示建议在多少秒内不再用该账号上传。
+    """
+
+    def __init__(self, retry_after_seconds: float, message: str = "") -> None:
+        self.retry_after_seconds = max(0.0, float(retry_after_seconds or 0))
+        super().__init__(message or f"file upload rate limited; retry after {self.retry_after_seconds:.0f}s")
+
+
 def _upload_filetype_from_content_type(content_type: str) -> str:
     lowered = (content_type or "").lower()
     if lowered.startswith("image/"):
@@ -111,6 +125,16 @@ class UpstreamFileUploader:
             raise RuntimeError(f"getstsToken failed: {sts_resp.get('status')} {sts_resp.get('body', '')[:200]}")
         sts_data = json.loads(sts_resp.get("body", "{}"))
         sts = (sts_data.get("data") or {}) if isinstance(sts_data, dict) else {}
+        if str(sts.get("code") or "") == "RateLimited":
+            try:
+                hours = float(sts.get("num"))
+            except (TypeError, ValueError):
+                hours = 0.0
+            retry_after = hours * 3600.0 if hours > 0 else _DEFAULT_UPLOAD_RATE_LIMIT_RETRY_SECONDS
+            raise FileUploadRateLimitedError(
+                retry_after_seconds=retry_after,
+                message=str(sts.get("details") or "file upload rate limited"),
+            )
         file_id = sts.get("file_id")
         file_path_remote = sts.get("file_path", "")
         bucketname = sts.get("bucketname", "")
