@@ -125,10 +125,12 @@ class ChatIDPool:
         return (int(digest, 16) % 2000) / 1000.0
 
     async def _create_warm_chat(self, semaphore: asyncio.Semaphore, acc, model: str, chat_type: str) -> None:
+        # 先抖动再获取信号量：让不同账号/模型的请求在时间轴上自然错开，
+        # 避免高并发下所有任务同时拿到信号量后并行 sleep 仍形成密集脉冲
+        jitter = self._jitter_seconds(getattr(acc, "email", ""), model, chat_type)
+        if jitter > 0:
+            await asyncio.sleep(jitter)
         async with semaphore:
-            jitter = self._jitter_seconds(getattr(acc, "email", ""), model, chat_type)
-            if jitter > 0:
-                await asyncio.sleep(jitter)
             try:
                 chat_id = await self.client.executor.create_chat(acc, model, chat_type=chat_type)
             except Exception as exc:
