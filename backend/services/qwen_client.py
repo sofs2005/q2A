@@ -146,23 +146,27 @@ class QwenClient:
 
     @staticmethod
     def _build_chat_transport_headers(*, account: Account | None = None, token: str | None = None, accept: str = "application/json, text/plain, */*") -> dict[str, str]:
+        fingerprint = fingerprint_for_account(account)
         headers = {
             "Authorization": f"Bearer {token}" if token else "",
             "X-Request-Id": str(uuid.uuid4()),
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "User-Agent": fingerprint.user_agent,
             "Accept": accept,
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Referer": f"{BASE_URL}/",
             "Origin": BASE_URL,
             "Connection": "keep-alive",
             "Content-Type": "application/json",
-            "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
         }
+        # sec-ch-ua 系列为 Chromium 专属，且版本须与 TLS impersonate 层一致，
+        # 否则高端风控可借 JA3/JA4 与 UA 交叉校验识破伪装；非 Chromium 指纹不发送
+        if fingerprint.sec_ch_ua:
+            headers["sec-ch-ua"] = fingerprint.sec_ch_ua
+            headers["sec-ch-ua-mobile"] = fingerprint.sec_ch_ua_mobile
+            headers["sec-ch-ua-platform"] = fingerprint.platform
+        headers["sec-fetch-dest"] = "empty"
+        headers["sec-fetch-mode"] = "cors"
+        headers["sec-fetch-site"] = "same-origin"
         headers.update(QwenClient._web_client_headers())
         if not token:
             headers.pop("Authorization", None)

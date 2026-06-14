@@ -115,20 +115,49 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Cookie", headers)
         self.assertEqual(headers["Authorization"], "Bearer token-1")
 
-    def test_build_chat_transport_headers_use_go_like_static_browser_headers(self) -> None:
+    def test_build_chat_transport_headers_follow_account_fingerprint(self) -> None:
         account = Account(email="alice@example.com", token="token-1", cookies="waf=ok; session=browser")
         account.fingerprint_id = "chrome136_windows"
 
         headers = QwenClient._build_chat_transport_headers(account=account, token=account.token, accept="text/event-stream")
 
+        fingerprint = fingerprint_for_account(account)
         self.assertEqual(headers["Accept"], "text/event-stream")
-        self.assertEqual(headers["User-Agent"], "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-        self.assertEqual(headers["sec-ch-ua"], '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"')
-        # Chat transport now includes web client headers for WAF bypass
+        # UA / sec-ch-ua / platform 必须跟随账号指纹，与 TLS impersonate 层保持一致
+        self.assertEqual(headers["User-Agent"], fingerprint.user_agent)
+        self.assertEqual(headers["sec-ch-ua"], fingerprint.sec_ch_ua)
+        self.assertEqual(headers["sec-ch-ua-platform"], fingerprint.platform)
+        self.assertIn('v="136"', headers["sec-ch-ua"])
+        # Chat transport 仍包含 web client headers（WAF bypass）
         self.assertIn("Version", headers)
         self.assertIn("source", headers)
         self.assertIn("Timezone", headers)
         self.assertEqual(headers["X-Accel-Buffering"], "no")
+
+    def test_build_chat_transport_headers_version_matches_tls_impersonate(self) -> None:
+        """UA 中的 Chrome 版本必须与 TLS impersonate 版本一致，避免风控交叉校验破绽。"""
+        account = Account(email="bob@example.com", token="token-2")
+        account.fingerprint_id = "chrome146_windows"
+
+        headers = QwenClient._build_chat_transport_headers(account=account, token=account.token)
+
+        fingerprint = fingerprint_for_account(account)
+        self.assertEqual(fingerprint.impersonate, "chrome146")
+        self.assertIn("Chrome/146.", headers["User-Agent"])
+        self.assertIn('v="146"', headers["sec-ch-ua"])
+
+    def test_build_chat_transport_headers_omit_sec_ch_ua_for_firefox(self) -> None:
+        """Firefox 指纹账号不应发送 Chromium 专属的 sec-ch-ua 头。"""
+        account = Account(email="carol@example.com", token="token-3")
+        account.fingerprint_id = "firefox147_windows"
+
+        headers = QwenClient._build_chat_transport_headers(account=account, token=account.token)
+
+        fingerprint = fingerprint_for_account(account)
+        self.assertEqual(headers["User-Agent"], fingerprint.user_agent)
+        self.assertIn("Firefox/147", headers["User-Agent"])
+        self.assertNotIn("sec-ch-ua", headers)
+        self.assertNotIn("sec-ch-ua-platform", headers)
 
     async def test_request_json_sends_web_client_headers_for_chat_requests(self) -> None:
         account = Account(email="alice@example.com", token="token-1")
