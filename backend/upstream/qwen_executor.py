@@ -149,13 +149,18 @@ class QwenExecutor:
         has_custom_tools: bool = False,
         files: list[dict] | None = None,
         account=None,
+        chat_type: str = "t2t",
+        media_options: dict | None = None,
     ):
         account_obj, token = self._resolve_account_context(account_or_token, account=account)
         stream_fn = getattr(self.engine, "stream_chat_once", None) or getattr(self.engine, "fetch_chat", None)
         if stream_fn is None:
             raise Exception("stream transport unavailable")
 
-        payload = build_chat_payload(chat_id, model, content, has_custom_tools, files=files)
+        payload = build_chat_payload(
+            chat_id, model, content, has_custom_tools, files=files,
+            chat_type=chat_type, media_options=media_options,
+        )
         buffer = ""
         started_at = time.perf_counter()
         first_event_logged = False
@@ -293,6 +298,8 @@ class QwenExecutor:
         has_custom_tools: bool = False,
         files: list[dict] | None = None,
         fixed_account=None,
+        chat_type: str = "t2t",
+        media_options: dict | None = None,
     ):
         exclude = set()
         if fixed_account is not None:
@@ -300,11 +307,11 @@ class QwenExecutor:
             acc = fixed_account
             try:
                 log.info(f"[Executor] using fixed account={acc.email} model={model}")
-                chat_id, reused = await self.get_chat_id(acc, model)
+                chat_id, reused = await self.get_chat_id(acc, model, chat_type=chat_type)
                 update_request_context(chat_id=chat_id)
                 log.info(f"[Executor] created chat_id={chat_id} account={acc.email} prewarmed={reused}")
                 yield {"type": "meta", "chat_id": chat_id, "acc": acc}
-                async for evt in self.stream(acc, chat_id, model, content, has_custom_tools, files=files):
+                async for evt in self.stream(acc, chat_id, model, content, has_custom_tools, files=files, chat_type=chat_type, media_options=media_options):
                     yield {"type": "event", "event": evt}
                 return
             except Exception:
@@ -322,12 +329,12 @@ class QwenExecutor:
 
             try:
                 log.info(f"[Executor] acquired account={acc.email} model={model} attempt={attempt + 1}")
-                chat_id, reused = await self.get_chat_id(acc, model)
+                chat_id, reused = await self.get_chat_id(acc, model, chat_type=chat_type)
                 update_request_context(chat_id=chat_id)
                 log.info(f"[Executor] created chat_id={chat_id} account={acc.email} prewarmed={reused}")
                 yield {"type": "meta", "chat_id": chat_id, "acc": acc}
 
-                async for evt in self.stream(acc, chat_id, model, content, has_custom_tools, files=files):
+                async for evt in self.stream(acc, chat_id, model, content, has_custom_tools, files=files, chat_type=chat_type, media_options=media_options):
                     yield {"type": "event", "event": evt}
                 return
 

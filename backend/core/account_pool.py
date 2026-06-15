@@ -51,12 +51,16 @@ class Account:
         self.waf_cookies = str(kwargs.get("waf_cookies", "") or "").strip()
         self.waf_cookies_expires_at = float(kwargs.get("waf_cookies_expires_at", 0) or 0)
         self.file_upload_blocked_until = float(kwargs.get("file_upload_blocked_until", 0) or 0)
+        self.video_blocked_until = float(kwargs.get("video_blocked_until", 0) or 0)
 
     def is_rate_limited(self) -> bool:
         return self.rate_limited_until > time.time()
 
     def is_file_upload_blocked(self) -> bool:
         return self.file_upload_blocked_until > time.time()
+
+    def is_video_blocked(self) -> bool:
+        return self.video_blocked_until > time.time()
 
     def is_available(self) -> bool:
         return self.valid and not self.is_rate_limited()
@@ -112,6 +116,7 @@ class Account:
             "waf_cookies": self.waf_cookies,
             "waf_cookies_expires_at": self.waf_cookies_expires_at,
             "file_upload_blocked_until": self.file_upload_blocked_until,
+            "video_blocked_until": self.video_blocked_until,
         }
 
 
@@ -538,6 +543,15 @@ class AccountPool:
         acc.file_upload_blocked_until = time.time() + retry_after
         acc.last_error = error_message or acc.last_error
         log.warning(f"[账号] {acc.email} 文件上传额度超限，{int(retry_after)} 秒内不再用于上传")
+
+    def mark_video_limited(self, acc: Account, retry_after_seconds: float = 3600, error_message: str = ""):
+        retry_after = max(0.0, float(retry_after_seconds or 0))
+        acc.video_blocked_until = time.time() + retry_after
+        acc.last_error = error_message or acc.last_error
+        log.warning(f"[账号] {acc.email} 视频生成额度超限，{int(retry_after)} 秒内不再用于视频")
+
+    def video_blocked_emails(self) -> set:
+        return {a.email for a in self.accounts if a.is_video_blocked()}
 
     def file_upload_blocked_emails(self) -> set:
         return {a.email for a in self.accounts if a.is_file_upload_blocked()}

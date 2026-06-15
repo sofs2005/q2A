@@ -395,6 +395,26 @@ class QwenClient:
         chats = data.get("data", [])
         return chats if isinstance(chats, list) else []
 
+    async def get_vision_task_status(self, token: str, task_id: str, account: Account | None = None, timeout: float = 30.0) -> dict:
+        """轮询视频/视觉生成任务状态。返回 {status, body}。"""
+        return await self._request_json(
+            "GET",
+            f"/api/v1/tasks/status/{task_id}",
+            token,
+            timeout=timeout,
+            account=account,
+        )
+
+    async def get_chat_detail(self, token: str, chat_id: str, account: Account | None = None, timeout: float = 30.0) -> dict:
+        """获取单个会话详情，用于视频生成结果兜底提取。返回 {status, body}。"""
+        return await self._request_json(
+            "GET",
+            f"/api/v2/chats/{chat_id}",
+            token,
+            timeout=timeout,
+            account=account,
+        )
+
     async def get_personalization_settings(self, account) -> dict:
         return await self._request_personalization_raw_json(
             "GET",
@@ -545,6 +565,8 @@ class QwenClient:
         has_custom_tools: bool = False,
         files: list[dict] | None = None,
         fixed_account=None,
+        chat_type: str = "t2t",
+        media_options: dict | None = None,
     ):
         async for item in self.executor.chat_stream_events_with_retry(
             model,
@@ -552,5 +574,7 @@ class QwenClient:
             has_custom_tools,
             files=files,
             fixed_account=fixed_account,
+            chat_type=chat_type,
+            media_options=media_options,
         ):
             yield item

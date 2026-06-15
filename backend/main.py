@@ -28,7 +28,7 @@ from backend.toolcore.context_offload import ContextOffloader
 from backend.services.response_store import InMemoryResponseStore
 from backend.services.upstream_file_uploader import UpstreamFileUploader
 import backend.api.models as models
-from backend.api import admin, v1_chat, responses_api, probes, anthropic, gemini, embeddings, images, files_api
+from backend.api import admin, v1_chat, responses_api, probes, anthropic, gemini, embeddings, images, videos, files_api
 from backend.services.garbage_collector import garbage_collect_chats
 from backend.services.context_cleanup import context_cleanup_loop
 
@@ -145,6 +145,7 @@ app.include_router(anthropic.router, tags=["Claude Compatible"])
 app.include_router(gemini.router, tags=["Gemini Compatible"])
 app.include_router(embeddings.router, tags=["Embeddings"])
 app.include_router(images.router, tags=["Images"])
+app.include_router(videos.router, tags=["Videos"])
 app.include_router(files_api.router, tags=["Files"])
 app.include_router(probes.router, tags=["Probes"])
 app.include_router(admin.router, prefix="/api/admin", tags=["Dashboard Admin"])
