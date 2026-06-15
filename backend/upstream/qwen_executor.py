@@ -28,8 +28,9 @@ def _is_waf_blocked_body(body: str) -> bool:
         or "<!doctypehtml" in body_lower
         or "fail_sys_user_validate" in body_lower
         or "rgv587_error" in body_lower
-        or ("_____tmd_____" in body_lower and "captcha" in body_lower)
+        or "_____tmd_____" in body_lower
         or ("/punish" in body_lower and "x5secdata" in body_lower)
+        or ("<script>" in body_lower and "x5sec" in body_lower)
     )
 
 
