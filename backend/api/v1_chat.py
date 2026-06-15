@@ -1317,9 +1317,14 @@ async def chat_completions(request: Request):
                             await queue.put(None)
 
                 producer_task = asyncio.create_task(producer())
+                heartbeat_interval = settings.STREAM_HEARTBEAT_INTERVAL_SECONDS
                 try:
                     while True:
-                        chunk = await queue.get()
+                        try:
+                            chunk = await asyncio.wait_for(queue.get(), timeout=heartbeat_interval)
+                        except asyncio.TimeoutError:
+                            yield ": heartbeat\n\n"
+                            continue
                         if chunk is None:
                             break
                         _log_openai_stream_sse_chunk(
