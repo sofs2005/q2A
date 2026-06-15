@@ -157,11 +157,37 @@ class ContextOffloader:
             return ""
         return "\n".join([TOOLS_CONTEXT_TITLE, TOOLS_CONTEXT_SUMMARY, "", "\n\n".join(tool_blocks), ""])
 
+    def _calculate_dynamic_inline_threshold(self, total_chars: int) -> int:
+        """Calculate a dynamic inline threshold that scales with conversation size.
+
+        Uses deterministic hash-based jitter instead of random jitter to ensure
+        identical inputs always produce identical offload decisions.
+        """
+        base_threshold = 8000
+        max_threshold = self.settings.CONTEXT_INLINE_MAX_CHARS
+
+        if total_chars <= 10000:
+            base = base_threshold
+        elif total_chars >= 50000:
+            base = max_threshold
+        else:
+            scale = (total_chars - 10000) / (50000 - 10000)
+            base = int(base_threshold + scale * (max_threshold - base_threshold))
+
+        # Deterministic jitter based on content size hash (+/- 15%)
+        jitter_hash = int(hashlib.md5(str(total_chars).encode()).hexdigest()[:8], 16)
+        jitter_range = max(1, int(base * 0.15))
+        jitter = (jitter_hash % (2 * jitter_range + 1)) - jitter_range
+        result = base + jitter
+
+        return max(base_threshold, min(max_threshold, result))
+
     def plan(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, client_profile: str = "") -> ContextOffloadPlan:
         estimated = self.estimate_prompt_len(messages, tools=tools, client_profile=client_profile)
         history_estimated = self.estimate_prompt_len(messages, tools=[], client_profile=client_profile)
         tools_text = self._tools_context_text(tools)
-        history_needs_file = history_estimated > self.settings.CONTEXT_INLINE_MAX_CHARS
+        dynamic_threshold = self._calculate_dynamic_inline_threshold(history_estimated)
+        history_needs_file = history_estimated > dynamic_threshold
         if not history_needs_file and not tools_text:
             return ContextOffloadPlan(mode="inline", inline_messages=messages, estimated_prompt_len=estimated)
 
