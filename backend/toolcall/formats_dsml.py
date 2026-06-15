@@ -54,7 +54,10 @@ def _restore_cdata(text: str) -> str:
 def _coerce_scalar(value: str) -> Any:
     raw = value.strip()
     restored = _restore_cdata(raw)
-    stripped = restored if _is_wrapped_cdata(raw) else html.unescape(restored)
+    # CDATA-wrapped values are literal strings — skip type coercion entirely
+    if _is_wrapped_cdata(raw):
+        return restored if restored != "" else ""
+    stripped = html.unescape(restored)
     if stripped == "":
         return ""
 

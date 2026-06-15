@@ -38,6 +38,21 @@ def parse_state_tool_calls(state_tool_calls: list[dict[str, Any]], allowed_tool_
     return ToolDirectiveParseResult(canonical_calls=canonical_calls, tool_blocks=tool_blocks, stop_reason=stop_reason)
 
 
+def _resolve_tool_name(raw_name: str, tool_names: set[str]) -> str | None:
+    """Case-insensitive tool name resolution.
+
+    Models sometimes emit tool names with different casing (e.g. 'read' instead of 'Read').
+    This helper matches against the allowed set case-insensitively and returns the canonical name.
+    """
+    if raw_name in tool_names:
+        return raw_name
+    lowered = raw_name.lower()
+    for name in tool_names:
+        if name.lower() == lowered:
+            return name
+    return None
+
+
 def parse_textual_tool_calls(answer_text: str, tools: list[dict[str, Any]]) -> ToolDirectiveParseResult:
     if not tools or not answer_text:
         return ToolDirectiveParseResult(tool_blocks=[{"type": "text", "text": answer_text}], stop_reason="end_turn")
