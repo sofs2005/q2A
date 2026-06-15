@@ -135,6 +135,13 @@ class ChatIDPool:
                 chat_id = await self.client.executor.create_chat(acc, model, chat_type=chat_type)
             except Exception as exc:
                 log.warning("[ChatIDPool] create_failed email=%s model=%s chat_type=%s error=%s", acc.email, model, chat_type, exc)
+                # 预热路径遇到鉴权失败时也触发后台自愈：否则只在实际请求重试分支
+                # 触发，仅被预热碰到的过期账号永远不会被刷新（healing 标志位保证幂等）。
+                err = str(exc).lower()
+                if "unauthorized" in err or "expired" in err or "401" in err or "403" in err:
+                    resolver = getattr(self.client.executor, "auth_resolver", None)
+                    if resolver is not None:
+                        asyncio.create_task(resolver.auto_heal_account(acc))
                 return
             item = WarmChat(acc.email, acc.token, model, normalize_chat_type(chat_type), chat_id, time.time())
             key = warm_chat_key(item.email, item.model, item.chat_type)
