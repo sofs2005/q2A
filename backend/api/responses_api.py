@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -150,67 +151,91 @@ async def create_response(request: Request):
     with request_context(req_id=req_id, surface="responses", requested_model=model_name, resolved_model=standard_request.resolved_model, command_environment=command_environment_hint):
         if standard_request.stream:
             async def generate():
-                translator = ResponsesStreamTranslator(response_id=response_id, created=created, model_name=model_name, tool_catalog=standard_request.tool_catalog)
-                translator.start()
-                for chunk in translator.pending_chunks:
-                    yield chunk
-                translator.pending_chunks.clear()
+                queue: asyncio.Queue[str | None] = asyncio.Queue()
 
+                async def producer() -> None:
+                    translator = ResponsesStreamTranslator(response_id=response_id, created=created, model_name=model_name, tool_catalog=standard_request.tool_catalog)
+                    translator.start()
+                    for chunk in translator.pending_chunks:
+                        await queue.put(chunk)
+                    translator.pending_chunks.clear()
+
+                    try:
+                        async with app.state.session_locks.hold(session_key):
+                            update_request_context(stream_attempt=1)
+
+                            async def on_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
+                                del evt
+                                if text_chunk:
+                                    translator.on_text_delta(text_chunk)
+                                if tool_calls and settings.TOOLCORE_V2_ENABLED:
+                                    translator.on_tool_calls(tool_calls)
+                                while translator.pending_chunks:
+                                    await queue.put(translator.pending_chunks.pop(0))
+
+                            result = await run_retryable_completion_bridge(
+                                client=client,
+                                standard_request=standard_request,
+                                prompt=prompt,
+                                users_db=users_db,
+                                token=token,
+                                history_messages=history_messages,
+                                max_attempts=request_max_attempts(standard_request),
+                                usage_delta_factory=build_usage_delta_factory(
+                                    prompt,
+                                    extra_prompt_tokens=standard_request.context_attachment_tokens,
+                                ),
+                                allow_after_visible_output=True,
+                                capture_events=False,
+                                on_delta=on_delta,
+                            )
+                            execution = result.execution
+                            response_payload = build_openai_response_payload(
+                                response_id=response_id,
+                                created=created,
+                                model_name=model_name,
+                                prompt=result.prompt,
+                                execution=execution,
+                                standard_request=standard_request,
+                                previous_response_id=previous_response_id,
+                                store=bool(raw_req_data.get("store", True)),
+                            )
+                            directive = build_tool_directive(standard_request, execution.state)
+                            assistant_message = build_openai_assistant_history_message(
+                                execution=execution,
+                                request=standard_request,
+                                directive=directive,
+                            )
+                            updated_history = list(transformed_req.get("messages", [])) + [assistant_message]
+                            await app.state.response_store.save(response_id, response_payload, updated_history)
+                            for chunk in translator.finalize(response_payload=response_payload, standard_request=standard_request, execution=execution):
+                                await queue.put(chunk)
+                    except HTTPException as he:
+                        await queue.put(sse_event({"type": "response.failed", "sequence_number": translator._next_sequence(), "response": {"id": response_id, "status": "failed"}, "error": he.detail}))
+                    except Exception as e:
+                        await queue.put(sse_event({"type": "response.failed", "sequence_number": translator._next_sequence(), "response": {"id": response_id, "status": "failed"}, "error": {"message": str(e)}}))
+                    finally:
+                        await queue.put(None)
+
+                producer_task = asyncio.create_task(producer())
+                heartbeat_interval = getattr(settings, "STREAM_HEARTBEAT_INTERVAL_SECONDS", 15)
                 try:
-                    async with app.state.session_locks.hold(session_key):
-                        update_request_context(stream_attempt=1)
-
-                        async def on_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
-                            del evt
-                            if text_chunk:
-                                translator.on_text_delta(text_chunk)
-                            if tool_calls and settings.TOOLCORE_V2_ENABLED:
-                                translator.on_tool_calls(tool_calls)
-
-                        result = await run_retryable_completion_bridge(
-                            client=client,
-                            standard_request=standard_request,
-                            prompt=prompt,
-                            users_db=users_db,
-                            token=token,
-                            history_messages=history_messages,
-                            max_attempts=request_max_attempts(standard_request),
-                            usage_delta_factory=build_usage_delta_factory(
-                                prompt,
-                                extra_prompt_tokens=standard_request.context_attachment_tokens,
-                            ),
-                            allow_after_visible_output=True,
-                            capture_events=False,
-                            on_delta=on_delta,
-                        )
-                        execution = result.execution
-                        response_payload = build_openai_response_payload(
-                            response_id=response_id,
-                            created=created,
-                            model_name=model_name,
-                            prompt=result.prompt,
-                            execution=execution,
-                            standard_request=standard_request,
-                            previous_response_id=previous_response_id,
-                            store=bool(raw_req_data.get("store", True)),
-                        )
-                        directive = build_tool_directive(standard_request, execution.state)
-                        assistant_message = build_openai_assistant_history_message(
-                            execution=execution,
-                            request=standard_request,
-                            directive=directive,
-                        )
-                        updated_history = list(transformed_req.get("messages", [])) + [assistant_message]
-                        await app.state.response_store.save(response_id, response_payload, updated_history)
-                        for chunk in translator.finalize(response_payload=response_payload, standard_request=standard_request, execution=execution):
-                            yield chunk
-                        return
-                except HTTPException as he:
-                    yield sse_event({"type": "response.failed", "sequence_number": translator._next_sequence(), "response": {"id": response_id, "status": "failed"}, "error": he.detail})
-                    return
-                except Exception as e:
-                    yield sse_event({"type": "response.failed", "sequence_number": translator._next_sequence(), "response": {"id": response_id, "status": "failed"}, "error": {"message": str(e)}})
-                    return
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(queue.get(), timeout=heartbeat_interval)
+                        except asyncio.TimeoutError:
+                            yield ": heartbeat\n\n"
+                            continue
+                        if chunk is None:
+                            break
+                        yield chunk
+                finally:
+                    if not producer_task.done():
+                        producer_task.cancel()
+                        try:
+                            await producer_task
+                        except Exception:
+                            pass
 
             return StreamingResponse(
                 generate(),
@@ -341,61 +366,96 @@ async def create_response_websocket(websocket: WebSocket):
         history_messages = prepared.combined_messages
 
         with request_context(req_id=req_id, surface="responses_ws", requested_model=model_name, resolved_model=standard_request.resolved_model, command_environment=command_environment_hint):
-            translator = ResponsesStreamTranslator(response_id=response_id, created=created, model_name=model_name, tool_catalog=standard_request.tool_catalog)
-            translator.start()
-            for chunk in translator.pending_chunks:
-                await websocket.send_json(sse_chunk_to_payload(chunk))
-            translator.pending_chunks.clear()
+            ws_queue: asyncio.Queue[dict | None] = asyncio.Queue()
 
-            async with app.state.session_locks.hold(session_key):
-                update_request_context(stream_attempt=1)
+            async def ws_producer() -> None:
+                translator = ResponsesStreamTranslator(response_id=response_id, created=created, model_name=model_name, tool_catalog=standard_request.tool_catalog)
+                translator.start()
+                for chunk in translator.pending_chunks:
+                    await ws_queue.put(sse_chunk_to_payload(chunk))
+                translator.pending_chunks.clear()
 
-                async def on_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
-                    del evt
-                    if text_chunk:
-                        translator.on_text_delta(text_chunk)
-                    if tool_calls and settings.TOOLCORE_V2_ENABLED:
-                        translator.on_tool_calls(tool_calls)
-                    while translator.pending_chunks:
-                        await websocket.send_json(sse_chunk_to_payload(translator.pending_chunks.pop(0)))
+                try:
+                    async with app.state.session_locks.hold(session_key):
+                        update_request_context(stream_attempt=1)
 
-                result = await run_retryable_completion_bridge(
-                    client=client,
-                    standard_request=standard_request,
-                    prompt=prompt,
-                    users_db=users_db,
-                    token=token,
-                    history_messages=history_messages,
-                    max_attempts=request_max_attempts(standard_request),
-                    usage_delta_factory=build_usage_delta_factory(
-                        prompt,
-                        extra_prompt_tokens=standard_request.context_attachment_tokens,
-                    ),
-                    allow_after_visible_output=True,
-                    capture_events=False,
-                    on_delta=on_delta,
-                )
-                execution = result.execution
-                response_payload = build_openai_response_payload(
-                    response_id=response_id,
-                    created=created,
-                    model_name=model_name,
-                    prompt=result.prompt,
-                    execution=execution,
-                    standard_request=standard_request,
-                    previous_response_id=previous_response_id,
-                    store=bool(raw_req_data.get("store", True)),
-                )
-                directive = build_tool_directive(standard_request, execution.state)
-                assistant_message = build_openai_assistant_history_message(
-                    execution=execution,
-                    request=standard_request,
-                    directive=directive,
-                )
-                updated_history = list(transformed_req.get("messages", [])) + [assistant_message]
-                await app.state.response_store.save(response_id, response_payload, updated_history)
-                for chunk in translator.finalize(response_payload=response_payload, standard_request=standard_request, execution=execution):
-                    await websocket.send_json(sse_chunk_to_payload(chunk))
+                        async def on_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
+                            del evt
+                            if text_chunk:
+                                translator.on_text_delta(text_chunk)
+                            if tool_calls and settings.TOOLCORE_V2_ENABLED:
+                                translator.on_tool_calls(tool_calls)
+                            while translator.pending_chunks:
+                                await ws_queue.put(sse_chunk_to_payload(translator.pending_chunks.pop(0)))
+
+                        result = await run_retryable_completion_bridge(
+                            client=client,
+                            standard_request=standard_request,
+                            prompt=prompt,
+                            users_db=users_db,
+                            token=token,
+                            history_messages=history_messages,
+                            max_attempts=request_max_attempts(standard_request),
+                            usage_delta_factory=build_usage_delta_factory(
+                                prompt,
+                                extra_prompt_tokens=standard_request.context_attachment_tokens,
+                            ),
+                            allow_after_visible_output=True,
+                            capture_events=False,
+                            on_delta=on_delta,
+                        )
+                        execution = result.execution
+                        response_payload = build_openai_response_payload(
+                            response_id=response_id,
+                            created=created,
+                            model_name=model_name,
+                            prompt=result.prompt,
+                            execution=execution,
+                            standard_request=standard_request,
+                            previous_response_id=previous_response_id,
+                            store=bool(raw_req_data.get("store", True)),
+                        )
+                        directive = build_tool_directive(standard_request, execution.state)
+                        assistant_message = build_openai_assistant_history_message(
+                            execution=execution,
+                            request=standard_request,
+                            directive=directive,
+                        )
+                        updated_history = list(transformed_req.get("messages", [])) + [assistant_message]
+                        await app.state.response_store.save(response_id, response_payload, updated_history)
+                        for chunk in translator.finalize(response_payload=response_payload, standard_request=standard_request, execution=execution):
+                            await ws_queue.put(sse_chunk_to_payload(chunk))
+                except Exception as e:
+                    log.exception("[WS] /v1/responses producer failed: %s", e)
+                    try:
+                        await ws_queue.put({"type": "response.failed", "error": {"message": str(e)}})
+                    except Exception:
+                        pass
+                finally:
+                    await ws_queue.put(None)
+
+            ws_producer_task = asyncio.create_task(ws_producer())
+            heartbeat_interval = getattr(settings, "STREAM_HEARTBEAT_INTERVAL_SECONDS", 15)
+            try:
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(ws_queue.get(), timeout=heartbeat_interval)
+                    except asyncio.TimeoutError:
+                        try:
+                            await websocket.send_json({"type": "ping"})
+                        except Exception:
+                            break
+                        continue
+                    if msg is None:
+                        break
+                    await websocket.send_json(msg)
+            finally:
+                if not ws_producer_task.done():
+                    ws_producer_task.cancel()
+                    try:
+                        await ws_producer_task
+                    except Exception:
+                        pass
     except WebSocketDisconnect:
         return
     except Exception as e:

@@ -396,7 +396,20 @@ async def anthropic_messages(request: Request):
                                 await _reacquire_bound_account_if_needed(client=client, standard_request=standard_request)
                                 continue
 
-                            for chunk in stream_state.pending_chunks:
+                            heartbeat_interval = settings.STREAM_HEARTBEAT_INTERVAL_SECONDS
+                            chunk_queue: asyncio.Queue[str | None] = asyncio.Queue()
+                            for c in stream_state.pending_chunks:
+                                await chunk_queue.put(c)
+                            await chunk_queue.put(None)
+
+                            while True:
+                                try:
+                                    chunk = await asyncio.wait_for(chunk_queue.get(), timeout=heartbeat_interval)
+                                except asyncio.TimeoutError:
+                                    yield ": heartbeat\n\n"
+                                    continue
+                                if chunk is None:
+                                    break
                                 yield chunk
                             return
                         except HTTPException as he:
