@@ -17,22 +17,56 @@ def _is_heavy_tool_profile(client_profile: str) -> bool:
     return client_profile in {CLAUDE_CODE_OPENAI_PROFILE, QWEN_CODE_OPENAI_PROFILE}
 
 
+_MODIFY_TOOLS = frozenset({"Write", "Edit", "NotebookEdit", "Patch"})
+_READ_TOOLS = frozenset({"Read", "Grep", "grep", "read"})
+_MODIFY_THRESHOLD = 16_000
+_READ_THRESHOLD = 4_000
+_READ_SAMPLE_CHARS = 2_000
+_OTHER_THRESHOLD = 160
+
+
+def _head_tail_sample(text: str, threshold: int, sample_chars: int) -> str:
+    """Keep first and last sample_chars of text, omitting the middle."""
+    if len(text) <= threshold:
+        return text
+    omitted = len(text) - 2 * sample_chars
+    if omitted <= 0:
+        return text
+    return text[:sample_chars] + f"\n... [omitted {omitted} chars] ...\n" + text[-sample_chars:]
+
+
 def compact_history_tool_input(name: str, input_data: dict[str, Any], client_profile: str) -> dict[str, Any]:
     if not _is_heavy_tool_profile(client_profile) or not isinstance(input_data, dict):
         return input_data
     compact = dict(input_data)
-    large_text_keys = ("content", "new_string", "old_string", "insert_text", "text", "patch")
-    for key in large_text_keys:
-        value = compact.get(key)
-        if isinstance(value, str) and len(value) > 160:
-            compact[key] = f"[omitted {len(value)} chars]"
-    if name in {"Write", "Edit", "NotebookEdit"}:
+    large_text_keys = ("content", "new_string", "old_string", "insert_text", "text", "patch", "command")
+
+    if name in _MODIFY_TOOLS:
+        # Modify tools: higher threshold, full omission when exceeded
+        for key in large_text_keys:
+            value = compact.get(key)
+            if isinstance(value, str) and len(value) > _MODIFY_THRESHOLD:
+                compact[key] = f"[omitted {len(value)} chars]"
+        # Keep only preferred keys for modify tools
         preferred: dict[str, Any] = {}
         for key in ("file_path", "path", "target_file", "filename", "old_string", "new_string", "content"):
             if key in compact:
                 preferred[key] = compact[key]
         if preferred:
             compact = preferred
+    elif name in _READ_TOOLS:
+        # Read tools: head/tail sampling to preserve file structure
+        for key in large_text_keys:
+            value = compact.get(key)
+            if isinstance(value, str) and len(value) > _READ_THRESHOLD:
+                compact[key] = _head_tail_sample(value, _READ_THRESHOLD, _READ_SAMPLE_CHARS)
+    else:
+        # Other tools: low threshold, full omission
+        for key in large_text_keys:
+            value = compact.get(key)
+            if isinstance(value, str) and len(value) > _OTHER_THRESHOLD:
+                compact[key] = f"[omitted {len(value)} chars]"
+
     return compact
 
 

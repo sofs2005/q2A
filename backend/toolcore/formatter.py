@@ -23,7 +23,7 @@ def build_canonical_openai_chat_payload(*, completion_id: str, created: int, mod
     if tool_blocks:
         message: dict[str, Any] = {
             "role": "assistant",
-            "content": None,
+            "content": "",
             "tool_calls": [
                 {
                     "id": block["id"],
