@@ -90,9 +90,11 @@ def build_chat_payload(
         message_meta = {"subChatType": "t2t"}
 
     payload = {
-        "stream": True,
+        # 视频（t2v）为异步任务：task_id 仅存在于非流式 completions 响应体的
+        # messages[0].extra.wanx.task_id，故视频必须用 stream:false 取回 body。
+        "stream": not is_video,
         "version": "2.1",
-        "incremental_output": True,
+        "incremental_output": not is_video,
         "chat_id": chat_id,
         "chat_mode": "normal",
         "model": model,

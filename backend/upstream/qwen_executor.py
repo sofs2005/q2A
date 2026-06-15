@@ -339,42 +339,98 @@ class QwenExecutor:
                 return
 
             except Exception as e:
-                err_msg = str(e).lower()
-                is_timeout = (
-                    "timeout" in err_msg
-                    or "timed out" in err_msg
-                    or "readtimeout" in err_msg
-                    or type(e).__name__ in ("ReadTimeout", "TimeoutError", "TimeoutException")
-                )
-
-                if is_timeout:
-                    log.warning(f"[Executor] timeout detected attempt={attempt + 1}/{settings.MAX_RETRIES} account={acc.email} error={e}")
-                    exclude.add(acc.email)
-                elif "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
-                    self.account_pool.mark_rate_limited(acc)
-                    exclude.add(acc.email)
-                elif "waf_blocked" in err_msg or "aliyun_waf" in err_msg:
-                    exclude.add(acc.email)
-                    # WAF 命中：标记该账号 acw_tc 失效并后台刷新，为后续请求恢复风控 cookie
-                    acc.waf_cookies_expires_at = 0
-                    if self.auth_resolver is not None:
-                        asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
-                elif "unauthorized" in err_msg or "401" in err_msg or "403" in err_msg:
-                    self.account_pool.mark_invalid(acc)
-                    exclude.add(acc.email)
-                    if "activation" in err_msg or "pending" in err_msg:
-                        acc.activation_pending = True
-                    if self.auth_resolver is not None:
-                        asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
-                else:
-                    exclude.add(acc.email)
-
-                self.account_pool.release(acc)
+                self._classify_and_release(acc, e, exclude)
                 log.warning(
                     f"[Executor] retry attempt={attempt + 1}/{settings.MAX_RETRIES} account={acc.email} error={e}"
                 )
             except (asyncio.CancelledError, GeneratorExit):
                 self.account_pool.release(acc)
                 raise
+
+        raise Exception(f"All {settings.MAX_RETRIES} attempts failed. Please check upstream accounts.")
+
+    def _classify_and_release(self, acc, e: Exception, exclude: set) -> None:
+        """按错误类型标记账号状态并加入排除集，最后释放账号（流式/非流式共用）。"""
+        err_msg = str(e).lower()
+        is_timeout = (
+            "timeout" in err_msg
+            or "timed out" in err_msg
+            or "readtimeout" in err_msg
+            or type(e).__name__ in ("ReadTimeout", "TimeoutError", "TimeoutException")
+        )
+
+        if is_timeout:
+            log.warning(f"[Executor] timeout detected account={acc.email} error={e}")
+            exclude.add(acc.email)
+        elif "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
+            self.account_pool.mark_rate_limited(acc)
+            exclude.add(acc.email)
+        elif "waf_blocked" in err_msg or "aliyun_waf" in err_msg:
+            exclude.add(acc.email)
+            # WAF 命中：标记该账号 acw_tc 失效并后台刷新，为后续请求恢复风控 cookie
+            acc.waf_cookies_expires_at = 0
+            if self.auth_resolver is not None:
+                asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
+        elif "unauthorized" in err_msg or "401" in err_msg or "403" in err_msg:
+            self.account_pool.mark_invalid(acc)
+            exclude.add(acc.email)
+            if "activation" in err_msg or "pending" in err_msg:
+                acc.activation_pending = True
+            if self.auth_resolver is not None:
+                asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
+        else:
+            exclude.add(acc.email)
+
+        self.account_pool.release(acc)
+
+    async def complete_once_with_retry(
+        self,
+        model: str,
+        content: str,
+        has_custom_tools: bool = False,
+        files: list[dict] | None = None,
+        chat_type: str = "t2v",
+        media_options: dict | None = None,
+    ) -> dict:
+        """非流式一次性 completions + 账号重试（用于视频 t2v）。
+
+        成功返回 {"chat_id", "acc", "body"}；body 为完整 JSON 文本。
+        account 的 release 由调用方负责（与流式成功路径一致）。
+        """
+        complete_fn = getattr(self.engine, "complete_chat_once", None)
+        if complete_fn is None:
+            raise Exception("non-stream transport unavailable")
+
+        exclude: set = set()
+        for attempt in range(settings.MAX_RETRIES):
+            update_request_context(upstream_attempt=attempt + 1)
+            acc = await self.account_pool.acquire_wait(timeout=60, exclude=exclude)
+            if not acc:
+                raise Exception("No available accounts in pool (all busy or rate limited)")
+
+            try:
+                chat_id, reused = await self.get_chat_id(acc, model, chat_type=chat_type)
+                update_request_context(chat_id=chat_id)
+                log.info(f"[Executor] non-stream completions chat_id={chat_id} account={acc.email} attempt={attempt + 1}")
+                payload = build_chat_payload(
+                    chat_id, model, content, has_custom_tools, files=files,
+                    chat_type=chat_type, media_options=media_options,
+                )
+                res = await complete_fn(acc.token, chat_id, payload, account=acc)
+                status = res.get("status")
+                body = res.get("body", "")
+                if status != 200:
+                    raise Exception(f"HTTP {status}: {str(body)[:200]}")
+                if _is_waf_blocked_body(body):
+                    raise Exception(f"waf_blocked: completions challenge: {_preview_text(body)}")
+                return {"chat_id": chat_id, "acc": acc, "body": body}
+            except (asyncio.CancelledError, GeneratorExit):
+                self.account_pool.release(acc)
+                raise
+            except Exception as e:
+                self._classify_and_release(acc, e, exclude)
+                log.warning(
+                    f"[Executor] non-stream retry attempt={attempt + 1}/{settings.MAX_RETRIES} account={acc.email} error={e}"
+                )
 
         raise Exception(f"All {settings.MAX_RETRIES} attempts failed. Please check upstream accounts.")

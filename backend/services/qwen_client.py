@@ -395,21 +395,28 @@ class QwenClient:
         chats = data.get("data", [])
         return chats if isinstance(chats, list) else []
 
+    async def complete_chat_once(self, token: str, chat_id: str, payload: dict, account: Account | None = None, timeout: float | None = None) -> dict:
+        """非流式 completions（用于视频 t2v）：返回 {status, body}，body 为完整 JSON 文本。
+
+        视频任务的 task_id 嵌在响应体 messages[0].extra.wanx.task_id，SSE 流不会下发，
+        故必须用 stream:false 的一次性 POST 取回整个响应体。
+        """
+        request_timeout = timeout if timeout is not None else settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS
+        return await self._request_json(
+            "POST",
+            f"/api/v2/chat/completions?chat_id={chat_id}",
+            token,
+            body=payload,
+            timeout=request_timeout,
+            account=account,
+            chat_transport=True,
+        )
+
     async def get_vision_task_status(self, token: str, task_id: str, account: Account | None = None, timeout: float = 30.0) -> dict:
         """轮询视频/视觉生成任务状态。返回 {status, body}。"""
         return await self._request_json(
             "GET",
             f"/api/v1/tasks/status/{task_id}",
-            token,
-            timeout=timeout,
-            account=account,
-        )
-
-    async def get_chat_detail(self, token: str, chat_id: str, account: Account | None = None, timeout: float = 30.0) -> dict:
-        """获取单个会话详情，用于视频生成结果兜底提取。返回 {status, body}。"""
-        return await self._request_json(
-            "GET",
-            f"/api/v2/chats/{chat_id}",
             token,
             timeout=timeout,
             account=account,
@@ -578,3 +585,22 @@ class QwenClient:
             media_options=media_options,
         ):
             yield item
+
+    async def complete_once_with_retry(
+        self,
+        model: str,
+        content: str,
+        has_custom_tools: bool = False,
+        files: list[dict] | None = None,
+        chat_type: str = "t2v",
+        media_options: dict | None = None,
+    ) -> dict:
+        """非流式一次性 completions + 重试（用于视频 t2v）。返回 {chat_id, acc, body}。"""
+        return await self.executor.complete_once_with_retry(
+            model,
+            content,
+            has_custom_tools=has_custom_tools,
+            files=files,
+            chat_type=chat_type,
+            media_options=media_options,
+        )
