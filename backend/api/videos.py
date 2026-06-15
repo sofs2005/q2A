@@ -1,9 +1,16 @@
 """
 视频生成接口 — 兼容 OpenAI /v1/videos/generations 规范。
 
-底层通过现有直连 HTTP 聊天能力触发千问 "生成视频" 模式（chat_type=t2v），
-不依赖浏览器运行时。视频生成耗时较长，初始响应通常只返回任务 ID，
-需要轮询 /api/v1/tasks/status/{id} 直到任务完成后才能取到视频 URL。
+底层通过现有直连 HTTP 聊天能力触发千问 "生成视频" 模式（chat_type=t2v）。
+视频生成为异步任务：聊天流很快结束（只产出 response.created），真正的
+task_id 嵌在 messages[].extra.wanx.task_id，需要从会话详情读取后再轮询
+GET /api/v1/tasks/status/{task_id}，直到任务完成才能取到视频 URL。
+
+提取/轮询逻辑参考已验证的 chat.qwen.ai 网页代理实现（FreeQwenApi）：
+- task_id: data.messages[].extra.wanx.task_id（优先），回退顶层 task_id
+- 轮询端点: GET https://chat.qwen.ai/api/v1/tasks/status/{task_id}
+- 状态字段: task_status | status；成功 completed/success/succeeded
+- 视频 URL: 状态响应的 content / video_url / url（含 .mp4/.mov/.webm）
 """
 import re
 import time
@@ -28,62 +35,78 @@ VIDEO_MODEL_MAP = {
 
 VALID_RATIOS = {"16:9", "9:16", "1:1", "4:3", "3:4"}
 
-# 任务运行/成功状态判定
-TASK_STATUS_RUNNING = {"running", "pending", "queued", "processing", "created"}
-TASK_STATUS_SUCCESS = {"success", "succeeded", "finished", "completed"}
+# 任务状态判定（大小写不敏感）
+TASK_STATUS_SUCCESS = {"completed", "success", "succeeded", "finished"}
+TASK_STATUS_FAILED = {"failed", "error", "cancelled", "canceled"}
 
 # 轮询参数
 POLL_TIMEOUT_SECONDS = 7 * 60
-POLL_INTERVAL_SECONDS = 10
+POLL_INTERVAL_SECONDS = 5
+
+_VIDEO_EXTS = (".mp4", ".webm", ".mov", ".m3u8")
 
 
-def _extract_video_urls(text: str) -> list[str]:
-    urls: list[str] = []
+# ---------------------------------------------------------------------------
+# JSON 感知的递归提取
+# ---------------------------------------------------------------------------
 
-    for u in re.findall(r'!\[.*?\]\((https?://[^\s\)]+)\)', text):
-        urls.append(u.rstrip(").,;"))
+def _find_task_id(obj) -> str | None:
+    """递归查找 task_id：优先 extra.wanx.task_id，回退顶层 task_id/taskId。"""
+    wanx_id: list[str] = []
+    flat_id: list[str] = []
 
-    for u in re.findall(r'"(?:url|video|src|videoUrl|video_url)"\s*:\s*"(https?://[^"]+)"', text):
-        urls.append(u)
+    def walk(o):
+        if isinstance(o, dict):
+            wanx = o.get("wanx")
+            if isinstance(wanx, dict):
+                tid = wanx.get("task_id") or wanx.get("taskId")
+                if tid:
+                    wanx_id.append(str(tid))
+            for key in ("task_id", "taskId"):
+                v = o.get(key)
+                if isinstance(v, str) and v:
+                    flat_id.append(v)
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
 
-    mp4_pattern = r'https?://[^\s"<>]+\.(?:mp4|webm|mov|m3u8)(?:[^\s"<>]*)'
-    for u in re.findall(mp4_pattern, text, re.IGNORECASE):
-        urls.append(u.rstrip(".,;)\"'>"))
-
-    seen: set[str] = set()
-    result: list[str] = []
-    for u in urls:
-        if _looks_like_video_url(u) and u not in seen:
-            seen.add(u)
-            result.append(u)
-    return result
+    walk(obj)
+    if wanx_id:
+        return wanx_id[0]
+    return flat_id[0] if flat_id else None
 
 
 def _looks_like_video_url(url: str) -> bool:
-    lowered = url.lower()
-    return any(ext in lowered for ext in (".mp4", ".webm", ".mov", ".m3u8")) or "video" in lowered
+    low = url.lower().split("?", 1)[0]
+    return low.endswith(_VIDEO_EXTS) or "video" in url.lower()
 
 
-def _extract_task_ids(text: str) -> list[str]:
-    ids: list[str] = []
-    for tid in re.findall(r'"task_id"\s*:\s*"([^"]+)"', text):
-        ids.append(tid)
-    for tid in re.findall(r'"taskId"\s*:\s*"([^"]+)"', text):
-        ids.append(tid)
-    seen: set[str] = set()
-    result: list[str] = []
-    for tid in ids:
-        if tid and tid not in seen:
-            seen.add(tid)
-            result.append(tid)
-    return result
+def _find_video_url(obj) -> str | None:
+    """递归收集所有 http(s) URL（含字符串内嵌/Markdown），返回首个像视频的。"""
+    candidates: list[str] = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+        elif isinstance(o, str):
+            for m in re.findall(r'https?://[^\s"<>\)\]]+', o):
+                candidates.append(m.rstrip(".,;)\"'>"))
+
+    walk(obj)
+    for u in candidates:
+        if _looks_like_video_url(u):
+            return u
+    return None
 
 
-def _task_status_from_body(body: str) -> str:
-    try:
-        obj = json.loads(body)
-    except Exception:
-        return ""
+def _task_status_of(obj) -> str:
+    """从任务状态响应中取状态字段（顶层或 data 下）。"""
     if not isinstance(obj, dict):
         return ""
     data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
@@ -120,46 +143,83 @@ def _build_video_prompt(prompt: str, duration: int, ratio: str) -> str:
     )
 
 
-async def _poll_video_task(client: QwenClient, acc, task_id: str) -> str:
-    """轮询任务状态，返回累积的响应快照文本。超时或失败抛异常。"""
+def _parse_json(body: str):
+    try:
+        return json.loads(body or "")
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 统一轮询：先拿 task_id/url，再轮询任务状态
+# ---------------------------------------------------------------------------
+
+async def _poll_until_ready(client: QwenClient, acc, chat_id: str,
+                            task_id: str | None) -> str | None:
+    """
+    在超时窗口内统一轮询，直到取到视频 URL：
+    - 有 task_id：轮询 GET /api/v1/tasks/status/{task_id}，从响应取 content/url
+    - 无 task_id：拉会话详情 /api/v2/chats/{chat_id}，尝试发现 task_id 或直接的视频 URL
+    """
     deadline = time.time() + POLL_TIMEOUT_SECONDS
-    snapshots: list[str] = []
     last_status = ""
     while time.time() < deadline:
-        res = await client.get_vision_task_status(acc.token, task_id, account=acc)
-        body = res.get("body", "") or ""
-        if body:
-            snapshots.append(body)
-        if res.get("status") == 200:
-            status = _task_status_from_body(body)
-            if status:
-                last_status = status
-            if status in TASK_STATUS_SUCCESS:
-                return "\n".join(snapshots)
-            if status and status not in TASK_STATUS_RUNNING:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Video task failed status={status}",
-                )
+        if task_id:
+            res = await client.get_vision_task_status(acc.token, task_id, account=acc)
+            if res.get("status") == 200:
+                obj = _parse_json(res.get("body", ""))
+                status = _task_status_of(obj)
+                if status:
+                    last_status = status
+                if status in TASK_STATUS_SUCCESS:
+                    url = _find_video_url(obj)
+                    if url:
+                        return url
+                elif status in TASK_STATUS_FAILED:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Video task failed status={status}",
+                    )
+        else:
+            # 尚未拿到 task_id：从会话详情发现 task_id 或直接的视频 URL
+            try:
+                detail = await client.get_chat_detail(acc.token, chat_id, account=acc)
+                obj = _parse_json(detail.get("body", ""))
+                if obj is not None:
+                    url = _find_video_url(obj)
+                    if url:
+                        return url
+                    task_id = _find_task_id(obj)
+                    if task_id:
+                        log.info(f"[T2V] 从会话详情发现 task_id={task_id}")
+                        continue  # 立即转入任务状态轮询，不等待
+            except Exception as exc:
+                log.debug("[T2V] chat detail poll failed chat_id=%s error=%s", chat_id, exc)
+
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
     raise HTTPException(
         status_code=504,
-        detail=f"Video task timed out task_id={task_id} last_status={last_status or '-'}",
+        detail=f"Video task timed out chat_id={chat_id} last_status={last_status or '-'}",
     )
 
+
+# ---------------------------------------------------------------------------
+# 核心生成流程（自带账号释放与会话清理）
+# ---------------------------------------------------------------------------
 
 async def _run_generation(
     client: QwenClient, model: str, prompt: str, n: int, duration: int,
     ratio: str, media_options: dict,
 ) -> dict:
-    """完整的视频生成流程，返回最终响应体。自带账号释放与会话清理。"""
     from backend.core.config import settings
 
     acc = None
     chat_id = None
+    owns_release = False  # 流正常结束时由本调用方负责唯一一次 release
     try:
         prompt_text = _build_video_prompt(prompt, duration, ratio)
-        event_payloads: list[str] = []
+        events: list[dict] = []
         async for item in client.chat_stream_events_with_retry(
             model, prompt_text, has_custom_tools=False,
             chat_type="t2v", media_options=media_options,
@@ -168,50 +228,43 @@ async def _run_generation(
                 acc = item.get("acc")
                 chat_id = item.get("chat_id")
                 continue
-            if item.get("type") != "event":
-                continue
-            event_payloads.append(json.dumps(item.get("event", {}), ensure_ascii=False))
+            if item.get("type") == "event":
+                events.append(item.get("event", {}))
+        # 执行器在成功路径（return）不会 release，调用方接管
+        owns_release = True
 
         if acc is None or chat_id is None:
             raise HTTPException(status_code=500, detail="Video generation session was not created")
 
-        answer_text = "\n".join(event_payloads)
-        video_urls = _extract_video_urls(answer_text)
+        # 1) 流里可能已有直接 URL（少见）
+        video_url = _find_video_url(events)
+        # 2) 流里找 task_id（嵌套 extra.wanx.task_id）
+        task_id = _find_task_id(events)
+        log.info(f"[T2V] stream done: url={bool(video_url)} task_id={task_id or '-'} events={len(events)}")
 
-        # 流里没有直接的 URL：尝试轮询任务
-        if not video_urls:
-            task_ids = _extract_task_ids(answer_text)
-            if task_ids:
-                log.info(f"[T2V] 开始轮询任务 task_id={task_ids[0]}")
-                task_text = await _poll_video_task(client, acc, task_ids[0])
-                answer_text += "\n" + task_text
-                video_urls = _extract_video_urls(answer_text)
+        # 3) 统一轮询：拿 task_id/url → 轮询任务状态
+        if not video_url:
+            video_url = await _poll_until_ready(client, acc, chat_id, task_id)
 
-        # 仍无 URL：拉会话详情兜底
-        if not video_urls:
-            try:
-                detail = await client.get_chat_detail(acc.token, chat_id, account=acc)
-                detail_body = detail.get("body", "") or ""
-                if detail_body:
-                    answer_text += "\n" + detail_body
-                    video_urls = _extract_video_urls(answer_text)
-            except Exception as exc:
-                log.debug("[T2V] chat detail fallback failed chat_id=%s error=%s", chat_id, exc)
-
-        log.info(f"[T2V] 提取到 {len(video_urls)} 个视频 URL: {video_urls}")
-
-        if not video_urls:
+        if not video_url:
+            # 自诊断：转储事件结构，便于核对真实形状
+            log.warning(
+                "[T2V] no video url. events_preview=%s",
+                json.dumps(events, ensure_ascii=False)[:2000],
+            )
             raise HTTPException(status_code=500, detail="Video generation produced no video URL")
 
+        log.info(f"[T2V] 视频 URL: {video_url}")
+        # Qwen 单任务生成单个视频；n>1 时返回同一 URL 以兼容契约
         data = [
             {
-                "url": url,
+                "url": video_url,
                 "revised_prompt": prompt,
                 "ratio": ratio,
                 "size": ratio,
                 "duration": duration,
             }
-            for url in video_urls[:n]
+            for _ in range(n)
         ]
         return {"created": int(time.time()), "data": data}
 
@@ -220,12 +273,11 @@ async def _run_generation(
     except Exception as e:
         msg = str(e)
         log.error(f"[T2V] 生成失败: {msg}")
-        # 配额相关错误，标记账号视频维度受限
         if acc is not None and ("quota" in msg.lower() or "额度" in msg or "limit" in msg.lower()):
             client.account_pool.mark_video_limited(acc, error_message=msg)
         raise HTTPException(status_code=500, detail=msg)
     finally:
-        if acc is not None and getattr(acc, "inflight", 0) > 0:
+        if acc is not None and owns_release:
             client.account_pool.release(acc)
         if acc is not None and chat_id and settings.UPSTREAM_AUTO_DELETE_ENABLED:
             asyncio.create_task(client.delete_chat(acc.token, chat_id, account=acc))
