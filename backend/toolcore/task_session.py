@@ -29,5 +29,5 @@ def build_openai_assistant_history_message(*, execution, request: StandardReques
             for block in directive.tool_blocks
             if block.get('type') == 'tool_use'
         ]
-        return {'role': 'assistant', 'content': None, 'tool_calls': tool_calls}
+        return {'role': 'assistant', 'content': "", 'tool_calls': tool_calls}
     return {'role': 'assistant', 'content': execution.state.answer_text}

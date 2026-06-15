@@ -68,12 +68,15 @@ def _client_visible_tools(tools: list[dict[str, Any]], tool_catalog) -> list[dic
 
 def build_openai_completion_payload(*, completion_id: str, created: int, model_name: str, prompt: str, execution, standard_request) -> dict[str, Any]:
     directive = build_tool_directive(standard_request, execution.state)
+    visible_answer_text = sanitize_visible_answer_text(
+        execution.state.answer_text, tool_use=directive.stop_reason == "tool_use"
+    )
     payload = build_canonical_openai_chat_payload(
         completion_id=completion_id,
         created=created,
         model_name=model_name,
         prompt=prompt,
-        answer_text=execution.state.answer_text,
+        answer_text=visible_answer_text,
         reasoning_text=execution.state.reasoning_text,
         directives=directive.tool_blocks,
         tool_catalog=standard_request.tool_catalog,
@@ -150,11 +153,14 @@ def build_openai_response_payload(
 
 def build_anthropic_message_payload(*, msg_id: str, model_name: str, prompt: str, execution, standard_request) -> dict[str, Any]:
     directive = build_tool_directive(standard_request, execution.state)
+    visible_answer_text = sanitize_visible_answer_text(
+        execution.state.answer_text, tool_use=directive.stop_reason == "tool_use"
+    )
     return build_canonical_anthropic_message(
         msg_id=msg_id,
         model_name=model_name,
         prompt=prompt,
-        answer_text=execution.state.answer_text,
+        answer_text=visible_answer_text,
         reasoning_text=execution.state.reasoning_text,
         directives=directive.tool_blocks,
         tool_catalog=standard_request.tool_catalog,

@@ -138,7 +138,7 @@ class OpenAIStreamTranslator:
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model_name,
-            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
         }
         self.pending_chunks.append(f"data: {json.dumps(yield_payload, ensure_ascii=False)}\n\n")
         self.role_chunk_sent = True
