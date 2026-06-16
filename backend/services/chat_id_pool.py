@@ -40,6 +40,7 @@ class ChatIDPool:
         self._desired: dict[str, tuple[str, str]] = self._configured_desired_models()
         self._lock = asyncio.Lock()
         self._fill_task: asyncio.Task | None = None
+        self._fill_round = 0  # 预热轮次计数：用于每轮相位轮换，避免固定账号始终先打上游
 
     def _configured_desired_models(self) -> dict[str, tuple[str, str]]:
         desired: dict[str, tuple[str, str]] = {}
@@ -108,28 +109,54 @@ class ChatIDPool:
             and float(getattr(acc, "next_available_at", lambda: 0.0)()) <= now
         ]
         semaphore = asyncio.Semaphore(max_concurrency)
+        # 每轮相位轮换：按轮次旋转账号起跑顺序，避免同一账号每轮都第一个打上游
+        self._fill_round += 1
+        total = len(accounts)
+        offset = self._fill_round % total if total else 0
         tasks = []
-        for acc in accounts:
+        for idx, acc in enumerate(accounts):
+            # slot 决定该账号在错峰窗口内的相对起跑位置（0..total-1），随轮次旋转
+            slot = (idx + offset) % total if total else 0
             for model, chat_type in desired:
                 missing = target - await self.count(acc.email, model, chat_type)
                 for _ in range(max(0, missing)):
-                    tasks.append(asyncio.create_task(self._create_warm_chat(semaphore, acc, model, chat_type)))
+                    tasks.append(asyncio.create_task(
+                        self._create_warm_chat(semaphore, acc, model, chat_type, slot, total)
+                    ))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     @staticmethod
-    def _jitter_seconds(email: str, model: str, chat_type: str) -> float:
-        """基于 email+model+chat_type 哈希的确定性抖动延迟（0~2s），分散预热请求脉冲。"""
+    def _jitter(email: str, model: str, chat_type: str) -> float:
+        """基于 email+model+chat_type 哈希的确定性抖动（0~JITTER_SECONDS）。
+
+        在序位铺开的基础上叠加抖动，打散"同一序位、不同模型"的并发请求，
+        并让相邻账号的起跑时间不至于过于规整，进一步弱化请求脉冲特征。
+        """
+        jitter_max = max(0.0, float(getattr(settings, "CHAT_ID_PREWARM_JITTER_SECONDS", 1.5) or 0))
+        if jitter_max <= 0:
+            return 0.0
         key = f"{str(email or '').strip().lower()}|{str(model or '').strip()}|{normalize_chat_type(chat_type)}"
         digest = hashlib.sha256(key.encode("utf-8", errors="ignore")).hexdigest()
-        return (int(digest, 16) % 2000) / 1000.0
+        return (int(digest, 16) % 1000) / 1000.0 * jitter_max
 
-    async def _create_warm_chat(self, semaphore: asyncio.Semaphore, acc, model: str, chat_type: str) -> None:
-        # 先抖动再获取信号量：让不同账号/模型的请求在时间轴上自然错开，
-        # 避免高并发下所有任务同时拿到信号量后并行 sleep 仍形成密集脉冲
-        jitter = self._jitter_seconds(getattr(acc, "email", ""), model, chat_type)
-        if jitter > 0:
-            await asyncio.sleep(jitter)
+    @staticmethod
+    def _spread_delay(slot: int, total: int, email: str, model: str, chat_type: str) -> float:
+        """账号错峰延迟：在 SPREAD_SECONDS 窗口内按序位 slot 均匀铺开 + 抖动。
+
+        相比旧的纯哈希抖动（固定 0~2s 且账号顺序永远相同），序位均匀铺开能
+        随账号数量自适应拉开间距，配合 fill() 的轮次相位轮换实现真正的错开。
+        """
+        spread = max(0.0, float(getattr(settings, "CHAT_ID_PREWARM_SPREAD_SECONDS", 6) or 0))
+        base = (spread * slot / total) if (spread > 0 and total > 0) else 0.0
+        return base + ChatIDPool._jitter(email, model, chat_type)
+
+    async def _create_warm_chat(self, semaphore: asyncio.Semaphore, acc, model: str, chat_type: str, slot: int = 0, total: int = 1) -> None:
+        # 先错峰再获取信号量：按账号序位在错峰窗口内铺开起跑时间，
+        # 避免高并发下所有任务同时拿到信号量后仍形成密集请求脉冲触发上游风控
+        delay = self._spread_delay(slot, total, getattr(acc, "email", ""), model, chat_type)
+        if delay > 0:
+            await asyncio.sleep(delay)
         async with semaphore:
             try:
                 chat_id = await self.client.executor.create_chat(acc, model, chat_type=chat_type)

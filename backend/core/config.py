@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     CHAT_ID_PREWARM_TARGET_PER_ACCOUNT: int = int(os.getenv("CHAT_ID_PREWARM_TARGET_PER_ACCOUNT", 5))
     CHAT_ID_PREWARM_TTL_SECONDS: int = int(os.getenv("CHAT_ID_PREWARM_TTL_SECONDS", 120))
     CHAT_ID_PREWARM_MAX_CONCURRENCY: int = int(os.getenv("CHAT_ID_PREWARM_MAX_CONCURRENCY", 16))
+    CHAT_ID_PREWARM_SPREAD_SECONDS: float = float(os.getenv("CHAT_ID_PREWARM_SPREAD_SECONDS", 6))
+    CHAT_ID_PREWARM_JITTER_SECONDS: float = float(os.getenv("CHAT_ID_PREWARM_JITTER_SECONDS", 1.5))
     CHAT_ID_PREWARM_MODELS: str = os.getenv("CHAT_ID_PREWARM_MODELS", "qwen3.7-plus,qwen3.6-plus")
     QWEN_CHAT_TRANSPORT_SEND_COOKIES: bool = os.getenv("QWEN_CHAT_TRANSPORT_SEND_COOKIES", "false").lower() in {"1", "true", "yes", "on"}
     QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP: bool = os.getenv("QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP", "true").lower() in {"1", "true", "yes", "on"}
