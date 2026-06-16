@@ -500,7 +500,8 @@ class QwenClient:
                 self._header_diagnostics(account=account, headers=headers),
             )
             try:
-                async with httpx.AsyncClient(http2=False, follow_redirects=True, timeout=timeout) as client:
+                _proxy = getattr(settings, "UPSTREAM_PROXY", "") or None
+                async with httpx.AsyncClient(http2=False, follow_redirects=True, timeout=timeout, proxy=_proxy) as client:
                     async with client.stream(
                         "POST",
                         f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",

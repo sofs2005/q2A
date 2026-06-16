@@ -63,6 +63,9 @@ class Settings(BaseSettings):
         os.getenv("QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS", 90)
     )
     QWEN_UPSTREAM_STREAM_DEDICATED_SESSION: bool = os.getenv("QWEN_UPSTREAM_STREAM_DEDICATED_SESSION", "true").lower() in {"1", "true", "yes", "on"}
+    # 上游出站代理（留空=直连）。支持 socks5h://host:port、http://host:port 等，
+    # 例如对接 MicroWARP（Cloudflare WARP SOCKS5）：socks5h://microwarp:1080
+    UPSTREAM_PROXY: str = os.getenv("UPSTREAM_PROXY", "").strip()
     MODELS_USE_UPSTREAM: bool = os.getenv("MODELS_USE_UPSTREAM", "true").lower() in {"1", "true", "yes", "on"}
     OPENAI_JSON_SINGLEFLIGHT_ENABLED: bool = os.getenv("OPENAI_JSON_SINGLEFLIGHT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     OPENAI_JSON_SINGLEFLIGHT_WAIT_TIMEOUT_SECONDS: float = float(os.getenv("OPENAI_JSON_SINGLEFLIGHT_WAIT_TIMEOUT_SECONDS", 600))

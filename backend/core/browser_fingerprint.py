@@ -169,11 +169,16 @@ def fingerprint_for_account(account: Any | None) -> BrowserFingerprint:
 def new_session(fingerprint: BrowserFingerprint, *, timeout: float | None = None) -> AsyncSession:
     from backend.core.config import settings
 
-    return AsyncSession(
+    kwargs: dict[str, Any] = dict(
         impersonate=fingerprint.impersonate,
         timeout=timeout if timeout is not None else settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS,
         allow_redirects=True,
     )
+    proxy = getattr(settings, "UPSTREAM_PROXY", "")
+    if proxy:
+        # curl_cffi 基于 libcurl，仅做 TCP 隧道，本地 TLS 指纹伪装不受影响
+        kwargs["proxies"] = {"http": proxy, "https": proxy}
+    return AsyncSession(**kwargs)
 
 
 async def get_session(fingerprint: BrowserFingerprint) -> AsyncSession:
