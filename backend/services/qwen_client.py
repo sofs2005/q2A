@@ -53,6 +53,17 @@ class QwenClient:
         return waf
 
     @staticmethod
+    def _extract_acw_tc(resp) -> str:
+        """从上游响应提取 acw_tc（Set-Cookie）；缺失或异常返回空串。"""
+        try:
+            cookies = getattr(resp, "cookies", None)
+            if cookies is None:
+                return ""
+            return str(cookies.get("acw_tc", "") or "")
+        except Exception:
+            return ""
+
+    @staticmethod
     def _merge_cookie_header(*cookie_strings: str) -> str:
         """按 cookie 名合并多个 cookie 串并去重，靠后的同名值覆盖靠前的。"""
         merged: dict[str, str] = {}
@@ -216,7 +227,7 @@ class QwenClient:
                 json=body,
                 timeout=request_timeout,
             )
-            return {"status": resp.status_code, "body": getattr(resp, "text", "")}
+            return {"status": resp.status_code, "body": getattr(resp, "text", ""), "acw_tc": self._extract_acw_tc(resp)}
         except Exception as e:
             return {"status": 0, "body": str(e)}
 
@@ -242,7 +253,7 @@ class QwenClient:
                 json=body,
                 timeout=request_timeout,
             )
-            return {"status": resp.status_code, "body": getattr(resp, "text", "")}
+            return {"status": resp.status_code, "body": getattr(resp, "text", ""), "acw_tc": self._extract_acw_tc(resp)}
         except Exception as e:
             return {"status": 0, "body": str(e)}
 

@@ -57,6 +57,16 @@ class QwenExecutor:
             return account_or_token, str(getattr(account_or_token, "token", "") or "")
         return None, str(account_or_token or "")
 
+    @staticmethod
+    def _absorb_waf_cookie(account, acw_tc: str) -> None:
+        """把上游响应收割到的 acw_tc 写回账号 WAF cookie（与登录刷新同口径，TTL 1500s）。
+        仅在响应真的下发了新 acw_tc 时写入；为空则跳过、保留账号原有 cookie 不动。"""
+        if account is None or not acw_tc:
+            return
+        account.waf_cookies = f"acw_tc={acw_tc}"
+        account.waf_cookies_expires_at = time.time() + 1500
+        log.info(f"[Executor] {getattr(account, 'email', '')} acw_tc 预热刷新")
+
     async def create_chat(self, account_or_token, model: str, chat_type: str = "t2t") -> str:
         account, token = self._resolve_account_context(account_or_token)
         request_fn = getattr(self.engine, "_request_json", None) or getattr(self.engine, "api_call", None)
@@ -107,6 +117,9 @@ class QwenExecutor:
             data = json.loads(body_text)
             if not data.get("success") or "id" not in data.get("data", {}):
                 raise Exception("Qwen API returned error or missing id")
+            # 预热/建 chat 时顺手收割 acw_tc 刷新 WAF cookie：chats/new 走 bearer 鉴权、
+            # 不被 WAF 拦，故能为无密码账号（登录不了、拿不到 acw_tc）也补上风控 cookie。
+            self._absorb_waf_cookie(account, r.get("acw_tc", ""))
             return data["data"]["id"]
         except Exception as e:
             body_lower = body_text.lower()
@@ -303,23 +316,45 @@ class QwenExecutor:
     ):
         exclude = set()
         if fixed_account is not None:
-            update_request_context(upstream_attempt=1)
+            # 固定账号（上下文文件绑定该账号工作区）不能换号，否则读不到已上传文件，
+            # 故池路径的失败转移不适用。撞 WAF 时改为原地自愈：清空 acw_tc 逼 create_chat
+            # 裸奔重新收割种子 cookie，再用同账号重试一次（仅在尚未产出事件时安全重试）。
             acc = fixed_account
-            try:
-                log.info(f"[Executor] using fixed account={acc.email} model={model}")
-                chat_id, reused = await self.get_chat_id(acc, model, chat_type=chat_type)
-                update_request_context(chat_id=chat_id)
-                log.info(f"[Executor] created chat_id={chat_id} account={acc.email} prewarmed={reused}")
-                yield {"type": "meta", "chat_id": chat_id, "acc": acc}
-                async for evt in self.stream(acc, chat_id, model, content, has_custom_tools, files=files, chat_type=chat_type, media_options=media_options):
-                    yield {"type": "event", "event": evt}
-                return
-            except Exception:
-                self.account_pool.release(acc)
-                raise
-            except (asyncio.CancelledError, GeneratorExit):
-                self.account_pool.release(acc)
-                raise
+            waf_retry_used = False
+            attempt_no = 0
+            while True:
+                attempt_no += 1
+                update_request_context(upstream_attempt=attempt_no)
+                produced = False
+                try:
+                    log.info(f"[Executor] using fixed account={acc.email} model={model} attempt={attempt_no}")
+                    if waf_retry_used:
+                        # 绕过预热复用，强制新建 chat 以触发 _absorb_waf_cookie 重新收割 acw_tc
+                        chat_id, reused = await self.create_chat(acc, model, chat_type=chat_type), False
+                    else:
+                        chat_id, reused = await self.get_chat_id(acc, model, chat_type=chat_type)
+                    update_request_context(chat_id=chat_id)
+                    log.info(f"[Executor] created chat_id={chat_id} account={acc.email} prewarmed={reused}")
+                    yield {"type": "meta", "chat_id": chat_id, "acc": acc}
+                    async for evt in self.stream(acc, chat_id, model, content, has_custom_tools, files=files, chat_type=chat_type, media_options=media_options):
+                        produced = True
+                        yield {"type": "event", "event": evt}
+                    return
+                except (asyncio.CancelledError, GeneratorExit):
+                    self.account_pool.release(acc)
+                    raise
+                except Exception as e:
+                    err = str(e).lower()
+                    if ("waf_blocked" in err or "aliyun_waf" in err) and not waf_retry_used and not produced:
+                        waf_retry_used = True
+                        acc.waf_cookies = ""  # 真正失效旧 acw_tc（expires=0 不生效），逼下轮裸奔收割
+                        acc.waf_cookies_expires_at = 0
+                        if self.auth_resolver is not None:
+                            asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
+                        log.warning(f"[Executor] fixed account WAF hit, in-place reseed+retry account={acc.email} error={e}")
+                        continue
+                    self.account_pool.release(acc)
+                    raise
 
         for attempt in range(settings.MAX_RETRIES):
             update_request_context(upstream_attempt=attempt + 1)
