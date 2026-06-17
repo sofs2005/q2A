@@ -173,6 +173,33 @@ def _tool_usage_line(tool: dict[str, Any], *, max_desc: int = 40, max_keys: int 
     return line
 
 
+def _build_name_alias_lines(name_alias_map: dict[str, str] | None) -> list[str]:
+    """Render a client-name -> bridge-slot lookup table.
+
+    The user (or earlier turns) may reference a tool by its real client-side
+    name (e.g. "Bash"), but the bridge only exposes opaque slot ids
+    (e.g. "bridge-2"). Without a lookup the model wrongly concludes the named
+    tool is unavailable. This table lets it resolve the mention without us
+    mutating free-form user text.
+    """
+    if not name_alias_map:
+        return []
+    # Sort by slot id then client name for stable, readable grouping.
+    entries = sorted(name_alias_map.items(), key=lambda kv: (kv[1], kv[0]))
+    lines = [
+        "TOOL NAME RESOLUTION — the user or earlier turns may name a tool by its real client-side name.",
+        "Resolve any such name to its bridge slot via this table before deciding a tool is unavailable:",
+    ]
+    for client_name, slot in entries:
+        lines.append(f'- "{client_name}" => {slot}')
+    lines.append(
+        "When the user mentions a tool name listed here, call the mapped bridge slot; "
+        "never reply that a listed tool does not exist."
+    )
+    lines.append("")
+    return lines
+
+
 def _shell_command_guidance(command_environment: CommandEnvironment | None) -> list[str]:
     shell = str(getattr(command_environment, "shell", "unknown") or "unknown").strip().lower()
     lines = [
@@ -194,6 +221,7 @@ def build_tool_instruction_block(
     tool_choice_mode: str = "auto",
     required_tool_name: str | None = None,
     command_environment: CommandEnvironment | None = None,
+    name_alias_map: dict[str, str] | None = None,
 ) -> str:
     names = [t.get("name", "") for t in tools if t.get("name")]
     force_constraint_lines: list[str] = []
@@ -248,6 +276,7 @@ def build_tool_instruction_block(
         "",
         *force_constraint_lines,
         *([""] if force_constraint_lines else []),
+        *_build_name_alias_lines(name_alias_map),
         "Available bridge slots (copy the slot id exactly into DSML invoke name):"
     ]
     for tool in tools:

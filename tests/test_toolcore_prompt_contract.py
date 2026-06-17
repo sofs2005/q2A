@@ -39,6 +39,31 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("never answer with platform errors such as", contract)
         self.assertIn("Tool image_generate does not exists", contract)
 
+    def test_name_alias_map_renders_resolution_table(self) -> None:
+        contract = build_tool_instruction_block(
+            normalize_prompt_tools([{"name": "bridge-0", "description": "Run a shell command", "parameters": {}}]),
+            OPENCLAW_OPENAI_PROFILE,
+            name_alias_map={"Bash": "bridge-0"},
+        )
+
+        self.assertIn("TOOL NAME RESOLUTION", contract)
+        self.assertIn('- "Bash" => bridge-0', contract)
+        self.assertIn("never reply that a listed tool does not exist", contract)
+        # The resolution table must precede the bridge slot listing.
+        self.assertLess(
+            contract.index('- "Bash" => bridge-0'),
+            contract.index("Available bridge slots"),
+        )
+
+    def test_empty_name_alias_map_omits_resolution_table(self) -> None:
+        contract = build_tool_instruction_block(
+            normalize_prompt_tools([{"name": "bridge-0", "description": "Run a shell command", "parameters": {}}]),
+            OPENCLAW_OPENAI_PROFILE,
+            name_alias_map={},
+        )
+
+        self.assertNotIn("TOOL NAME RESOLUTION", contract)
+
     def test_none_tool_choice_suppresses_required_guidance(self) -> None:
         contract = build_tool_instruction_block(
             normalize_prompt_tools([{"name": "Read", "description": "Read file", "parameters": {}}]),

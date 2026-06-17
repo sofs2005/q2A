@@ -228,6 +228,7 @@ def build_prompt_with_tools(
             tool_choice_mode=tool_choice_mode,
             required_tool_name=required_tool_name,
             command_environment=command_environment,
+            name_alias_map=tool_reference_replacements,
         )
     opencode_override = bool(tools and client_profile == OPENCLAW_OPENAI_PROFILE and looks_like_opencode_system_prompt(system_prompt))
     if opencode_override and tools_part:
