@@ -350,7 +350,8 @@ class QwenExecutor:
                         acc.waf_cookies = ""  # 真正失效旧 acw_tc（expires=0 不生效），逼下轮裸奔收割
                         acc.waf_cookies_expires_at = 0
                         if self.auth_resolver is not None:
-                            asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
+                            # 必须 await 等待自愈完成，否则 create_task 异步执行时重试已发出、cookie 仍为空
+                            await self.auth_resolver.auto_heal_account(acc)
                         log.warning(f"[Executor] fixed account WAF hit, in-place reseed+retry account={acc.email} error={e}")
                         continue
                     self.account_pool.release(acc)
