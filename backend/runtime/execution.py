@@ -709,7 +709,7 @@ async def collect_completion_run(
             prompt,
             has_custom_tools=bool(request.tools),
             files=getattr(request, "upstream_files", None),
-            fixed_account=getattr(request, "bound_account", None),
+            preferred_account=getattr(request, "bound_account", None),
         ):
             if item.get("type") == "meta":
                 chat_id = item.get("chat_id")

@@ -58,38 +58,38 @@ class _RetryPool:
 
 
 class QwenExecutorAccountFlowTests(unittest.IsolatedAsyncioTestCase):
-    async def test_fixed_account_path_passes_account_objects_to_create_and_stream(self) -> None:
+    async def test_preferred_account_is_used_first_attempt(self) -> None:
+        """preferred_account 应在首次尝试时被使用，且 chat_id 来自预热池。"""
         account = Account(email="alice@example.com", token="token-1")
         account.fingerprint_id = "chrome146_windows"
-        executor = QwenExecutor(SimpleNamespace(), _Pool())
+        chat_pool = SimpleNamespace(
+            remember_model=AsyncMock(),
+            take=AsyncMock(return_value=("warm-chat-1", True)),
+        )
+        pool = _RetryPool(account)
+        executor = QwenExecutor(SimpleNamespace(chat_id_pool=chat_pool), pool)
         seen = []
 
-        async def fake_create_chat(acc, model, chat_type="t2t"):
-            seen.append(("create", acc, model, chat_type))
-            return "chat-1"
-
-        async def fake_stream(acc, chat_id, model, content, has_custom_tools=False, files=None):
-            seen.append(("stream", acc, chat_id, model, content, has_custom_tools, files))
+        async def fake_stream(acc, chat_id, model, content, has_custom_tools=False, files=None, chat_type="t2t", media_options=None):
+            seen.append(("stream", acc, chat_id, model, content))
             if False:
                 yield None
             return
             yield
 
-        executor.create_chat = fake_create_chat
         executor.stream = fake_stream
 
         events = []
-        async for item in executor.chat_stream_events_with_retry("gpt-4o", "hello", fixed_account=account):
+        async for item in executor.chat_stream_events_with_retry("gpt-4o", "hello", preferred_account=account):
             events.append(item)
 
         self.assertEqual(events[0]["type"], "meta")
         self.assertIs(events[0]["acc"], account)
-        self.assertEqual(seen[0][0], "create")
+        self.assertEqual(events[0]["chat_id"], "warm-chat-1")
+        chat_pool.take.assert_awaited_once_with("alice@example.com", "gpt-4o", "t2t")
+        self.assertEqual(seen[0][0], "stream")
         self.assertIs(seen[0][1], account)
-        self.assertEqual(seen[0][2], "gpt-4o")
-        self.assertEqual(seen[1][0], "stream")
-        self.assertIs(seen[1][1], account)
-        self.assertEqual(seen[1][2], "chat-1")
+        self.assertEqual(seen[0][2], "warm-chat-1")
 
     async def test_create_chat_reports_waf_blocked_for_aliyun_waf_html(self) -> None:
         account = Account(email="alice@example.com", token="token-1")

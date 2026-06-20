@@ -310,63 +310,23 @@ class QwenExecutor:
         content: str,
         has_custom_tools: bool = False,
         files: list[dict] | None = None,
-        fixed_account=None,
+        preferred_account=None,
         chat_type: str = "t2t",
         media_options: dict | None = None,
     ):
         exclude = set()
-        if fixed_account is not None:
-            # 固定账号（上下文文件绑定该账号工作区）不能换号，否则读不到已上传文件，
-            # 故池路径的失败转移不适用。撞 WAF 时改为原地自愈：清空 acw_tc 逼 create_chat
-            # 裸奔重新收割种子 cookie，再用同账号重试一次（仅在尚未产出事件时安全重试）。
-            acc = fixed_account
-            waf_retry_used = False
-            attempt_no = 0
-            while True:
-                attempt_no += 1
-                update_request_context(upstream_attempt=attempt_no)
-                produced = False
-                try:
-                    log.info(f"[Executor] using fixed account={acc.email} model={model} attempt={attempt_no}")
-                    if waf_retry_used:
-                        # 绕过预热复用，强制新建 chat 以触发 _absorb_waf_cookie 重新收割 acw_tc
-                        chat_id, reused = await self.create_chat(acc, model, chat_type=chat_type), False
-                    else:
-                        chat_id, reused = await self.get_chat_id(acc, model, chat_type=chat_type)
-                    update_request_context(chat_id=chat_id)
-                    log.info(f"[Executor] created chat_id={chat_id} account={acc.email} prewarmed={reused}")
-                    yield {"type": "meta", "chat_id": chat_id, "acc": acc}
-                    async for evt in self.stream(acc, chat_id, model, content, has_custom_tools, files=files, chat_type=chat_type, media_options=media_options):
-                        produced = True
-                        yield {"type": "event", "event": evt}
-                    return
-                except (asyncio.CancelledError, GeneratorExit):
-                    self.account_pool.release(acc)
-                    raise
-                except Exception as e:
-                    err = str(e).lower()
-                    if ("waf_blocked" in err or "aliyun_waf" in err) and not waf_retry_used and not produced:
-                        waf_retry_used = True
-                        acc.waf_cookies = ""  # 真正失效旧 acw_tc（expires=0 不生效），逼下轮裸奔收割
-                        acc.waf_cookies_expires_at = 0
-                        if self.auth_resolver is not None:
-                            # 必须 await 等待自愈完成，否则 create_task 异步执行时重试已发出、cookie 仍为空
-                            await self.auth_resolver.auto_heal_account(acc)
-                        # WAF 命中后施加额外冷却，避免连续撞击加重风控
-                        extra_cooldown = max(0.0, float(getattr(settings, "WAF_RETRY_EXTRA_COOLDOWN_SECONDS", 5) or 0))
-                        if extra_cooldown > 0:
-                            log.info(f"[Executor] WAF cooldown {extra_cooldown:.1f}s before retry account={acc.email}")
-                            await asyncio.sleep(extra_cooldown)
-                        log.warning(f"[Executor] fixed account WAF hit, in-place reseed+retry account={acc.email} error={e}")
-                        continue
-                    self.account_pool.release(acc)
-                    raise
-
+        # 统一走预热池路径：所有请求（含文件绑定）都从 ChatIDPool 取已预热 chat_id，
+        # 不再区分 fixed_account / 普通池。preferred_account 仅作为首次尝试的首选账号，
+        # WAF/限流时仍走标准失败转移（换号重试），避免原地新建裸奔 chat_id 被 WAF 拦截。
         for attempt in range(settings.MAX_RETRIES):
             update_request_context(upstream_attempt=attempt + 1)
-            acc = await self.account_pool.acquire_wait(timeout=60, exclude=exclude)
-            if not acc:
-                raise Exception("No available accounts in pool (all busy or rate limited)")
+            # 首次尝试优先使用 affinity 绑定的首选账号（保证文件可达），后续重试走池分配
+            if attempt == 0 and preferred_account is not None:
+                acc = preferred_account
+            else:
+                acc = await self.account_pool.acquire_wait(timeout=60, exclude=exclude)
+                if not acc:
+                    raise Exception("No available accounts in pool (all busy or rate limited)")
 
             try:
                 log.info(f"[Executor] acquired account={acc.email} model={model} attempt={attempt + 1}")
