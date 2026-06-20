@@ -118,13 +118,33 @@ class AuthResolver:
         # 自动捕获 acw_tc WAF cookie（登录响应 Set-Cookie）
         import time as _time
         acw_tc = resp.cookies.get("acw_tc", "")
+
+        # 登录接口通常不返回 acw_tc，需额外发一次轻量请求触发 WAF 下发
+        if not acw_tc:
+            try:
+                seed_headers = fingerprint.build_headers(
+                    token=new_token,
+                    content_type="application/json",
+                )
+                seed_resp = await session.post(
+                    f"{BASE_URL}/api/v2/chats/new",
+                    json={"model": "qwen-max", "chat_type": "t2t"},
+                    headers=seed_headers,
+                )
+                acw_tc = seed_resp.cookies.get("acw_tc", "")
+                if acw_tc:
+                    log.info(f"[Refresh] {acc.email} acw_tc 通过 chats/new 种子请求获取")
+            except Exception as seed_err:
+                log.warning(f"[Refresh] {acc.email} 种子请求异常: {seed_err}")
+
         if acw_tc:
             acc.waf_cookies = f"acw_tc={acw_tc}"
             acc.waf_cookies_expires_at = _time.time() + 1500
             log.info(f"[Refresh] {acc.email} acw_tc 已同步刷新")
         else:
-            # 登录没返回 acw_tc，标记过期让下次请求自动获取
+            # 登录和种子请求都没返回 acw_tc，标记过期让下次 create_chat 收割
             acc.waf_cookies_expires_at = 0
+            log.warning(f"[Refresh] {acc.email} 未能获取 acw_tc，将在下次 create_chat 时收割")
 
         await self.pool.save()
         log.info(f"[Refresh] {acc.email} token 已更新")
