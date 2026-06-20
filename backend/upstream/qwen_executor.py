@@ -352,6 +352,11 @@ class QwenExecutor:
                         if self.auth_resolver is not None:
                             # 必须 await 等待自愈完成，否则 create_task 异步执行时重试已发出、cookie 仍为空
                             await self.auth_resolver.auto_heal_account(acc)
+                        # WAF 命中后施加额外冷却，避免连续撞击加重风控
+                        extra_cooldown = max(0.0, float(getattr(settings, "WAF_RETRY_EXTRA_COOLDOWN_SECONDS", 5) or 0))
+                        if extra_cooldown > 0:
+                            log.info(f"[Executor] WAF cooldown {extra_cooldown:.1f}s before retry account={acc.email}")
+                            await asyncio.sleep(extra_cooldown)
                         log.warning(f"[Executor] fixed account WAF hit, in-place reseed+retry account={acc.email} error={e}")
                         continue
                     self.account_pool.release(acc)
