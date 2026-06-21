@@ -583,7 +583,7 @@ class QwenClient:
         content: str,
         has_custom_tools: bool = False,
         files: list[dict] | None = None,
-        fixed_account=None,
+        preferred_account=None,
         chat_type: str = "t2t",
         media_options: dict | None = None,
     ):
@@ -592,7 +592,7 @@ class QwenClient:
             content,
             has_custom_tools,
             files=files,
-            fixed_account=fixed_account,
+            preferred_account=preferred_account,
             chat_type=chat_type,
             media_options=media_options,
         ):
