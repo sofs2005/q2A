@@ -34,7 +34,6 @@ class QwenClient:
         return {
             "Version": "0.2.66",
             "source": "web",
-            "bx-v": "2.5.36",
             "X-Request-Id": str(uuid.uuid4()),
             "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT%z", time.localtime()),
             "X-Accel-Buffering": "no",
