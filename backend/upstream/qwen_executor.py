@@ -73,13 +73,14 @@ class QwenExecutor:
         if request_fn is None:
             raise Exception("request transport unavailable")
 
-        ts = int(time.time())
+        ts = int(time.time() * 1000)
         body = {
             "title": f"api_{ts}",
             "models": [model],
             "chat_mode": "normal",
             "chat_type": chat_type,
             "timestamp": ts,
+            "project_id": "",
         }
 
         if getattr(self.engine, "_request_json", None) is not None:
@@ -91,6 +92,7 @@ class QwenExecutor:
                 timeout=settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS,
                 account=account,
                 chat_transport=True,
+                referer=f"{BASE_URL}/c/new-chat",
             )
         else:
             r = await request_fn("POST", "/api/v2/chats/new", token, body)

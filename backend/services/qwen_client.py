@@ -32,8 +32,9 @@ class QwenClient:
     @staticmethod
     def _web_client_headers() -> dict[str, str]:
         return {
-            "Version": "0.2.57",
+            "Version": "0.2.66",
             "source": "web",
+            "bx-v": "2.5.36",
             "X-Request-Id": str(uuid.uuid4()),
             "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT%z", time.localtime()),
             "X-Accel-Buffering": "no",
@@ -156,7 +157,7 @@ class QwenClient:
         )
 
     @staticmethod
-    def _build_chat_transport_headers(*, account: Account | None = None, token: str | None = None, accept: str = "application/json, text/plain, */*") -> dict[str, str]:
+    def _build_chat_transport_headers(*, account: Account | None = None, token: str | None = None, accept: str = "application/json, text/plain, */*", referer: str | None = None) -> dict[str, str]:
         fingerprint = fingerprint_for_account(account)
         headers = {
             "Authorization": f"Bearer {token}" if token else "",
@@ -164,7 +165,7 @@ class QwenClient:
             "User-Agent": fingerprint.user_agent,
             "Accept": accept,
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Referer": f"{BASE_URL}/",
+            "Referer": referer or f"{BASE_URL}/",
             "Origin": BASE_URL,
             "Connection": "keep-alive",
             "Content-Type": "application/json",
@@ -240,9 +241,10 @@ class QwenClient:
         timeout: float | None = None,
         account: Account | None = None,
         chat_transport: bool = False,
+        referer: str | None = None,
     ) -> dict:
         request_timeout = timeout if timeout is not None else settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS
-        headers = self._build_chat_transport_headers(account=account, token=token) if chat_transport else self._build_headers(account=account, token=token)
+        headers = self._build_chat_transport_headers(account=account, token=token, referer=referer) if chat_transport else self._build_headers(account=account, token=token, referer=referer)
         session = await get_session(fingerprint_for_account(account))
         log.info("[QwenClient] request_headers path=%s diag=%s", path, self._header_diagnostics(account=account, headers=headers))
         try:
@@ -502,7 +504,10 @@ class QwenClient:
 
     async def stream_chat_once(self, token: str, chat_id: str, payload: dict, account: Account | None = None) -> AsyncIterator[dict]:
         timeout = settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS
-        headers = self._build_chat_transport_headers(account=account, token=token, accept="text/event-stream")
+        headers = self._build_chat_transport_headers(
+            account=account, token=token, accept="text/event-stream",
+            referer=f"{BASE_URL}/c/{chat_id}",
+        )
         if bool(getattr(settings, "QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP", True)):
             log.info(
                 "[QwenClient] stream_headers chat_id=%s dedicated_session=%s diag=%s",
