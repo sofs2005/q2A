@@ -25,12 +25,25 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
-    # Playwright Chromium runtime dependencies
+    # Playwright Chromium runtime dependencies (complete set)
     libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
     libatk-bridge2.0-0 \
+    libcups2 \
     libdrm2 \
+    libdbus-1-3 \
     libxkbcommon0 \
+    libatspi2.0-0 \
+    libx11-6 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxrandr2 \
     libgbm1 \
+    libpango-1.0-0 \
+    libcairo2 \
     libasound2 \
     libxshmfence1 \
     libx11-xcb1 \
@@ -40,6 +53,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY backend/requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt
+
+# Install Playwright Chromium browser binary (must be after pip install)
+RUN playwright install --with-deps chromium
 
 COPY backend/ ./backend/
 COPY start.py ./
