@@ -301,7 +301,7 @@ class CaptchaSolver:
             context = await browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
                 ),
                 viewport={"width": 1280, "height": 720},
                 locale="zh-CN",
@@ -458,8 +458,36 @@ Function.prototype.toString = function() {
                     except Exception as e:
                         log.warning("[CaptchaSolver] 导航 punish URL 异常: %s", str(e)[:200])
 
-                    # 等待滑块元素渲染,然后主动拖动
-                    await self._drag_slider(page)
+                    # ── 自动验证等待期 ──
+                    # headless 模式下 x5sec punish 页面可能自动放行（无需拖动）
+                    # 先等 3s 轮询 cookie / URL 变化，若已放行则跳过拖动
+                    AUTO_VERIFY_WAIT = 3.0
+                    auto_verified = False
+                    auto_deadline = asyncio.get_event_loop().time() + AUTO_VERIFY_WAIT
+                    while asyncio.get_event_loop().time() < auto_deadline:
+                        cur_url = page.url or ""
+                        if cur_url and "punish" not in cur_url and "_____tmd_____" not in cur_url:
+                            log.info("[CaptchaSolver] 自动验证通过（无需拖动），URL=%s", cur_url[:80])
+                            auto_verified = True
+                            passed = True
+                            break
+                        # 检查是否已下发 x5sec cookie
+                        try:
+                            cookies = await context.cookies()
+                            cookie_names = {c["name"] for c in cookies}
+                            if "x5sec" in cookie_names or "acw_sc__v3" in cookie_names:
+                                log.info("[CaptchaSolver] 自动验证通过（检测到放行 cookie）")
+                                auto_verified = True
+                                passed = True
+                                break
+                        except Exception:
+                            pass
+                        await page.wait_for_timeout(300)
+
+                    if not auto_verified:
+                        # 自动验证未通过，需要主动拖动滑块
+                        log.info("[CaptchaSolver] 自动验证未通过，开始主动拖动滑块")
+                        await self._drag_slider(page)
 
                     # 等待滑块验证完成:页面 URL 不再含 punish/_____tmd_____
                     last_url = ""
@@ -638,13 +666,13 @@ Function.prototype.toString = function() {
         try:
             # 等待滑块完全渲染，最多重试3次获取 bounding_box
             box = None
-            for attempt in range(3):
-                await page.wait_for_timeout(500)
+            for attempt in range(5):
+                await page.wait_for_timeout(200)
                 box = await slider.bounding_box()
                 if box:
                     break
                 log.warning("[CaptchaSolver] 滑块元素 bounding box 为空, 重试第%d次", attempt + 1)
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(300)
 
             if not box:
                 log.warning("[CaptchaSolver] 滑块元素 bounding box 始终为空")
@@ -751,13 +779,13 @@ Function.prototype.toString = function() {
             except Exception as e:
                 log.warning("[CaptchaSolver] 检查拖动结果异常: %s", str(e)[:100])
 
-            # 如果拖动失败，最多重试3次
-            max_retries = 3
+            # 如果拖动失败，最多重试1次（x5secdata 仅 20s 有效，不宜浪费时间在多次重试上）
+            max_retries = 1
             retry_count = 0
             while not moved_successfully and retry_count < max_retries:
                 retry_count += 1
                 log.warning("[CaptchaSolver] 第%d次拖动失败，尝试第%d次重试", retry_count, retry_count + 1)
-                await page.wait_for_timeout(random.randint(3000, 5000))
+                await page.wait_for_timeout(random.randint(800, 1500))
 
                 try:
                     retry_box = await slider.bounding_box()
