@@ -193,12 +193,23 @@ async def add_account(request: Request):
         raise HTTPException(400, detail="Invalid JSON body")
 
     token = data.get("token", "")
+    email = data.get("email", "")
+    password = data.get("password", "")
+
+    # 支持仅填邮箱密码自动登录获取 token
     if not token:
-        raise HTTPException(400, detail="token is required")
+        if not email or not password:
+            raise HTTPException(400, detail="需要提供 token，或者同时提供 email + password")
+        log.info(f"[AddAccount] 未提供 token，尝试用 {email} 自动登录获取...")
+        ok, new_token, err_detail = await client.auth_resolver.login(email, password)
+        if not ok or not new_token:
+            return {"ok": False, "error": f"自动登录失败: {err_detail or '未知错误'}"}
+        token = new_token
+        log.info(f"[AddAccount] {email} 自动登录成功，已获取 token")
 
     acc = Account(
-        email=data.get("email", f"manual_{int(time.time())}@qwen"),
-        password=data.get("password", ""),
+        email=email or f"manual_{int(time.time())}@qwen",
+        password=password,
         token=token,
         cookies=data.get("cookies", ""),
         username=data.get("username", "")
