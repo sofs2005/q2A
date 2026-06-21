@@ -8,7 +8,7 @@ import time
 
 from backend.core.config import settings
 from backend.core.request_logging import update_request_context
-from backend.services.auth_resolver import AuthResolver
+from backend.services.auth_resolver import BASE_URL, AuthResolver
 from backend.upstream.payload_builder import build_chat_payload
 from backend.upstream.sse_consumer import parse_sse_chunk
 
