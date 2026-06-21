@@ -105,6 +105,7 @@ class ChatIDPool:
             acc
             for acc in getattr(self.account_pool, "accounts", [])
             if acc.is_available()
+            and acc.get_status_code() not in ("disabled", "banned", "auth_error", "invalid")
             and int(getattr(acc, "inflight", 0) or 0) < max_inflight
             and float(getattr(acc, "next_available_at", lambda: 0.0)()) <= now
         ]

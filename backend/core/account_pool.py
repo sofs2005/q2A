@@ -460,7 +460,9 @@ class AccountPool:
                 now = time.time()
                 candidates = [
                     a for a in self.accounts
-                    if a.valid and (not exclude or a.email not in exclude)
+                    if a.valid
+                    and a.get_status_code() not in ("disabled", "banned", "auth_error", "invalid")
+                    and (not exclude or a.email not in exclude)
                 ]
                 snapshot = self._scheduler_snapshot(now, exclude)
                 if not candidates:
