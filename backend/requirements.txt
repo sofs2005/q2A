@@ -7,3 +7,4 @@ python-multipart
 tiktoken
 curl_cffi
 oss2
+playwright

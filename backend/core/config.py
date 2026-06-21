@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     QWEN_CHAT_TRANSPORT_SEND_COOKIES: bool = os.getenv("QWEN_CHAT_TRANSPORT_SEND_COOKIES", "false").lower() in {"1", "true", "yes", "on"}
     QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP: bool = os.getenv("QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP", "true").lower() in {"1", "true", "yes", "on"}
 
+    # Captcha Solver (x5sec punish 滑块突破)
+    CAPTCHA_SOLVER_ENABLED: bool = os.getenv("CAPTCHA_SOLVER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    CAPTCHA_SOLVER_TIMEOUT_MS: int = int(os.getenv("CAPTCHA_SOLVER_TIMEOUT_MS", 15000))
+    CAPTCHA_BROWSER_IDLE_TIMEOUT: float = float(os.getenv("CAPTCHA_BROWSER_IDLE_TIMEOUT", 30))
+    WAF_PUNISH_COOLDOWN: int = int(os.getenv("WAF_PUNISH_COOLDOWN", 1800))
+
     # 日志
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     QWEN_CODE_CODER_MODEL: str = os.getenv("QWEN_CODE_CODER_MODEL", "qwen3-coder-plus")

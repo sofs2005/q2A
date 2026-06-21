@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 
@@ -354,6 +355,10 @@ class QwenExecutor:
                         log.info(f"[Executor] WAF 兜底 create_chat 完成 account={acc.email}")
                     except Exception as seed_err:
                         log.warning(f"[Executor] WAF 兜底 create_chat 失败 account={acc.email} error={seed_err}")
+                # 重试前随机退避 2~5s：降低 IP 频率分，给新 cookie 生效时间
+                backoff = random.uniform(2.0, 5.0)
+                log.info(f"[Executor] retry backoff {backoff:.1f}s before attempt={attempt + 2}")
+                await asyncio.sleep(backoff)
             except (asyncio.CancelledError, GeneratorExit):
                 self.account_pool.release(acc)
                 raise

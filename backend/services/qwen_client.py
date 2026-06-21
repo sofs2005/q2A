@@ -13,6 +13,8 @@ from backend.core.browser_fingerprint import fingerprint_for_account, get_sessio
 from backend.core.config import settings
 from backend.services.auth_resolver import BASE_URL, AuthResolver
 from backend.services.chat_id_pool import ChatIDPool
+from backend.services.waf_cookie_manager import WafCookieManager
+from backend.services.captcha_solver import CaptchaSolver, extract_punish_url
 from backend.upstream.payload_builder import build_chat_payload
 from backend.upstream.sse_consumer import parse_sse_chunk
 
@@ -501,8 +503,118 @@ class QwenClient:
         async for event in self.executor.stream(token, chat_id, model, content, has_custom_tools, files=files, account=account):
             yield event
 
+    @staticmethod
+    def _is_punish_response(status_code: int, body_text: str, headers: dict | None = None) -> bool:
+        """检测响应是否为 x5sec punish 滑块挑战页。"""
+        if status_code != 200:
+            return False
+        body_lower = (body_text or "").lower()
+        if "_____tmd_____" in body_lower:
+            return True
+        if "<script>" in body_text[:500] and "x5sec" in body_lower:
+            return True
+        if headers and headers.get("bxpunish") == "1":
+            return True
+        return False
+
+    async def _handle_punish_and_retry(
+        self,
+        token: str,
+        chat_id: str,
+        payload: dict,
+        account: Account | None,
+        body_text: str,
+        timeout: float,
+    ) -> AsyncIterator[dict]:
+        """检测到 x5sec punish 后尝试滑块突破并重试 HTTP completions。
+
+        成功则 yield 重试后的正常响应；失败则标记账号冷却 1800s 并 yield 403。
+        """
+        punish_url = extract_punish_url(body_text)
+        log.warning(
+            "[stream_chat_once] x5sec punish detected chat_id=%s punish_url=%s",
+            chat_id, (punish_url or "")[:120] if punish_url else "None",
+        )
+
+        solver = CaptchaSolver.get_instance()
+        pass_cookies = await solver.solve_punish(
+            punish_url=punish_url or "",
+            account_token=token,
+        )
+
+        if pass_cookies:
+            log.info(
+                "[stream_chat_once] captcha solved cookies=%s, retrying HTTP completions",
+                list(pass_cookies.keys()),
+            )
+            if account:
+                waf_mgr = WafCookieManager.get_instance()
+                waf_mgr.update_cookies(account, pass_cookies)
+
+            retry_headers = self._build_chat_transport_headers(
+                account=account, token=token, accept="text/event-stream",
+                referer=f"{BASE_URL}/c/{chat_id}",
+            )
+            # 重试走 Go-like HTTP 路径（简单可靠，避免 curl_cffi session 状态问题）
+            try:
+                _proxy = getattr(settings, "UPSTREAM_PROXY", "") or None
+                async with httpx.AsyncClient(http2=False, follow_redirects=True, timeout=timeout, proxy=_proxy) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
+                        headers=retry_headers,
+                        json=payload,
+                        timeout=timeout,
+                    ) as resp2:
+                        if resp2.status_code != 200:
+                            body_chunks2 = []
+                            async for chunk in resp2.aiter_bytes():
+                                body_chunks2.append(chunk)
+                            body_text2 = b"".join(body_chunks2).decode(errors="replace")[:2000]
+                            still_punish = self._is_punish_response(resp2.status_code, body_text2, dict(resp2.headers))
+                            if still_punish:
+                                log.warning("[stream_chat_once] retry still punished after captcha solve")
+                            else:
+                                log.error(f"[stream_chat_once] retry non-200 status={resp2.status_code}")
+                                yield {"status": resp2.status_code, "body": body_text2}
+                                return
+                        else:
+                            log.info("[stream_chat_once] retry success after captcha solve")
+                            async for chunk in resp2.aiter_bytes():
+                                decoded = chunk.decode("utf-8", errors="replace")
+                                if decoded:
+                                    yield {"chunk": decoded}
+                            yield {"status": "streamed"}
+                            return
+            except Exception as retry_err:
+                log.error(f"[stream_chat_once] retry request failed: {retry_err}")
+
+        # 滑块失败或重试仍被拦截：降级为 1800s 冷却
+        log.warning("[stream_chat_once] captcha failed or retry still punished, cooling down 1800s")
+        if account:
+            waf_mgr = WafCookieManager.get_instance()
+            waf_mgr.mark_expired(account)
+            if self.account_pool is not None:
+                self.account_pool.mark_rate_limited(
+                    account, cooldown=1800,
+                    error_message="x5sec punish interception, account cooled down 1800s",
+                )
+        yield {
+            "status": 403,
+            "body": '{"error":"x5sec punish interception, account cooled down 1800s"}',
+        }
+
     async def stream_chat_once(self, token: str, chat_id: str, payload: dict, account: Account | None = None) -> AsyncIterator[dict]:
         timeout = settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS
+
+        # 构建 headers 前先刷新 WAF cookie（过期时自动 GET 首页获取 acw_tc）
+        if account:
+            try:
+                waf_mgr = WafCookieManager.get_instance()
+                await waf_mgr.get_cookies(account)
+            except Exception as waf_err:
+                log.warning("[stream_chat_once] WAF cookie refresh failed: %s", waf_err)
+
         headers = self._build_chat_transport_headers(
             account=account, token=token, accept="text/event-stream",
             referer=f"{BASE_URL}/c/{chat_id}",
@@ -532,6 +644,31 @@ class QwenClient:
                             yield {"status": resp.status_code, "body": body_text}
                             return
 
+                        # 流式读取：先收集第一个 chunk 检测是否 punish 页
+                        first_chunk = ""
+                        async for chunk in resp.aiter_bytes():
+                            decoded = chunk.decode("utf-8", errors="replace")
+                            if decoded:
+                                first_chunk += decoded
+                                # 收到足够数据后检测 punish（SSE 首行通常 < 500 bytes）
+                                if len(first_chunk) >= 200 or "\n\n" in first_chunk:
+                                    break
+
+                        if self._is_punish_response(200, first_chunk):
+                            # 读完剩余 body 用于提取 punish URL
+                            remaining = []
+                            async for chunk in resp.aiter_bytes():
+                                remaining.append(chunk)
+                            full_body = first_chunk + b"".join(remaining).decode("utf-8", errors="replace")
+                            async for item in self._handle_punish_and_retry(
+                                token, chat_id, payload, account, full_body, timeout,
+                            ):
+                                yield item
+                            return
+
+                        # 非 punish：正常 yield 已读数据 + 继续流式
+                        if first_chunk:
+                            yield {"chunk": first_chunk}
                         async for chunk in resp.aiter_bytes():
                             decoded = chunk.decode("utf-8", errors="replace")
                             if decoded:
@@ -567,6 +704,29 @@ class QwenClient:
                     yield {"status": resp.status_code, "body": body_text}
                     return
 
+                # 流式读取：先收集第一个 chunk 检测是否 punish 页
+                first_chunk = ""
+                async for chunk in resp.aiter_content():
+                    decoded = chunk.decode("utf-8", errors="replace")
+                    if decoded:
+                        first_chunk += decoded
+                        if len(first_chunk) >= 200 or "\n\n" in first_chunk:
+                            break
+
+                if self._is_punish_response(200, first_chunk):
+                    remaining = []
+                    async for chunk in resp.aiter_content():
+                        remaining.append(chunk)
+                    full_body = first_chunk + b"".join(remaining).decode("utf-8", errors="replace")
+                    async for item in self._handle_punish_and_retry(
+                        token, chat_id, payload, account, full_body, timeout,
+                    ):
+                        yield item
+                    return
+
+                # 非 punish：正常 yield
+                if first_chunk:
+                    yield {"chunk": first_chunk}
                 async for chunk in resp.aiter_content():
                     decoded = chunk.decode("utf-8", errors="replace")
                     if decoded:
