@@ -39,19 +39,36 @@ class AuthResolver:
 
     async def auto_heal_account(self, acc: Account):
         """Background task to refresh token. If successful, marks account valid.
-        If refresh fails or account is pending activation, tries to activate via email."""
+        If refresh fails or account is pending activation, tries to activate via email.
+
+        WAF/rate_limit 冷却期间跳过自愈：token 刷新无法解除 IP/行为级封锁，
+        且刷新过程中的种子请求可能进一步触发 WAF。
+        """
         if getattr(acc, "healing", False):
             log.info(f"[BGRefresh] {acc.email} healing already in progress")
+            return
+
+        # WAF/rate_limit 冷却中不触发自愈，避免种子请求加重封锁
+        import time as _time
+        if getattr(acc, "rate_limited_until", 0) > _time.time():
+            remaining = int(acc.rate_limited_until - _time.time())
+            log.info(f"[自愈] {acc.email} 仍在冷却中(剩余{remaining}s)，跳过 token 刷新")
             return
 
         acc.healing = True
         try:
             ok = await self.refresh_token(acc)
             if ok:
+                # refresh_token 内部已处理状态标记（保留 rate_limited），
+                # 此处仅在非冷却状态下额外确认 valid
                 if not getattr(acc, 'activation_pending', False):
-                    acc.valid = True
-                    await self.pool.save()
-                    log.info(f"[自愈] {acc.email} Token 刷新成功，已标记有效")
+                    if acc.status_code != "rate_limited":
+                        acc.valid = True
+                        await self.pool.save()
+                        log.info(f"[自愈] {acc.email} Token 刷新成功，已标记有效")
+                    else:
+                        await self.pool.save()
+                        log.info(f"[自愈] {acc.email} Token 刷新成功，冷却中保留 rate_limited 状态")
                     return
                 log.info(f"[BGRefresh] {acc.email} token refreshed but account still needs activation")
             else:
@@ -110,10 +127,16 @@ class AuthResolver:
             return False
 
         acc.token = new_token
-        acc.valid = True
         acc.activation_pending = False
-        acc.status_code = "valid"
-        acc.last_error = ""
+        # Token 刷新成功只恢复凭证有效性，不覆盖 WAF/rate_limit 冷却状态
+        # WAF punish 是 IP/行为级封锁，与 Token 有效性无关
+        if acc.status_code not in ("rate_limited",):
+            acc.valid = True
+            acc.status_code = "valid"
+            acc.last_error = ""
+        else:
+            # 冷却中：仅更新 token，保留 rate_limited 状态和冷却时间
+            log.info(f"[Refresh] {acc.email} token 已刷新，但账号仍在冷却中，保留 rate_limited 状态")
 
         # 自动捕获 acw_tc WAF cookie（登录响应 Set-Cookie）
         import time as _time

@@ -661,14 +661,21 @@ Function.prototype.toString = function() {
 
             track_info = await slider.evaluate("""
 (el) => {
-    const track = el.closest ? el.closest('.nc_scale') : null;
-    if (track) {
-        const rect = track.getBoundingClientRect();
-        return {width: rect.width, left: rect.left, found: true};
+    // 多级轨道探测：.nc_scale → .nc_wrapper → 父容器 → 视口估算
+    const candidates = ['.nc_scale', '.nc_wrapper', '[class*="scale"]', '[class*="track"]'];
+    for (const sel of candidates) {
+        const track = el.closest ? el.closest(sel) : null;
+        if (track) {
+            const rect = track.getBoundingClientRect();
+            // 合理性校验：宽度必须在 [100, 800] 范围内
+            if (rect.width >= 100 && rect.width <= 800 && rect.left >= 0) {
+                return {width: rect.width, left: rect.left, found: true, selector: sel};
+            }
+        }
     }
-    // 找不到 track 时，使用滑块自身的位置和默认宽度
+    // 所有候选都无效，返回标记
     const elRect = el.getBoundingClientRect();
-    return {width: 300, left: elRect.left, found: false};
+    return {width: 0, left: elRect.left, found: false, selector: null};
 }
 """)
             track_width = track_info["width"]
@@ -678,19 +685,42 @@ Function.prototype.toString = function() {
             start_x = box["x"] + box["width"] / 2
             start_y = box["y"] + box["height"] / 2
 
-            # 如果找不到 track，使用滑块位置 + 默认拖动距离
-            if not track_found:
-                log.warning("[CaptchaSolver] 未找到 .nc_scale，使用默认拖动距离")
-                end_x = start_x + 250  # 默认向右拖动 250px
-            else:
+            if track_found:
                 end_x = track_left + track_width - box["width"] / 2 - 2
+                log.info(
+                    "[CaptchaSolver] 轨道探测成功 selector=%s width=%.1f left=%.1f",
+                    track_info.get("selector"), track_width, track_left,
+                )
+            else:
+                # 多级 fallback：视口比例估算
+                viewport_width = 1280  # 与 BrowserContext viewport 一致
+                estimated_track_width = 300  # 阿里云滑块轨道通常 ~300px
+                # 尝试从页面获取实际视口宽度
+                try:
+                    vw = await page.evaluate("() => window.innerWidth")
+                    if isinstance(vw, (int, float)) and 320 <= vw <= 3840:
+                        viewport_width = vw
+                        # 轨道通常是视口宽度的 20%-30%
+                        estimated_track_width = max(200, min(350, int(viewport_width * 0.25)))
+                except Exception:
+                    pass
+                log.warning(
+                    "[CaptchaSolver] 未找到有效轨道，使用视口估算 viewport=%d track_est=%d",
+                    viewport_width, estimated_track_width,
+                )
+                end_x = start_x + estimated_track_width
 
             distance = end_x - start_x
 
-            # 安全检查：距离必须为正
-            if distance <= 0:
-                log.warning("[CaptchaSolver] 计算的距离无效 distance=%.1f，使用默认值", distance)
-                distance = 250
+            # 安全钳位：距离必须在 [180, 350] 合理区间内
+            MIN_DISTANCE = 180
+            MAX_DISTANCE = 350
+            if distance < MIN_DISTANCE or distance > MAX_DISTANCE:
+                log.warning(
+                    "[CaptchaSolver] 距离异常 distance=%.1f，钳位到 [%d, %d]",
+                    distance, MIN_DISTANCE, MAX_DISTANCE,
+                )
+                distance = max(MIN_DISTANCE, min(MAX_DISTANCE, distance))
                 end_x = start_x + distance
 
             log.info(
