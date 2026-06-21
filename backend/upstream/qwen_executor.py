@@ -340,18 +340,30 @@ class QwenExecutor:
                 return
 
             except Exception as e:
-                self._classify_and_release(acc, e, exclude)
+                needs_heal = await self._classify_and_release(acc, e, exclude)
                 log.warning(
                     f"[Executor] retry attempt={attempt + 1}/{settings.MAX_RETRIES} account={acc.email} error={e}"
                 )
+                # WAF/401 自愈完成后，如果账号仍无有效 acw_tc，强制新建 chat 收割 cookie
+                # （预热池复用的 chat_id 不会触发 create_chat，导致 cookie 无法在重试链路中刷新）
+                if needs_heal and acc.waf_cookies_expires_at == 0:
+                    try:
+                        await self.create_chat(acc, model, chat_type=chat_type)
+                        log.info(f"[Executor] WAF 兜底 create_chat 完成 account={acc.email}")
+                    except Exception as seed_err:
+                        log.warning(f"[Executor] WAF 兜底 create_chat 失败 account={acc.email} error={seed_err}")
             except (asyncio.CancelledError, GeneratorExit):
                 self.account_pool.release(acc)
                 raise
 
         raise Exception(f"All {settings.MAX_RETRIES} attempts failed. Please check upstream accounts.")
 
-    def _classify_and_release(self, acc, e: Exception, exclude: set) -> None:
-        """按错误类型标记账号状态并加入排除集，最后释放账号（流式/非流式共用）。"""
+    async def _classify_and_release(self, acc, e: Exception, exclude: set) -> bool:
+        """按错误类型标记账号状态并加入排除集，最后释放账号（流式/非流式共用）。
+
+        Returns:
+            True 表示触发了 WAF/401 自愈（调用方应在重试前等待自愈完成并兜底收割 cookie）。
+        """
         err_msg = str(e).lower()
         is_timeout = (
             "timeout" in err_msg
@@ -359,6 +371,7 @@ class QwenExecutor:
             or "readtimeout" in err_msg
             or type(e).__name__ in ("ReadTimeout", "TimeoutError", "TimeoutException")
         )
+        needs_heal = False
 
         if is_timeout:
             log.warning(f"[Executor] timeout detected account={acc.email} error={e}")
@@ -368,21 +381,24 @@ class QwenExecutor:
             exclude.add(acc.email)
         elif "waf_blocked" in err_msg or "aliyun_waf" in err_msg:
             exclude.add(acc.email)
-            # WAF 命中：标记该账号 acw_tc 失效并后台刷新，为后续请求恢复风控 cookie
+            # WAF 命中：标记该账号 acw_tc 失效并立即刷新，为后续请求恢复风控 cookie
             acc.waf_cookies_expires_at = 0
             if self.auth_resolver is not None:
-                asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
+                await self.auth_resolver.auto_heal_account(acc)
+            needs_heal = True
         elif "unauthorized" in err_msg or "401" in err_msg or "403" in err_msg:
             self.account_pool.mark_invalid(acc)
             exclude.add(acc.email)
             if "activation" in err_msg or "pending" in err_msg:
                 acc.activation_pending = True
             if self.auth_resolver is not None:
-                asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
+                await self.auth_resolver.auto_heal_account(acc)
+            needs_heal = True
         else:
             exclude.add(acc.email)
 
         self.account_pool.release(acc)
+        return needs_heal
 
     async def complete_once_with_retry(
         self,
@@ -429,9 +445,16 @@ class QwenExecutor:
                 self.account_pool.release(acc)
                 raise
             except Exception as e:
-                self._classify_and_release(acc, e, exclude)
+                needs_heal = await self._classify_and_release(acc, e, exclude)
                 log.warning(
                     f"[Executor] non-stream retry attempt={attempt + 1}/{settings.MAX_RETRIES} account={acc.email} error={e}"
                 )
+                # WAF/401 自愈完成后，如果账号仍无有效 acw_tc，强制新建 chat 收割 cookie
+                if needs_heal and acc.waf_cookies_expires_at == 0:
+                    try:
+                        await self.create_chat(acc, model, chat_type=chat_type)
+                        log.info(f"[Executor] non-stream WAF 兜底 create_chat 完成 account={acc.email}")
+                    except Exception as seed_err:
+                        log.warning(f"[Executor] non-stream WAF 兜底 create_chat 失败 account={acc.email} error={seed_err}")
 
         raise Exception(f"All {settings.MAX_RETRIES} attempts failed. Please check upstream accounts.")
