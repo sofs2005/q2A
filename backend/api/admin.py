@@ -184,6 +184,7 @@ async def add_account(request: Request):
     from backend.core.account_pool import Account, AccountPool
     from backend.services.qwen_client import QwenClient
 
+    log = logging.getLogger("backend.api.admin")
     pool: AccountPool = request.app.state.account_pool
     client: QwenClient = request.app.state.qwen_client
 
