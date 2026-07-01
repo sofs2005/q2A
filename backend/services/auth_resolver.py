@@ -101,6 +101,49 @@ class AuthResolver:
         finally:
             acc.healing = False
 
+    async def login(self, email: str, password: str) -> tuple[bool, str, str]:
+        """Login with email+password and return (ok, token, error_detail)."""
+        log.info(f"[Login] 正在登录 {email}...")
+        payload = {
+            "email": email,
+            "password": self._sha256_password(password),
+        }
+
+        try:
+            fingerprint = fingerprint_for_account(email=email)
+            session = await get_session(fingerprint)
+            resp = await session.post(
+                f"{BASE_URL}/api/v1/auths/signin",
+                json=payload,
+                headers=fingerprint.build_headers(content_type="application/json"),
+            )
+        except Exception as e:
+            log.warning(f"[Login] {email} curl_cffi 登录异常: {e}")
+            return False, "", str(e)
+
+        if resp.status_code != 200:
+            detail = ""
+            try:
+                detail = resp.json().get("detail", "") or resp.text()
+            except Exception:
+                detail = resp.text()
+            log.warning(f"[Login] {email} HTTP {resp.status_code}，登录失败: {detail}")
+            return False, "", f"HTTP {resp.status_code}: {detail}"
+
+        try:
+            data = resp.json()
+        except Exception:
+            log.warning(f"[Login] {email} 登录响应不是 JSON")
+            return False, "", "登录响应不是 JSON"
+
+        new_token = str(data.get("token", "") or "").strip()
+        if not new_token:
+            log.warning(f"[Login] {email} 登录响应缺少 token 字段")
+            return False, "", "登录响应缺少 token 字段"
+
+        log.info(f"[Login] {email} 登录成功")
+        return True, new_token, ""
+
     async def refresh_token(self, acc: Account) -> bool:
         """Re-login with email+password via curl_cffi to get a fresh token."""
         if not acc.email or not acc.password:
