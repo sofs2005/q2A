@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import logging
 
@@ -110,7 +111,9 @@ class AuthResolver:
         }
 
         try:
-            fingerprint = fingerprint_for_account(email=email)
+            # login 没有 Account 对象，构造一个临时对象供 fingerprint 使用
+            temp_acc = Account(email=email, password=password)
+            fingerprint = fingerprint_for_account(temp_acc)
             session = await get_session(fingerprint)
             resp = await session.post(
                 f"{BASE_URL}/api/v1/auths/signin",
