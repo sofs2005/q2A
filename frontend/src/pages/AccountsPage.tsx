@@ -203,7 +203,6 @@ export default function AccountsPage() {
   const [accounts, setAccounts] = useState<AccountItem[]>([])
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
-  const [token, setToken] = useState("")
   const [registering, setRegistering] = useState(false)
   const [registerUnlocked, setRegisterUnlocked] = useState(false)
   const [verifying, setVerifying] = useState<string | null>(null)
@@ -639,26 +638,21 @@ export default function AccountsPage() {
   }
 
   const handleAdd = () => {
-    if (!token.trim()) {
-      toast.error("请先填写 Token")
+    if (!email.trim() || !password.trim()) {
+      toast.error("请填写邮箱和密码")
       return
     }
     const id = toast.loading("正在注入账号...")
     fetch(`${API_BASE}/api/admin/accounts`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...getAuthHeader() },
-      body: JSON.stringify({
-        email: email || `manual_${Date.now()}@qwen`,
-        password,
-        token,
-      })
+      body: JSON.stringify({ email, password })
     }).then(res => res.json())
       .then(data => {
         if (data.ok) {
           toast.success("账号已加入账号池", { id })
           setEmail("")
           setPassword("")
-          setToken("")
           fetchAccounts()
         } else {
           toast.error(localizeError(data.error) || "账号注入失败", { id, duration: 8000 })
@@ -842,28 +836,20 @@ export default function AccountsPage() {
 
       <div className="rounded-2xl border bg-card/40 p-6 space-y-4">
         <div>
-          <h3 className="text-base font-bold">{"手动注入账号"}</h3>
-          <p className="text-sm text-muted-foreground">{"请先在 chat.qwen.ai 登录，然后按 F12 打开开发者工具，在 Application / Storage 里的 Local Storage / 本地存储 中找到 token 并直接复制完整原始值粘贴到下方输入框。"}</p>
-          <div className="rounded-xl border border-orange-500/30 bg-orange-500/10 p-3 mt-3">
-            <p className="text-sm font-semibold text-orange-700 dark:text-orange-300">{"重要：请只粘贴 Local Storage / 本地存储 里的 token 原始值，不要从 Network 请求或 Authorization 请求头中提取。"}</p>
-            <p className="text-xs text-orange-700/80 dark:text-orange-200/80 mt-1">{"请不要带 Bearer 前缀，也不要粘贴整段 Authorization 文本。邮箱和密码可以不填，系统会在注入前先验证 token 是否有效。"}</p>
-          </div>
+          <h3 className="text-base font-bold">{"添加账号"}</h3>
+          <p className="text-sm text-muted-foreground">{"填写账号邮箱和密码，系统将自动登录并获取 Token。"}</p>
         </div>
         <div className="flex flex-col md:flex-row gap-4 items-end">
           <div className="flex-1 w-full">
-            <label className="text-xs font-semibold mb-1.5 block">{"Token（必填）"}</label>
-            <input type="text" value={token} onChange={e => setToken(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder={"粘贴从 Local Storage / 本地存储 直接复制的 token"} />
+            <label className="text-xs font-semibold mb-1.5 block">{"邮箱"}</label>
+            <input type="text" value={email} onChange={e => setEmail(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder={"账号邮箱地址"} />
           </div>
-          <div className="w-full md:w-64">
-            <label className="text-xs font-semibold mb-1.5 block">{"邮箱（选填）"}</label>
-            <input type="text" value={email} onChange={e => setEmail(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder={"邮箱地址"} />
-          </div>
-          <div className="w-full md:w-64">
-            <label className="text-xs font-semibold mb-1.5 block">{"密码（选填）"}</label>
-            <input type="text" value={password} onChange={e => setPassword(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder={"用于自动刷新或激活"} />
+          <div className="flex-1 w-full">
+            <label className="text-xs font-semibold mb-1.5 block">{"密码"}</label>
+            <input type="password" value={password} onChange={e => setPassword(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder={"账号密码"} />
           </div>
           <Button onClick={handleAdd} variant="secondary" className="h-10 w-full md:w-auto font-semibold">
-            <Plus className="mr-2 h-4 w-4" /> {"注入账号"}
+            <Plus className="mr-2 h-4 w-4" /> {"添加账号"}
           </Button>
         </div>
       </div>

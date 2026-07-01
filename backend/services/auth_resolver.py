@@ -57,7 +57,21 @@ class AuthResolver:
 
         acc.healing = True
         try:
-            ok = await self.refresh_token(acc)
+            # Token 刷新最多重试 3 次，带退避间隔避免连续请求触发 WAF
+            max_retries = 3
+            retry_delays = [30, 60, 120]  # 秒：第1次等30s，第2次等60s，第3次等120s
+            ok = False
+            for attempt in range(max_retries):
+                ok = await self.refresh_token(acc)
+                if ok:
+                    break
+                if attempt < max_retries - 1:
+                    delay = retry_delays[attempt]
+                    log.info(f"[自愈] {acc.email} 第{attempt + 1}次刷新失败，{delay}s 后重试...")
+                    await asyncio.sleep(delay)
+                else:
+                    log.warning(f"[自愈] {acc.email} Token 刷新已重试{max_retries}次均失败")
+
             if ok:
                 # refresh_token 内部已处理状态标记（保留 rate_limited），
                 # 此处仅在非冷却状态下额外确认 valid
