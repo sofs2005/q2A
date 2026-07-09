@@ -212,7 +212,7 @@ async def add_account(request: Request):
         email=email or f"manual_{int(time.time())}@qwen",
         password=password,
         token=token,
-        cookies=data.get("cookies", ""),
+        cookies="",
         username=data.get("username", "")
     )
 

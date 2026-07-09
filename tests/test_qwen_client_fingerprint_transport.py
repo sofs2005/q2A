@@ -129,7 +129,8 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers["sec-ch-ua-platform"], fingerprint.platform)
         self.assertIn('v="136"', headers["sec-ch-ua"])
         # Chat transport 仍包含 web client headers（WAF bypass）
-        self.assertIn("Version", headers)
+        self.assertEqual(headers["Version"], "0.2.71")
+        self.assertEqual(headers["bx-v"], "2.5.36")
         self.assertIn("source", headers)
         self.assertIn("Timezone", headers)
         self.assertEqual(headers["X-Accel-Buffering"], "no")
@@ -168,7 +169,8 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
             await client._request_json("POST", "/api/v2/chats/new", account.token, {}, account=account)
 
         headers = session.calls[0]["headers"]
-        self.assertEqual(headers["Version"], "0.2.57")
+        self.assertEqual(headers["Version"], "0.2.71")
+        self.assertEqual(headers["bx-v"], "2.5.36")
         self.assertEqual(headers["source"], "web")
         self.assertIn("X-Request-Id", headers)
         self.assertIn("Timezone", headers)
@@ -304,7 +306,8 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
     def test_web_client_headers_include_x_accel_buffering(self) -> None:
         headers = QwenClient._web_client_headers()
         self.assertEqual(headers["X-Accel-Buffering"], "no")
-        self.assertIn("Version", headers)
+        self.assertEqual(headers["Version"], "0.2.71")
+        self.assertEqual(headers["bx-v"], "2.5.36")
         self.assertIn("source", headers)
         self.assertIn("X-Request-Id", headers)
         self.assertIn("Timezone", headers)
@@ -313,7 +316,8 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         account = Account(email="alice@example.com", token="token-1")
         headers = QwenClient._build_chat_transport_headers(account=account, token=account.token)
         self.assertEqual(headers["X-Accel-Buffering"], "no")
-        self.assertIn("Version", headers)
+        self.assertEqual(headers["Version"], "0.2.71")
+        self.assertEqual(headers["bx-v"], "2.5.36")
         self.assertEqual(headers["source"], "web")
         self.assertIn("X-Request-Id", headers)
         self.assertIn("Timezone", headers)

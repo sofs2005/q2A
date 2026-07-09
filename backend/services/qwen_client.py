@@ -34,7 +34,8 @@ class QwenClient:
     @staticmethod
     def _web_client_headers() -> dict[str, str]:
         return {
-            "Version": "0.2.66",
+            "Version": "0.2.71",
+            "bx-v": "2.5.36",
             "source": "web",
             "X-Request-Id": str(uuid.uuid4()),
             "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT%z", time.localtime()),
@@ -101,6 +102,7 @@ class QwenClient:
             "user_agent_family": fingerprint.browser,
             "user_agent": headers.get("User-Agent", ""),
             "version": headers.get("Version", ""),
+            "bx_version": headers.get("bx-v", ""),
             "source": headers.get("source", ""),
         }
 
@@ -210,6 +212,15 @@ class QwenClient:
             or "expired" in body_lower
         )
 
+    @staticmethod
+    def _looks_like_waf_challenge(status: int, body: str) -> bool:
+        body_lower = (body or "").lower()
+        if "aliyun_waf" in body_lower or "x5sec" in body_lower or "_____tmd_____" in body_lower:
+            return status in {200, 403}
+        if "<!doctype" in body_lower or "<html" in body_lower:
+            return status in {200, 403}
+        return False
+
     async def _request_raw_json(
         self,
         method: str,
@@ -243,22 +254,45 @@ class QwenClient:
         account: Account | None = None,
         chat_transport: bool = False,
         referer: str | None = None,
+        retry_waf: bool = False,
     ) -> dict:
         request_timeout = timeout if timeout is not None else settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS
-        headers = self._build_chat_transport_headers(account=account, token=token, referer=referer) if chat_transport else self._build_headers(account=account, token=token, referer=referer)
         session = await get_session(fingerprint_for_account(account))
-        log.info("[QwenClient] request_headers path=%s diag=%s", path, self._header_diagnostics(account=account, headers=headers))
+
+        async def _send_once() -> dict:
+            headers = self._build_chat_transport_headers(account=account, token=token, referer=referer) if chat_transport else self._build_headers(account=account, token=token, referer=referer)
+            log.info("[QwenClient] request_headers path=%s diag=%s", path, self._header_diagnostics(account=account, headers=headers))
+            try:
+                resp = await session.request(
+                    method,
+                    f"{BASE_URL}{path}",
+                    headers=headers,
+                    json=body,
+                    timeout=request_timeout,
+                )
+                return {"status": resp.status_code, "body": getattr(resp, "text", ""), "acw_tc": self._extract_acw_tc(resp)}
+            except Exception as e:
+                return {"status": 0, "body": str(e)}
+
+        if retry_waf and account is not None:
+            try:
+                await WafCookieManager.get_instance().get_cookies(account)
+            except Exception as waf_err:
+                log.warning("[QwenClient] WAF cookie refresh failed path=%s email=%s error=%s", path, getattr(account, "email", ""), waf_err)
+
+        res = await _send_once()
+        if not (retry_waf and account is not None and self._looks_like_waf_challenge(res["status"], res["body"])):
+            return res
+
+        log.warning("[QwenClient] WAF challenge detected path=%s email=%s, refreshing cookie and retrying once", path, getattr(account, "email", ""))
+        waf_mgr = WafCookieManager.get_instance()
         try:
-            resp = await session.request(
-                method,
-                f"{BASE_URL}{path}",
-                headers=headers,
-                json=body,
-                timeout=request_timeout,
-            )
-            return {"status": resp.status_code, "body": getattr(resp, "text", ""), "acw_tc": self._extract_acw_tc(resp)}
-        except Exception as e:
-            return {"status": 0, "body": str(e)}
+            waf_mgr.mark_expired(account)
+            await waf_mgr.get_cookies(account)
+        except Exception as waf_err:
+            log.warning("[QwenClient] WAF retry refresh failed path=%s email=%s error=%s", path, getattr(account, "email", ""), waf_err)
+            return res
+        return await _send_once()
 
     async def clear_all_chats(self, account) -> dict:
         email = getattr(account, "email", "")
@@ -393,14 +427,16 @@ class QwenClient:
     async def delete_chat(self, token: str, chat_id: str, account: Account | None = None):
         if not token or not chat_id:
             return
-        res = await self._request_json("DELETE", f"/api/v2/chats/{chat_id}", token, timeout=20.0, account=account)
-        if res["status"] in (200, 204):
+        res = await self._request_json("DELETE", f"/api/v2/chats/{chat_id}", token, timeout=20.0, account=account, retry_waf=True)
+        if res["status"] in (200, 204) and not self._looks_like_waf_challenge(res["status"], res["body"]):
             return
+        log.warning("[delete_chat] failed email=%s chat_id=%s status=%s body=%s", getattr(account, "email", ""), chat_id, res["status"], res["body"][:120])
         raise RuntimeError(f"HTTP {res['status']}: {res['body'][:120]}")
 
     async def list_chats(self, token: str, limit: int = 50, account: Account | None = None) -> list[dict]:
-        res = await self._request_json("GET", f"/api/v2/chats?limit={int(limit)}", token, timeout=20.0, account=account)
-        if res["status"] != 200:
+        res = await self._request_json("GET", f"/api/v2/chats?limit={int(limit)}", token, timeout=20.0, account=account, retry_waf=True)
+        if res["status"] != 200 or self._looks_like_waf_challenge(res["status"], res["body"]):
+            log.warning("[list_chats] failed email=%s status=%s body=%s", getattr(account, "email", ""), res["status"], res["body"][:120])
             return []
         try:
             data = json.loads(res.get("body", "{}"))

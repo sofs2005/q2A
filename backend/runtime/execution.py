@@ -1349,5 +1349,5 @@ async def cleanup_runtime_resources(client, acc, chat_id: str | None, *, preserv
             try:
                 await client.delete_chat(token, chat_id, account=acc)
             except Exception as exc:
-                log.debug("[Cleanup] delete_chat failed chat_id=%s error=%s", chat_id, exc)
+                log.warning("[Cleanup] delete_chat failed chat_id=%s error=%s", chat_id, exc)
         asyncio.create_task(_delete_chat_later())

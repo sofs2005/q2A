@@ -135,7 +135,8 @@ class AccountPool:
         data = await self.db.load()
         self.accounts = [Account(**d) for d in data] if isinstance(data, list) else []
         migrated = self._assign_missing_fingerprints()
-        if migrated:
+        cleaned_cookies = self._clear_legacy_manual_cookies()
+        if migrated or cleaned_cookies:
             await self.save()
         log.info(f"Loaded {len(self.accounts)} upstream account(s)")
 
@@ -145,6 +146,16 @@ class AccountPool:
             if account.fingerprint_id:
                 continue
             account.fingerprint_id = fingerprint_id_for_email(account.email)
+            changed = True
+        return changed
+
+    def _clear_legacy_manual_cookies(self) -> bool:
+        """清空历史手动 cookies；WAF acw_tc 统一保存在 waf_cookies。"""
+        changed = False
+        for account in self.accounts:
+            if not str(getattr(account, "cookies", "") or "").strip():
+                continue
+            account.cookies = ""
             changed = True
         return changed
 
@@ -423,7 +434,6 @@ class AccountPool:
 
             ready.sort(key=lambda a: (
                 a.inflight,
-                0 if str(getattr(a, "cookies", "") or "").strip() else 1,
                 a.last_request_started or 0.0,
                 a.last_used or 0.0,
                 a.email or "",

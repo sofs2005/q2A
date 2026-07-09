@@ -26,7 +26,7 @@ async def context_cleanup_loop(app, interval_seconds: int = 300):
                             try:
                                 await app.state.qwen_client.delete_chat(acc.token, record.chat_id, account=acc)
                             except Exception as exc:
-                                log.debug("[ContextCleanup] chat delete failed session=%s chat_id=%s error=%s", record.session_key, record.chat_id, exc)
+                                log.warning("[ContextCleanup] chat delete failed session=%s chat_id=%s error=%s", record.session_key, record.chat_id, exc)
                         for remote_meta in record.uploaded_files:
                             try:
                                 await app.state.upstream_file_uploader.delete_remote_file(acc, remote_meta)
