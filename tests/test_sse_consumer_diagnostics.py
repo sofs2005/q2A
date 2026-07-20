@@ -38,6 +38,44 @@ class SseConsumerDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(parsed, [{"type": "delta", "phase": "answer", "content": "hello", "status": "", "extra": {}}])
 
+    def test_parses_response_created_as_lifecycle(self) -> None:
+        chunk = (
+            'data: {"response.created":{"chat_id":"c1","parent_id":"p1",'
+            '"response_id":"r1","response_index":"0"}}\n\n'
+        )
+
+        parsed = parse_sse_chunk(chunk)
+
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["type"], "lifecycle")
+        self.assertEqual(parsed[0]["phase"], "response.created")
+        self.assertEqual(parsed[0]["extra"]["response_id"], "r1")
+
+    def test_parses_upstream_error_event(self) -> None:
+        chunk = (
+            'data: {"error":{"code":"invalid_input","details":"输入或附件无效。请检查后重试。"},'
+            '"response_id":"r1","response_index":0}\n\n'
+        )
+
+        parsed = parse_sse_chunk(chunk)
+
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["type"], "error")
+        self.assertEqual(parsed[0]["code"], "invalid_input")
+        self.assertIn("附件", parsed[0]["details"])
+        self.assertEqual(parsed[0]["response_id"], "r1")
+
+    def test_parses_quota_limit_error_event(self) -> None:
+        chunk = (
+            'data: {"error":{"code":"quota_limit","details":"目前服务访问量较大，请稍后再试。"},'
+            '"response_id":"r2","response_index":0}\n\n'
+        )
+
+        parsed = parse_sse_chunk(chunk)
+
+        self.assertEqual(parsed[0]["type"], "error")
+        self.assertEqual(parsed[0]["code"], "quota_limit")
+
 
 if __name__ == "__main__":
     unittest.main()

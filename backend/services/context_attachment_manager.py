@@ -10,12 +10,57 @@ from backend.core.upstream_file_cache import UpstreamFileCacheEntry
 from backend.services.client_profiles import user_role_system_text
 from backend.services.token_calc import count_tokens
 from backend.services.standard_request_builder import _excluded_command_like_tool_names
-from backend.services.upstream_file_uploader import FileUploadRateLimitedError
+from backend.services.upstream_file_uploader import (
+    FileUploadRateLimitedError,
+    safe_signed_url_cache_expires_at,
+)
 from backend.toolcore.context_offload import SYSTEM_CONTEXT_FILE_PREFIX, SYSTEM_CONTEXT_PROMPT_NOTE
 from backend.toolcore.request_normalizer import normalize_chat_request, to_prompt_payload
 
 
 log = logging.getLogger("qwen2api.context_attachment_manager")
+
+# 无法解析签名过期时间时，对带 x-oss-signature 的 URL 使用保守复用窗口（官方常见 300s - 30s）。
+_DEFAULT_SIGNED_URL_CACHE_TTL_SECONDS = 270.0
+
+
+def _remote_url_from_meta(remote_meta: dict[str, Any] | None) -> str:
+    if not isinstance(remote_meta, dict):
+        return ""
+    remote_ref = remote_meta.get("remote_ref")
+    if isinstance(remote_ref, dict):
+        return str(remote_ref.get("url") or "")
+    return str(remote_meta.get("url") or "")
+
+
+def _resolve_attachment_cache_expires_at(
+    remote_meta: dict[str, Any],
+    *,
+    created_at: float,
+    session_ttl_seconds: float,
+) -> float:
+    """缓存过期取 min(会话 TTL, 签名 URL 安全过期)。
+
+    官方 file_url 通常 x-oss-expires=300；超过后复用会触发 invalid_input。
+    """
+    session_expires = float(created_at) + max(60.0, float(session_ttl_seconds or 0.0))
+    candidates: list[float] = [session_expires]
+
+    url = _remote_url_from_meta(remote_meta)
+    safe = safe_signed_url_cache_expires_at(url, now=created_at)
+    if safe is not None:
+        candidates.append(safe)
+    else:
+        raw_url_expires = remote_meta.get("url_expires_at")
+        if raw_url_expires is not None:
+            try:
+                candidates.append(float(raw_url_expires) - 30.0)
+            except (TypeError, ValueError):
+                pass
+        elif "x-oss-signature" in url.lower() or "x-oss-expires" in url.lower():
+            candidates.append(float(created_at) + _DEFAULT_SIGNED_URL_CACHE_TTL_SECONDS)
+
+    return min(candidates)
 
 
 def _is_retryable_attachment_upload_error(exc: Exception) -> bool:
@@ -311,6 +356,11 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
             ext = Path(attachment.filename).suffix.lstrip(".").lower()
             remote, acc, uploaded = await _upload_with_failover(acc, local_meta, ext)
             if uploaded:
+                cache_expires = _resolve_attachment_cache_expires_at(
+                    remote,
+                    created_at=local_meta["created_at"],
+                    session_ttl_seconds=attachment_ttl,
+                )
                 await cache.set(UpstreamFileCacheEntry(
                     session_key=session_key,
                     account_email=acc.email,
@@ -319,7 +369,7 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                     filename=attachment.filename,
                     remote_file_meta=remote,
                     created_at=local_meta["created_at"],
-                    expires_at=local_meta["created_at"] + attachment_ttl,
+                    expires_at=cache_expires,
                 ))
             upstream_files.append(remote["remote_ref"])
             await affinity.add_uploaded_file(session_key, remote)
@@ -331,6 +381,11 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                 local_meta = await file_store.save_text(filename, generated.text, generated.content_type, purpose="context")
                 remote, acc, uploaded = await _upload_with_failover(acc, local_meta, generated.ext)
                 if uploaded:
+                    cache_expires = _resolve_attachment_cache_expires_at(
+                        remote,
+                        created_at=local_meta["created_at"],
+                        session_ttl_seconds=attachment_ttl,
+                    )
                     await cache.set(UpstreamFileCacheEntry(
                         session_key=session_key,
                         account_email=acc.email,
@@ -339,7 +394,7 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                         filename=filename,
                         remote_file_meta=remote,
                         created_at=local_meta["created_at"],
-                        expires_at=local_meta["created_at"] + attachment_ttl,
+                        expires_at=cache_expires,
                     ))
                 upstream_files.append(remote["remote_ref"])
                 context_attachment_tokens += count_tokens(generated.text)

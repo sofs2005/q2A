@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import calendar
 import json
 import mimetypes
+import re
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import oss2
 
 
 _DEFAULT_UPLOAD_RATE_LIMIT_RETRY_SECONDS = 3600.0
+# 官方签名 URL 常见 x-oss-expires=300；复用时提前 30s 作废，避免临界过期。
+_SIGNED_URL_EXPIRY_SAFETY_SECONDS = 30.0
+_OSS_DATE_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$")
 
 
 class FileUploadRateLimitedError(Exception):
@@ -58,6 +64,54 @@ def _normalize_sign_region(region: str) -> str:
     if region.startswith("oss-"):
         return region[len("oss-"):]
     return region
+
+
+def signed_url_expires_at(url: str, *, now: float | None = None) -> float | None:
+    """从 OSS 签名 URL 解析绝对过期时间（unix 秒）。
+
+    官方 file_url 形如：
+    ...?x-oss-date=20260720T072213Z&x-oss-expires=300&x-oss-signature=...
+    过期时刻 = x-oss-date + x-oss-expires；缺 date 时用 now + expires。
+    """
+    text = str(url or "").strip()
+    if not text:
+        return None
+    try:
+        query = parse_qs(urlparse(text).query)
+    except Exception:
+        return None
+
+    def _first(name: str) -> str:
+        values = query.get(name) or query.get(name.lower()) or []
+        return str(values[0]).strip() if values else ""
+
+    expires_raw = _first("x-oss-expires")
+    if not expires_raw:
+        return None
+    try:
+        expires_seconds = float(expires_raw)
+    except (TypeError, ValueError):
+        return None
+    if expires_seconds <= 0:
+        return None
+
+    base = now if now is not None else time.time()
+    date_raw = _first("x-oss-date")
+    if date_raw:
+        matched = _OSS_DATE_RE.match(date_raw)
+        if matched:
+            year, month, day, hour, minute, second = (int(part) for part in matched.groups())
+            # OSS 签名日期为 UTC。
+            base = float(calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0)))
+    return base + expires_seconds
+
+
+def safe_signed_url_cache_expires_at(url: str, *, now: float | None = None, safety_seconds: float = _SIGNED_URL_EXPIRY_SAFETY_SECONDS) -> float | None:
+    """缓存复用截止时间：签名过期前 safety_seconds 秒作废。"""
+    absolute = signed_url_expires_at(url, now=now)
+    if absolute is None:
+        return None
+    return absolute - max(0.0, float(safety_seconds or 0.0))
 
 
 def _looks_like_dns_or_connect_failure(exc: Exception) -> bool:
@@ -115,7 +169,8 @@ class UpstreamFileUploader:
             acc.token,
             {
                 "filename": filename,
-                "filesize": len(raw),
+                # 官网网页端传字符串；与官方抓包保持一致。
+                "filesize": str(len(raw)),
                 "filetype": _upload_filetype_from_content_type(content_type),
             },
             timeout=20.0,
@@ -211,8 +266,10 @@ class UpstreamFileUploader:
                 raise RuntimeError(f"file parse timeout: {file_id}")
 
         user_id = file_path_remote.split('/', 1)[0] if '/' in file_path_remote else ""
-        now_ms = int(time.time() * 1000)
+        now = time.time()
+        now_ms = int(now * 1000)
         put_url = str(file_url or f"https://{upload_endpoint}/{file_path_remote.lstrip('/')}")
+        url_expires_at = signed_url_expires_at(put_url, now=now)
         remote_ref = {
             "type": remote_type,
             "file": {
@@ -251,6 +308,7 @@ class UpstreamFileUploader:
             "filename": filename,
             "content_type": content_type,
             "parse_status": parse_status,
+            "url_expires_at": url_expires_at,
             "remote_ref": remote_ref,
         }
 

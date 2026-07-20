@@ -65,7 +65,7 @@ class _FakeClient:
                             "access_key_id": "ak",
                             "access_key_secret": "sk",
                             "security_token": "st",
-                            "file_url": "https://qwen-webui-prod.oss-accelerate.aliyuncs.com/user/object_inline-image.png?x-oss-signature=test-signature",
+                            "file_url": "https://qwen-webui-prod.oss-accelerate.aliyuncs.com/user/object_inline-image.png?x-oss-date=20260720T072213Z&x-oss-expires=300&x-oss-signature=test-signature",
                         }
                     }
                 ),
@@ -147,17 +147,45 @@ class UpstreamFileUploaderTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             result["remote_ref"]["url"],
-            "https://qwen-webui-prod.oss-accelerate.aliyuncs.com/user/object_inline-image.png?x-oss-signature=test-signature",
+            "https://qwen-webui-prod.oss-accelerate.aliyuncs.com/user/object_inline-image.png?x-oss-date=20260720T072213Z&x-oss-expires=300&x-oss-signature=test-signature",
         )
         self.assertEqual(fake_client.requests[0][0], "/api/v2/files/getstsToken")
         self.assertEqual(fake_client.requests[0][1]["filetype"], "image")
+        # 官网网页端 filesize 为字符串
+        self.assertEqual(fake_client.requests[0][1]["filesize"], "9")
         self.assertIs(fake_client.requests[0][2], account)
         self.assertEqual([path for path, _, _ in fake_client.requests], ["/api/v2/files/getstsToken"])
         self.assertEqual(result["remote_ref"]["type"], "image")
         self.assertEqual(result["remote_ref"]["showType"], "image")
         self.assertEqual(result["remote_ref"]["file_class"], "vision")
+        self.assertIsNotNone(result.get("url_expires_at"))
 
         Path(local_file).unlink(missing_ok=True)
+
+    def test_signed_url_expires_at_from_oss_query(self) -> None:
+        from backend.services.upstream_file_uploader import (
+            safe_signed_url_cache_expires_at,
+            signed_url_expires_at,
+        )
+
+        url = (
+            "https://qwen-webui-prod.oss-accelerate.aliyuncs.com/u/f_desktop.ini"
+            "?x-oss-date=20260720T072213Z&x-oss-expires=300"
+            "&x-oss-signature-version=OSS4-HMAC-SHA256&x-oss-signature=abc"
+        )
+        expires = signed_url_expires_at(url)
+        self.assertIsNotNone(expires)
+        safe = safe_signed_url_cache_expires_at(url)
+        self.assertIsNotNone(safe)
+        self.assertAlmostEqual(expires - safe, 30.0, places=3)
+
+    def test_signed_url_expires_at_fallback_now_plus_expires(self) -> None:
+        from backend.services.upstream_file_uploader import signed_url_expires_at
+
+        url = "https://example.com/obj?x-oss-expires=300&x-oss-signature=abc"
+        now = 1_700_000_000.0
+        expires = signed_url_expires_at(url, now=now)
+        self.assertEqual(expires, now + 300.0)
 
     async def test_getsts_ratelimited_raises_with_retry_after_from_num(self) -> None:
         """getstsToken 命中每日上传配额时，抛 FileUploadRateLimitedError 且 retry_after = num 小时。"""

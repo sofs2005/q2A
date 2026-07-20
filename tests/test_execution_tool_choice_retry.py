@@ -19,6 +19,38 @@ class ExecutionToolChoiceRetryTests(unittest.TestCase):
             required_tool_name="Read",
         )
 
+    def test_upstream_error_does_not_retry_as_empty_output(self) -> None:
+        retry = evaluate_retry_directive(
+            request=self._request(),
+            current_prompt="prompt",
+            history_messages=[],
+            attempt_index=0,
+            max_attempts=3,
+            state=RuntimeAttemptState(
+                answer_text="",
+                finish_reason="stop",
+                emitted_visible_output=False,
+                upstream_error_code="invalid_input",
+                upstream_error_details="输入或附件无效。请检查后重试。",
+            ),
+        )
+
+        self.assertFalse(retry.retry)
+        self.assertEqual(retry.reason, "upstream_error:invalid_input")
+
+    def test_empty_output_still_retries_without_upstream_error(self) -> None:
+        retry = evaluate_retry_directive(
+            request=self._request(),
+            current_prompt="prompt",
+            history_messages=[],
+            attempt_index=0,
+            max_attempts=3,
+            state=RuntimeAttemptState(answer_text="", emitted_visible_output=False),
+        )
+
+        self.assertTrue(retry.retry)
+        self.assertEqual(retry.reason, "empty_output")
+
     def test_required_tool_choice_retries_when_no_tool_call_present(self) -> None:
         retry = evaluate_retry_directive(
             request=self._request(),

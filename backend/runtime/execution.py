@@ -45,6 +45,9 @@ class RuntimeAttemptState:
     raw_events: list[dict[str, Any]] = field(default_factory=list)
     emitted_visible_output: bool = False
     stage_metrics: dict[str, float] = field(default_factory=dict)
+    # 上游 SSE 错误帧（如 quota_limit / invalid_input），用于避免 empty_output 盲重试。
+    upstream_error_code: str = ""
+    upstream_error_details: str = ""
 
 
 @dataclass(slots=True)
@@ -554,6 +557,9 @@ async def collect_completion_run(
         cleaned = "\n".join((block.get("text", "") or "").strip() for block in text_blocks).strip()
         return cleaned
 
+    upstream_error_code = ""
+    upstream_error_details = ""
+
     def _finalize_result(*, reason: str | None = None) -> RuntimeExecutionResult:
         nonlocal final_tool_sieve_events
         answer_text = "".join(answer_fragments)
@@ -642,26 +648,45 @@ async def collect_completion_run(
         if detected_tool_calls:
             answer_text = _strip_textual_tool_wrapper(answer_text, detected_tool_calls)
 
+        # 上游明确错误：在工具检测之后注入可见文案，避免空响应；
+        # finish_reason 仍用 stop（OpenAI 兼容），真实错误码放在 state.upstream_error_*。
+        if upstream_error_code and not detected_tool_calls and not answer_text.strip():
+            details = (upstream_error_details or "").strip()
+            answer_text = f"[upstream_error] {upstream_error_code}"
+            if details and details != upstream_error_code:
+                answer_text = f"{answer_text}: {details}"
+            final_finish_reason = "stop"
+
         # 检查空输出
         if not detected_tool_calls and not answer_text.strip() and not reasoning_text.strip():
-            log.warning(
-                "[Collect] 模型返回空输出: reason=%s chat_id=%s",
-                reason,
-                chat_id,
-            )
-            # 如果有 reasoning 但没有 visible output，说明模型只输出了思考过程
-            if reasoning_text.strip():
-                log.warning("[Collect] 模型只返回了推理内容，没有可见输出")
+            if upstream_error_code:
+                log.warning(
+                    "[Collect] 上游错误导致空输出: reason=%s chat_id=%s code=%s details=%s",
+                    reason,
+                    chat_id,
+                    upstream_error_code,
+                    upstream_error_details,
+                )
+            else:
+                log.warning(
+                    "[Collect] 模型返回空输出: reason=%s chat_id=%s",
+                    reason,
+                    chat_id,
+                )
+                # 如果有 reasoning 但没有 visible output，说明模型只输出了思考过程
+                if reasoning_text.strip():
+                    log.warning("[Collect] 模型只返回了推理内容，没有可见输出")
 
         if reason:
             log.info(
-                "[Collect] finalize reason=%s chat_id=%s tool_calls=%s answer_chars=%s reasoning_chars=%s finish_reason=%s",
+                "[Collect] finalize reason=%s chat_id=%s tool_calls=%s answer_chars=%s reasoning_chars=%s finish_reason=%s upstream_error=%s",
                 reason,
                 chat_id,
                 len(detected_tool_calls),
                 len(answer_text),
                 len(reasoning_text),
                 final_finish_reason,
+                upstream_error_code or "-",
             )
         metrics.mark("stream_finish", float(len(raw_events)))
         state = RuntimeAttemptState(
@@ -673,6 +698,8 @@ async def collect_completion_run(
             raw_events=raw_events,
             emitted_visible_output=emitted_visible_output,
             stage_metrics=metrics.summary(),
+            upstream_error_code=upstream_error_code,
+            upstream_error_details=upstream_error_details,
         )
         return RuntimeExecutionResult(state=state, chat_id=chat_id, acc=acc)
 
@@ -723,7 +750,22 @@ async def collect_completion_run(
             evt = item.get("event", {})
             if capture_events:
                 raw_events.append(evt)
-            if evt.get("type") != "delta":
+
+            evt_type = str(evt.get("type") or "")
+            if evt_type == "lifecycle":
+                # response.created 等生命周期事件，不当内容、也不当 unparsed。
+                continue
+            if evt_type == "error":
+                upstream_error_code = str(evt.get("code") or "unknown")
+                upstream_error_details = str(evt.get("details") or evt.get("content") or "upstream error")
+                log.warning(
+                    "[Collect] upstream SSE error chat_id=%s code=%s details=%s",
+                    chat_id,
+                    upstream_error_code,
+                    upstream_error_details,
+                )
+                return _finalize_result(reason=f"upstream_error:{upstream_error_code}")
+            if evt_type != "delta":
                 continue
 
             phase = evt.get("phase", "")
@@ -1049,6 +1091,18 @@ def evaluate_retry_directive(
             state.emitted_visible_output,
         )
         return RuntimeRetryDirective(retry=True, next_prompt=next_prompt, reason=reason)
+
+    # 上游明确错误（quota_limit / invalid_input 等）不应再被当成 empty_output 盲重试。
+    upstream_error_code = str(getattr(state, "upstream_error_code", "") or "").strip()
+    if upstream_error_code or str(getattr(state, "finish_reason", "") or "") == "error":
+        log.info(
+            "[Retry] skip reason=upstream_error code=%s details=%s attempt=%s/%s",
+            upstream_error_code or "error",
+            str(getattr(state, "upstream_error_details", "") or "")[:200],
+            attempt_index + 1,
+            max_attempts,
+        )
+        return RuntimeRetryDirective(retry=False, next_prompt=current_prompt, reason=f"upstream_error:{upstream_error_code or 'error'}")
 
     if attempt_index == 0 and can_retry_after_output and request.tools:
         command_error = _recent_command_error_candidate(history_messages)

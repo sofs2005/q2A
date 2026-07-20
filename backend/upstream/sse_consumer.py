@@ -18,7 +18,54 @@ def _first_string(*values: object) -> str:
     return ""
 
 
+def _parse_upstream_error(evt: dict) -> dict | None:
+    """识别官方 SSE 错误帧：{"error": {"code": "...", "details": "..."}, ...}。"""
+    raw = evt.get("error")
+    if not isinstance(raw, dict):
+        return None
+    code = _first_string(raw.get("code"), raw.get("type"), raw.get("error_code"))
+    details = _first_string(raw.get("details"), raw.get("message"), raw.get("msg"), str(raw) if raw else "")
+    if not code and not details:
+        return None
+    return {
+        "type": "error",
+        "phase": "error",
+        "content": "",
+        "status": "error",
+        "code": code or "unknown",
+        "details": details or code or "upstream error",
+        "response_id": evt.get("response_id"),
+        "response_index": evt.get("response_index"),
+        "extra": {"error": raw},
+    }
+
+
+def _parse_response_created(evt: dict) -> dict | None:
+    """识别流生命周期事件 response.created（非内容，不应当 unparsed）。"""
+    created = evt.get("response.created")
+    if not isinstance(created, dict):
+        return None
+    return {
+        "type": "lifecycle",
+        "phase": "response.created",
+        "content": "",
+        "status": "created",
+        "extra": created,
+    }
+
+
 def _parse_qwen_event(evt: dict) -> list[dict]:
+    if not isinstance(evt, dict):
+        return []
+
+    lifecycle = _parse_response_created(evt)
+    if lifecycle is not None:
+        return [lifecycle]
+
+    error_evt = _parse_upstream_error(evt)
+    if error_evt is not None:
+        return [error_evt]
+
     if evt.get("choices"):
         delta = evt["choices"][0].get("delta", {})
         content = delta.get("content", "")
