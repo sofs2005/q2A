@@ -11,13 +11,13 @@ class ModelAliasTests(unittest.TestCase):
         self.assertEqual(
             MODEL_MAP,
             {
-                "qwen-max": "qwen3.7-max",
+                "qwen-max": "qwen3.8-max-preview",
                 "qwen-plus": "qwen3.7-plus",
             },
         )
 
-    def test_qwen_short_aliases_resolve_to_qwen37_upstream_names(self) -> None:
-        self.assertEqual(resolve_model("qwen-max"), "qwen3.7-max")
+    def test_qwen_short_aliases_resolve_to_current_upstream_names(self) -> None:
+        self.assertEqual(resolve_model("qwen-max"), "qwen3.8-max-preview")
         self.assertEqual(resolve_model("qwen-plus"), "qwen3.7-plus")
 
     def test_model_list_fallback_only_includes_required_qwen_short_aliases(self) -> None:
@@ -41,7 +41,7 @@ class _FakeQwenClient:
         return [
             {"id": "qwen3.6-plus"},
             {"id": "qwen3.6-max-preview"},
-            {"id": "qwen3.7-max"},
+            {"id": "qwen3.8-max-preview"},
         ]
 
 
@@ -77,7 +77,7 @@ class ModelListEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(qwen_client.called)
         self.assertEqual(
             model_ids,
-            ["qwen3.6-plus", "qwen3.6-max-preview", "qwen3.7-max", "qwen-max", "qwen-plus"],
+            ["qwen3.6-plus", "qwen3.6-max-preview", "qwen3.8-max-preview", "qwen-max", "qwen-plus"],
         )
 
     async def test_model_list_can_disable_upstream_models(self) -> None:
