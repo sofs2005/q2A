@@ -32,7 +32,9 @@ class Settings(BaseSettings):
     CHAT_ID_PREWARM_JITTER_SECONDS: float = float(os.getenv("CHAT_ID_PREWARM_JITTER_SECONDS", 1.5))
     CHAT_ID_PREWARM_MODELS: str = os.getenv("CHAT_ID_PREWARM_MODELS", "qwen3.8-max-preview,qwen3.7-plus")
     QWEN_CHAT_TRANSPORT_SEND_COOKIES: bool = os.getenv("QWEN_CHAT_TRANSPORT_SEND_COOKIES", "false").lower() in {"1", "true", "yes", "on"}
-    QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP: bool = os.getenv("QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP", "true").lower() in {"1", "true", "yes", "on"}
+    # 默认 false：主流式走 curl_cffi（new_session 注入 UPSTREAM_PROXY + TLS 指纹）。
+    # 设为 true 时回退 httpx Go-like 路径（TLS 指纹易被 WAF 识别，仅作兼容开关）。
+    QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP: bool = os.getenv("QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP", "false").lower() in {"1", "true", "yes", "on"}
 
     # Captcha Solver (x5sec punish 滑块突破)
     CAPTCHA_SOLVER_ENABLED: bool = os.getenv("CAPTCHA_SOLVER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}

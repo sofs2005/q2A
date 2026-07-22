@@ -45,7 +45,8 @@ def build_chat_payload(
     chat_type: str = "t2t",
     media_options: dict | None = None,
 ) -> dict:
-    ts = int(time.time())
+    # 与 create_chat / 浏览器 softs 对齐：上游期望毫秒时间戳
+    ts = int(time.time() * 1000)
     fid = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
 

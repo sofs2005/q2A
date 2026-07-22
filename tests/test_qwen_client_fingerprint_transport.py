@@ -77,6 +77,32 @@ class _FakeAsyncClient:
         return _FakeStreamResponse()
 
 
+class _FakeCurlStreamResponse:
+    status_code = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def aiter_content(self):
+        yield b"data: {\"text\":\"ok\"}\n\n"
+
+
+class _FakeCurlStreamSession:
+    def __init__(self) -> None:
+        self.calls = []
+        self.closed = False
+
+    def stream(self, method, url, headers=None, json=None, timeout=None):
+        self.calls.append({"method": method, "url": url, "headers": headers or {}, "json": json, "timeout": timeout})
+        return _FakeCurlStreamResponse()
+
+    async def close(self):
+        self.closed = True
+
+
 class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_personalization_uses_account_fingerprint_session_and_headers(self) -> None:
         account = Account(email="alice@example.com", token="token-1")
@@ -187,12 +213,39 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Cookie", headers)
         self.assertEqual(headers["Authorization"], "Bearer token-1")
 
-    async def test_stream_chat_once_uses_go_like_http_transport_by_default(self) -> None:
+    async def test_stream_chat_once_uses_curl_cffi_session_by_default(self) -> None:
+        """默认关闭 GO_LIKE：主流式必须走 new_session(curl_cffi)，才能带 UPSTREAM_PROXY + TLS 指纹。"""
+        account = Account(email="alice@example.com", token="token-1", cookies="waf=ok; session=browser")
+        client = QwenClient(SimpleNamespace())
+        session = _FakeCurlStreamSession()
+        _FakeAsyncClient.instances = []
+
+        with (
+            patch("backend.services.qwen_client.httpx.AsyncClient", _FakeAsyncClient),
+            patch("backend.services.qwen_client.new_session", return_value=session) as new_session,
+            patch("backend.services.qwen_client.WafCookieManager") as waf_cls,
+        ):
+            waf_cls.get_instance.return_value.get_cookies = AsyncMock(return_value="")
+            chunks = [item async for item in client.stream_chat_once(account.token, "chat-1", {"stream": True}, account=account)]
+
+        self.assertTrue(new_session.called)
+        self.assertEqual(len(_FakeAsyncClient.instances), 0)
+        self.assertEqual(chunks[-1], {"status": "streamed"})
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertIn("/api/v2/chat/completions?chat_id=chat-1", session.calls[0]["url"])
+
+    async def test_stream_chat_once_uses_go_like_http_when_enabled(self) -> None:
         account = Account(email="alice@example.com", token="token-1", cookies="waf=ok; session=browser")
         client = QwenClient(SimpleNamespace())
         _FakeAsyncClient.instances = []
 
-        with patch("backend.services.qwen_client.httpx.AsyncClient", _FakeAsyncClient), patch("backend.services.qwen_client.new_session") as new_session:
+        with (
+            patch("backend.services.qwen_client.settings.QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP", True),
+            patch("backend.services.qwen_client.httpx.AsyncClient", _FakeAsyncClient),
+            patch("backend.services.qwen_client.new_session") as new_session,
+            patch("backend.services.qwen_client.WafCookieManager") as waf_cls,
+        ):
+            waf_cls.get_instance.return_value.get_cookies = AsyncMock(return_value="")
             chunks = [item async for item in client.stream_chat_once(account.token, "chat-1", {"stream": True}, account=account)]
 
         self.assertFalse(new_session.called)

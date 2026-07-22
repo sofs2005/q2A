@@ -6,12 +6,14 @@ WAF Cookie Manager — 通过轻量 HTTP GET 获取 acw_tc cookie，用于阿里
 - cna/cnaui/tfstk/isg 等是浏览器端 JS 生成的，GET 首页拿不到。
 - acw_tc 被 WAF 拉黑后封禁 1800 秒，触发后由 stream_chat_once 调用
   account_pool.mark_rate_limited(cooldown=1800) 进入冷却，不再立即重试。
+- 必须走 browser_fingerprint.new_session：注入 UPSTREAM_PROXY + 账号 TLS 指纹，
+  避免 cookie 与主请求出口 IP / 指纹不一致。
 """
 
 import logging
 import time
 
-from curl_cffi.requests import AsyncSession
+from backend.core.browser_fingerprint import fingerprint_for_account, new_session
 
 log = logging.getLogger("qwen2api.waf_cookies")
 
@@ -40,11 +42,12 @@ class WafCookieManager:
         return account.waf_cookies
 
     async def refresh_account_cookies(self, account):
-        """通过 curl_cffi GET 请求获取 acw_tc cookie。"""
+        """通过 curl_cffi GET 请求获取 acw_tc cookie（与主链路同代理/指纹）。"""
         email = account.email
         try:
             log.info(f"[WafCookie] Refreshing acw_tc for {email}...")
-            async with AsyncSession(impersonate="chrome", timeout=15) as s:
+            fingerprint = fingerprint_for_account(account)
+            async with new_session(fingerprint, timeout=15) as s:
                 await s.get("https://chat.qwen.ai", allow_redirects=True)
                 acw_tc = s.cookies.get("acw_tc", "")
                 if acw_tc:

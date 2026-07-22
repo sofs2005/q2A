@@ -655,7 +655,7 @@ class QwenClient:
             account=account, token=token, accept="text/event-stream",
             referer=f"{BASE_URL}/c/{chat_id}",
         )
-        if bool(getattr(settings, "QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP", True)):
+        if bool(getattr(settings, "QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP", False)):
             log.info(
                 "[QwenClient] stream_headers chat_id=%s dedicated_session=%s diag=%s",
                 chat_id,
