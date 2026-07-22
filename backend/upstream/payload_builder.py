@@ -45,10 +45,11 @@ def build_chat_payload(
     chat_type: str = "t2t",
     media_options: dict | None = None,
 ) -> dict:
-    # 与 create_chat / 浏览器 softs 对齐：上游期望毫秒时间戳
-    ts = int(time.time() * 1000)
-    fid = uuid.uuid4().hex
-    child_id = uuid.uuid4().hex
+    # completions 官网抓包（2026-07 softs）用秒级 timestamp；create_chat 另用毫秒，勿混。
+    ts = int(time.time())
+    # 官网 messages.fid / childrenIds 为带横线 UUID，非 32 位 hex
+    fid = str(uuid.uuid4())
+    child_id = str(uuid.uuid4())
 
     is_video = chat_type == "t2v"
 
@@ -102,6 +103,8 @@ def build_chat_payload(
         "parent_id": None,
         "messages": [
             {
+                # 与官网 completions 抓包对齐：id/model 显式占位
+                "id": None,
                 "fid": fid,
                 "parentId": None,
                 "childrenIds": [child_id],
@@ -111,6 +114,7 @@ def build_chat_payload(
                 "files": files or [],
                 "timestamp": ts,
                 "models": [model],
+                "model": "",
                 "chat_type": message_chat_type,
                 "feature_config": feature_config,
                 "extra": {"meta": message_meta},

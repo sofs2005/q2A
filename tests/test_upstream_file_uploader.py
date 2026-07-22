@@ -159,6 +159,14 @@ class UpstreamFileUploaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["remote_ref"]["showType"], "image")
         self.assertEqual(result["remote_ref"]["file_class"], "vision")
         self.assertIsNotNone(result.get("url_expires_at"))
+        # 官网 File 对象镜像字段：lastModified/name/size/type/webkitRelativePath
+        file_obj = result["remote_ref"]["file"]
+        self.assertEqual(file_obj["name"], "inline-image.png")
+        self.assertEqual(file_obj["size"], 9)
+        self.assertEqual(file_obj["type"], "image/png")
+        self.assertEqual(file_obj["webkitRelativePath"], "")
+        self.assertEqual(file_obj["lastModified"], file_obj["created_at"])
+        self.assertEqual(file_obj["meta"]["parse_meta"]["parse_status"], "success")
 
         Path(local_file).unlink(missing_ok=True)
 

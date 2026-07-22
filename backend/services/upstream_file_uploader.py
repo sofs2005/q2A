@@ -270,6 +270,7 @@ class UpstreamFileUploader:
         now_ms = int(now * 1000)
         put_url = str(file_url or f"https://{upload_endpoint}/{file_path_remote.lstrip('/')}")
         url_expires_at = signed_url_expires_at(put_url, now=now)
+        # remote_ref 字段对齐官网 chat completions 抓包（含浏览器 File 对象镜像字段）
         remote_ref = {
             "type": remote_type,
             "file": {
@@ -286,6 +287,11 @@ class UpstreamFileUploader:
                     "parse_meta": {"parse_status": parse_status},
                 },
                 "update_at": now_ms,
+                "lastModified": now_ms,
+                "name": filename,
+                "webkitRelativePath": "",
+                "size": len(raw),
+                "type": content_type,
             },
             "id": file_id,
             "url": put_url,

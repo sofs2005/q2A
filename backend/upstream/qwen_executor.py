@@ -192,6 +192,41 @@ class QwenExecutor:
         feature_config = payload.get("messages", [{}])[0].get("feature_config", {})
         log.info(f"[Executor] stream start chat_id={chat_id} model={model} has_custom_tools={has_custom_tools}")
         log.info(f"[Executor] feature_config: function_calling={feature_config.get('function_calling')} auto_search={feature_config.get('auto_search')} code_interpreter={feature_config.get('code_interpreter')} plugins_enabled={feature_config.get('plugins_enabled')}")
+        # 附件摘要：invalid_input 排查用（只打 id/type/status/url host，不打签名）
+        file_items = payload.get("messages", [{}])[0].get("files") or []
+        if file_items:
+            file_summaries = []
+            for item in file_items:
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url") or "")
+                host = ""
+                try:
+                    from urllib.parse import urlparse
+
+                    host = urlparse(url).netloc
+                except Exception:
+                    host = ""
+                file_obj = item.get("file") if isinstance(item.get("file"), dict) else {}
+                parse_status = ""
+                meta = file_obj.get("meta") if isinstance(file_obj.get("meta"), dict) else {}
+                parse_meta = meta.get("parse_meta") if isinstance(meta.get("parse_meta"), dict) else {}
+                parse_status = str(parse_meta.get("parse_status") or "")
+                file_summaries.append(
+                    {
+                        "id": item.get("id"),
+                        "type": item.get("type"),
+                        "showType": item.get("showType"),
+                        "status": item.get("status"),
+                        "size": item.get("size"),
+                        "parse_status": parse_status,
+                        "url_host": host,
+                        "name": item.get("name"),
+                    }
+                )
+            log.info("[Executor] stream files count=%s summary=%s", len(file_summaries), file_summaries)
+        else:
+            log.info("[Executor] stream files count=0")
 
         prompt_content = payload.get("messages", [{}])[0].get("content", "")
         if _has_textual_tool_contract_marker(prompt_content):
