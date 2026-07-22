@@ -34,6 +34,34 @@ class UpstreamPayloadBuilderTests(unittest.TestCase):
         self.assertLess(payload["timestamp"], 1_000_000_000_000)
         self.assertGreaterEqual(payload["timestamp"], 1_000_000_000)
 
+    def test_feature_config_with_files_matches_official_web_subset(self) -> None:
+        """带附件时 feature_config 必须收敛到官网子集，禁止 enable_tools/tool_choice 等键。"""
+        files = [{"type": "file", "id": "f1", "status": "uploaded"}]
+        payload = build_chat_payload(
+            "chat-1",
+            "qwen3.8-max-preview",
+            "hello",
+            has_custom_tools=True,
+            files=files,
+        )
+        fc = payload["messages"][0]["feature_config"]
+
+        self.assertEqual(fc.get("thinking_mode"), "Thinking")
+        self.assertEqual(fc.get("auto_thinking"), False)
+        self.assertEqual(fc.get("auto_search"), True)
+        self.assertEqual(fc.get("thinking_format"), "summary")
+        self.assertEqual(fc.get("function_calling"), False)
+        for banned in ("enable_tools", "enable_function_call", "tool_choice", "code_interpreter", "plugins_enabled"):
+            self.assertNotIn(banned, fc)
+
+    def test_feature_config_without_files_strips_enable_tool_keys(self) -> None:
+        """无附件时也不再塞 enable_tools / tool_choice。"""
+        payload = build_chat_payload("chat-1", "qwen3.8-max-preview", "hello", has_custom_tools=True)
+        fc = payload["messages"][0]["feature_config"]
+        self.assertEqual(fc.get("function_calling"), False)
+        for banned in ("enable_tools", "enable_function_call", "tool_choice"):
+            self.assertNotIn(banned, fc)
+
 
 if __name__ == "__main__":
     unittest.main()

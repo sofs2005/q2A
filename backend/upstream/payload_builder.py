@@ -23,6 +23,18 @@ CUSTOM_TOOL_LOW_LATENCY_OVERRIDES = {
 _DEFAULT_MEDIA_RATIO = "16:9"
 _VALID_MEDIA_RATIOS = {"16:9", "9:16", "1:1", "4:3", "3:4"}
 
+# 官网带附件 completions 抓包字段子集（2026-07 softs）。
+# 勿塞 enable_tools / tool_choice 等网页端没有的键——带 files 时上游校验更严。
+OFFICIAL_WEB_FEATURE_CONFIG = {
+    "thinking_enabled": True,
+    "output_schema": "phase",
+    "research_mode": "normal",
+    "auto_thinking": False,
+    "thinking_mode": "Thinking",
+    "thinking_format": "summary",
+    "auto_search": True,
+}
+
 
 def _normalize_media_ratio(media_options: dict | None) -> str:
     if not media_options:
@@ -75,19 +87,22 @@ def build_chat_payload(
             "size": ratio,
         }
     else:
-        feature_config = {
-            **CUSTOM_TOOL_COMPAT_FEATURE_CONFIG,
-            **(CUSTOM_TOOL_LOW_LATENCY_OVERRIDES if has_custom_tools else {}),
-            # Our Anthropic/OpenAI bridge relies on textual JSON/XML tool directives
-            # that are parsed locally. Enabling Qwen native function_calling here causes
-            # upstream interception such as `Tool Read/Bash does not exists.` for custom
-            # local tools that only exist in the bridge layer.
-            "function_calling": False,
-            # Additional safeguards to prevent tool call interception
-            "enable_tools": False,
-            "enable_function_call": False,
-            "tool_choice": "none",
-        }
+        if files:
+            # 有附件：严格对齐官网网页端 feature_config 子集。
+            # 旧版额外键（enable_tools / tool_choice / code_interpreter 等）在无附件时
+            # 往往能过；带 files 时会触发 invalid_input。
+            feature_config = dict(OFFICIAL_WEB_FEATURE_CONFIG)
+            if has_custom_tools:
+                # bridge 文本工具：仅关原生 function_calling，不再塞网页端没有的键
+                feature_config["function_calling"] = False
+        else:
+            feature_config = {
+                **CUSTOM_TOOL_COMPAT_FEATURE_CONFIG,
+                **(CUSTOM_TOOL_LOW_LATENCY_OVERRIDES if has_custom_tools else {}),
+                # bridge 文本工具：关闭原生 function_calling，避免拦截成
+                # `Tool Xxx does not exists.`
+                "function_calling": False,
+            }
         message_chat_type = "t2t"
         message_meta = {"subChatType": "t2t"}
 
