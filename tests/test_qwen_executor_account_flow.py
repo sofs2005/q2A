@@ -94,7 +94,7 @@ class QwenExecutorAccountFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_create_chat_reports_waf_blocked_for_aliyun_waf_html(self) -> None:
         account = Account(email="alice@example.com", token="token-1")
 
-        async def fake_request(method, path, token, body=None, timeout=None, account=None):
+        async def fake_request(method, path, token, body=None, timeout=None, account=None, **kwargs):
             return {
                 "status": 200,
                 "body": '<!doctypehtml><meta name="aliyun_waf_aa" content="blocked">',
@@ -104,6 +104,28 @@ class QwenExecutorAccountFlowTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(Exception, "waf_blocked"):
             await executor.create_chat(account, "qwen3.7-plus")
+
+    async def test_create_chat_enables_retry_waf_on_request(self) -> None:
+        """create_chat 必须开 retry_waf，才能在建 chat 前/撞挑战后刷新 acw_tc。"""
+        account = Account(email="alice@example.com", token="token-1")
+        seen = {}
+
+        async def fake_request(method, path, token, body=None, timeout=None, account=None, **kwargs):
+            seen["kwargs"] = kwargs
+            seen["path"] = path
+            return {
+                "status": 200,
+                "body": '{"success": true, "data": {"id": "chat-waf-1"}}',
+                "acw_tc": "fresh-acw",
+            }
+
+        executor = QwenExecutor(SimpleNamespace(_request_json=fake_request), _Pool())
+        chat_id = await executor.create_chat(account, "qwen3.8-max-preview")
+
+        self.assertEqual(chat_id, "chat-waf-1")
+        self.assertEqual(seen["path"], "/api/v2/chats/new")
+        self.assertTrue(seen["kwargs"].get("retry_waf"))
+        self.assertTrue(seen["kwargs"].get("chat_transport"))
 
     async def test_retry_does_not_mark_account_invalid_for_waf_blocked(self) -> None:
         account = Account(email="alice@example.com", token="token-1")

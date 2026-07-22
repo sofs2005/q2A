@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import types
 import unittest
@@ -84,6 +85,48 @@ class ChatIDPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chat_id, "chat-1")
         self.assertTrue(reused)
         trigger_fill.assert_not_called()
+
+    async def test_prewarm_waf_blocked_marks_cookie_expired_and_cools_account(self) -> None:
+        """预热撞 aliyun_waf 时必须作废 acw_tc 并短冷却，避免下一轮继续砸同一坏 cookie。"""
+        account = Account(email="alice@example.com", token="token-1")
+        account.waf_cookies = "acw_tc=stale"
+        account.waf_cookies_expires_at = 9999999999.0
+        account.valid = True
+
+        rate_limited = []
+
+        def mark_rate_limited(acc, cooldown=None, error_message=""):
+            rate_limited.append({"acc": acc, "cooldown": cooldown, "error": error_message})
+            acc.rate_limited_until = 1000.0
+
+        pool = SimpleNamespace(
+            accounts=[account],
+            get_by_email=lambda email: account,
+            max_inflight=1,
+            mark_rate_limited=mark_rate_limited,
+        )
+
+        async def fake_create_chat(acc, model, chat_type="t2t"):
+            raise Exception("waf_blocked: create_chat returned WAF page: aliyun_waf_aa")
+
+        client = SimpleNamespace(
+            executor=SimpleNamespace(create_chat=fake_create_chat, auth_resolver=None),
+            delete_chat=AsyncMock(),
+        )
+        chat_pool = ChatIDPool(client, pool)
+
+        with (
+            patch("backend.services.chat_id_pool.settings.WAF_RETRY_EXTRA_COOLDOWN_SECONDS", 5),
+            patch("backend.services.chat_id_pool.asyncio.sleep", new=AsyncMock()),
+        ):
+            await chat_pool._create_warm_chat(asyncio.Semaphore(1), account, "qwen3.8-max-preview", "t2t")
+
+        self.assertEqual(account.waf_cookies_expires_at, 0)
+        self.assertEqual(account.waf_cookies, "")
+        self.assertEqual(len(rate_limited), 1)
+        self.assertIs(rate_limited[0]["acc"], account)
+        self.assertEqual(rate_limited[0]["cooldown"], 5)
+        self.assertIn("waf", rate_limited[0]["error"].lower())
 
     async def test_fill_uses_configured_prewarm_models_before_first_request(self) -> None:
         account = Account(email="alice@example.com", token="token-1")

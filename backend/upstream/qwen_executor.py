@@ -94,6 +94,8 @@ class QwenExecutor:
                 account=account,
                 chat_transport=True,
                 referer=f"{BASE_URL}/c/new-chat",
+                # 建 chat 前刷新 acw_tc；撞 aliyun_waf/x5sec 挑战页时再刷新一次并重试
+                retry_waf=True,
             )
         else:
             r = await request_fn("POST", "/api/v2/chats/new", token, body)

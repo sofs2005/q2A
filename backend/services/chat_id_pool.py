@@ -166,7 +166,25 @@ class ChatIDPool:
                 # 预热路径遇到鉴权失败时也触发后台自愈：否则只在实际请求重试分支
                 # 触发，仅被预热碰到的过期账号永远不会被刷新（healing 标志位保证幂等）。
                 err = str(exc).lower()
-                if "unauthorized" in err or "expired" in err or "401" in err or "403" in err:
+                if "waf_blocked" in err or "aliyun_waf" in err:
+                    # 接入层 WAF：作废 acw_tc + 短冷却，避免下一轮预热继续砸同一坏 cookie/出口
+                    # 须同时清空 waf_cookies：仅置 expires_at=0 时 _valid_waf_cookie 仍会注入旧值
+                    acc.waf_cookies = ""
+                    acc.waf_cookies_expires_at = 0
+                    cooldown = max(1, int(float(getattr(settings, "WAF_RETRY_EXTRA_COOLDOWN_SECONDS", 5) or 5)))
+                    mark_rl = getattr(self.account_pool, "mark_rate_limited", None)
+                    if mark_rl is not None:
+                        mark_rl(
+                            acc,
+                            cooldown=cooldown,
+                            error_message=f"prewarm waf_blocked: {str(exc)[:160]}",
+                        )
+                    log.warning(
+                        "[ChatIDPool] prewarm waf cooldown email=%s cooldown=%ss",
+                        acc.email,
+                        cooldown,
+                    )
+                elif "unauthorized" in err or "expired" in err or "401" in err or "403" in err:
                     resolver = getattr(self.client.executor, "auth_resolver", None)
                     if resolver is not None:
                         asyncio.create_task(resolver.auto_heal_account(acc))

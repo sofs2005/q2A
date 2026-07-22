@@ -103,8 +103,8 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
         captured = {}
 
         class FakeEngine:
-            async def _request_json(self, method, path, token, body, timeout, account=None, chat_transport=False):
-                del method, path, token, body, account
+            async def _request_json(self, method, path, token, body, timeout, account=None, chat_transport=False, **kwargs):
+                del method, path, token, body, account, kwargs
                 captured["timeout"] = timeout
                 captured["chat_transport"] = chat_transport
                 return {"status": 200, "body": '{"success": true, "data": {"id": "chat-1"}}'}
