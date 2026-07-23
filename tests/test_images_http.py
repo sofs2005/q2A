@@ -39,7 +39,7 @@ class ImagesHttpTests(unittest.TestCase):
             self.assertEqual(images._resolve_image_model("qwen3.8-max-preview"), "qwen3.8-max-preview")
 
     def test_extract_image_urls_from_function_tool_result_extra(self) -> None:
-        """官网 image_gen function 帧：URL 在 extra.tool_result / image_list，不在 content。"""
+        """官网 image_gen：image_list 与 tool_result 是同图两条 CDN 路径，只取 image_list。"""
         event = {
             "type": "delta",
             "phase": "image_gen_tool",
@@ -57,11 +57,23 @@ class ImagesHttpTests(unittest.TestCase):
         urls = images._extract_image_urls_from_events([event])
         self.assertEqual(
             urls,
-            [
-                "https://cdn.qwenlm.ai/output/u/image_gen/r/b.png?key=k2",
-                "https://cdn.qwenlm.ai/output/u/t2i/c/a.png?key=k1",
-            ],
+            ["https://cdn.qwenlm.ai/output/u/image_gen/r/b.png?key=k2"],
         )
+
+    def test_extract_image_urls_falls_back_to_tool_result_when_no_image_list(self) -> None:
+        event = {
+            "type": "delta",
+            "phase": "image_gen_tool",
+            "content": "",
+            "status": "finished",
+            "extra": {
+                "tool_result": [
+                    {"image": "https://cdn.qwenlm.ai/output/u/t2i/c/a.png?key=k1"},
+                ],
+            },
+        }
+        urls = images._extract_image_urls_from_events([event])
+        self.assertEqual(urls, ["https://cdn.qwenlm.ai/output/u/t2i/c/a.png?key=k1"])
 
     def test_create_image_rehosts_cdn_url_to_local_content(self) -> None:
         acc = SimpleNamespace(token="token-1", email="user@example.com", inflight=1)
@@ -140,6 +152,78 @@ class ImagesHttpTests(unittest.TestCase):
         self.assertEqual(purpose, "generated_image")
         app.state.qwen_client.account_pool.release.assert_called_once_with(acc)
         app.state.qwen_client.delete_chat.assert_awaited_once_with("token-1", "chat-1", account=acc)
+
+    def test_create_image_n_two_runs_upstream_twice(self) -> None:
+        """n>1 时上游一次 image_gen 通常只出一张，需循环请求凑满 n。"""
+        acc = SimpleNamespace(token="token-1", email="user@example.com", inflight=0)
+        call_count = {"n": 0}
+        png_a = b"\x89PNG\r\n\x1a\nimage-A"
+        png_b = b"\x89PNG\r\n\x1a\nimage-B-different"
+
+        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, preferred_account=None):
+            call_count["n"] += 1
+            idx = call_count["n"]
+            acc.inflight += 1
+            yield {"type": "meta", "acc": acc, "chat_id": f"chat-{idx}"}
+            yield {
+                "type": "event",
+                "event": {
+                    "type": "delta",
+                    "phase": "image_gen_tool",
+                    "content": "",
+                    "status": "finished",
+                    "extra": {
+                        "image_list": [
+                            {"image": f"https://cdn.qwenlm.ai/output/u/image_gen/r/{idx}.png?key=k{idx}"},
+                        ],
+                    },
+                },
+            }
+
+        async def fake_download(url, account=None, timeout=None):
+            if url.endswith("1.png?key=k1") or "/1.png" in url:
+                return png_a, "image/png"
+            return png_b, "image/png"
+
+        save_ids = {"n": 0}
+
+        async def fake_save_bytes(filename, content_type, raw, purpose, owner_token=None):
+            save_ids["n"] += 1
+            fid = f"file{save_ids['n']}"
+            return {
+                "id": fid,
+                "path": f"/tmp/{fid}.png",
+                "filename": filename,
+                "content_type": content_type,
+                "size": len(raw),
+                "created_at": time.time(),
+                "purpose": purpose,
+            }
+
+        app = FastAPI()
+        app.include_router(images.router)
+        app.state.file_store = SimpleNamespace(save_bytes=AsyncMock(side_effect=fake_save_bytes))
+        release = Mock(side_effect=lambda account: setattr(account, "inflight", max(0, getattr(account, "inflight", 0) - 1)))
+        app.state.qwen_client = SimpleNamespace(
+            chat_stream_events_with_retry=fake_stream_events_with_retry,
+            download_url=AsyncMock(side_effect=fake_download),
+            delete_chat=AsyncMock(),
+            account_pool=SimpleNamespace(release=release),
+        )
+
+        client = TestClient(app)
+        response = client.post(
+            "/v1/images/generations",
+            headers={"Authorization": f"Bearer {settings.ADMIN_KEY}"},
+            json={"prompt": "生成两张图", "n": 2, "model": "qwen3.8-max-preview"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(len(payload["data"]), 2)
+        self.assertEqual(call_count["n"], 2)
+        self.assertEqual(app.state.qwen_client.delete_chat.await_count, 2)
+        self.assertEqual(release.call_count, 2)
 
     def test_create_image_does_not_require_list_chats(self) -> None:
         acc = SimpleNamespace(token="token-1", email="user@example.com", inflight=1)
