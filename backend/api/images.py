@@ -3,57 +3,138 @@
 
 底层通过现有直连 HTTP 聊天能力触发千问“生成图像”模式，
 不依赖浏览器运行时。
+
+CDN 签名链接对普通浏览器常不可访问，因此生成成功后会回源下载并
+转存为本地文件，对外返回同源 `/v1/images/content/{id}`。
 """
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import mimetypes
 import re
 import time
-import json
-import asyncio
-import logging
-from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import JSONResponse
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
+
+from backend.core.config import settings
 from backend.services.qwen_client import QwenClient
 
 log = logging.getLogger("qwen2api.images")
 router = APIRouter()
 
-DEFAULT_IMAGE_MODEL = "qwen3.6-plus"
+GENERATED_IMAGE_PURPOSE = "generated_image"
 
-IMAGE_MODEL_MAP = {
-    "dall-e-3": "qwen3.6-plus",
-    "dall-e-2": "qwen3.6-plus",
-    "qwen-image": "qwen3.6-plus",
-    "qwen-image-plus": "qwen3.6-plus",
-    "qwen-image-turbo": "qwen3.6-plus",
-    "qwen3.6-plus": "qwen3.6-plus",
-}
+
+def _default_image_model() -> str:
+    """从 env 读取默认生图模型，缺省 qwen3.8-max-preview。"""
+    name = str(getattr(settings, "IMAGE_GENERATION_MODEL", "") or "").strip()
+    return name or "qwen3.8-max-preview"
+
+
+def _dedupe_urls(urls: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for u in urls:
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        result.append(u)
+    return result
 
 
 def _extract_image_urls(text: str) -> list[str]:
     urls: list[str] = []
 
-    for u in re.findall(r'!\[.*?\]\((https?://[^\s\)]+)\)', text):
+    for u in re.findall(r"!\[.*?\]\((https?://[^\s\)]+)\)", text):
         urls.append(u.rstrip(").,;"))
 
     for u in re.findall(r'"(?:url|image|src|imageUrl|image_url)"\s*:\s*"(https?://[^"]+)"', text):
         urls.append(u)
 
-    cdn_pattern = r'https?://(?:cdn\.qwenlm\.ai|wanx\.alicdn\.com|img\.alicdn\.com|[^\s"<>]+\.(?:jpg|jpeg|png|webp|gif))(?:[^\s"<>]*)'
+    cdn_pattern = (
+        r"https?://(?:cdn\.qwenlm\.ai|wanx\.alicdn\.com|img\.alicdn\.com|"
+        r'[^\s"<>]+\.(?:jpg|jpeg|png|webp|gif))(?:[^\s"<>]*)'
+    )
     for u in re.findall(cdn_pattern, text, re.IGNORECASE):
         urls.append(u.rstrip(".,;)\"'>"))
 
-    seen: set[str] = set()
-    result: list[str] = []
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            result.append(u)
-    return result
+    return _dedupe_urls(urls)
+
+
+def _urls_from_image_entries(entries: Any) -> list[str]:
+    urls: list[str] = []
+    if not isinstance(entries, list):
+        return urls
+    for item in entries:
+        if isinstance(item, str) and item.startswith("http"):
+            urls.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        for key in ("image", "url", "src", "image_url", "imageUrl"):
+            value = item.get(key)
+            if isinstance(value, str) and value.startswith("http"):
+                urls.append(value)
+                break
+    return urls
+
+
+def _extract_image_urls_from_events(events: list[dict]) -> list[str]:
+    """从已解析的 SSE 事件中提取图片 URL。
+
+    官网文生图关键帧：
+      phase=image_gen_tool, status=finished,
+      extra.image_list[].image / extra.tool_result[].image
+    优先 image_list（展示用），再 tool_result，最后回退正则扫整包。
+    """
+    preferred: list[str] = []
+    fallback: list[str] = []
+    for evt in events:
+        if not isinstance(evt, dict):
+            continue
+        extra = evt.get("extra")
+        if isinstance(extra, dict):
+            preferred.extend(_urls_from_image_entries(extra.get("image_list")))
+            fallback.extend(_urls_from_image_entries(extra.get("tool_result")))
+        # 兼容未归一化的 raw choices 结构
+        choices = evt.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+                nested_extra = delta.get("extra") if isinstance(delta.get("extra"), dict) else {}
+                preferred.extend(_urls_from_image_entries(nested_extra.get("image_list")))
+                fallback.extend(_urls_from_image_entries(nested_extra.get("tool_result")))
+    ordered = _dedupe_urls(preferred + fallback)
+    if ordered:
+        return ordered
+    # 文本 / markdown / 整包 JSON 回退
+    blob = "\n".join(json.dumps(e, ensure_ascii=False) for e in events if isinstance(e, dict))
+    return _extract_image_urls(blob)
 
 
 def _resolve_image_model(requested: str | None) -> str:
-    if not requested:
-        return DEFAULT_IMAGE_MODEL
-    return IMAGE_MODEL_MAP.get(requested, DEFAULT_IMAGE_MODEL)
+    """解析生图上游模型。
+
+    - 未传 / 空串 → settings.IMAGE_GENERATION_MODEL
+    - 以 qwen 开头的名称 → 原样使用（便于临时指定其它 Qwen 型号）
+    - 其它（含旧 dall-e 别名）→ 回退到 env 默认
+    """
+    default = _default_image_model()
+    name = str(requested or "").strip()
+    if not name:
+        return default
+    lower = name.lower()
+    if lower.startswith("qwen"):
+        return name
+    return default
 
 
 def _get_token(request: Request) -> str:
@@ -69,6 +150,77 @@ def _build_image_prompt(prompt: str) -> str:
         "如果可以生成图片，请返回可访问的图片链接或包含图片链接的结果。\n\n"
         f"用户需求：{prompt}"
     )
+
+
+def _guess_filename(url: str, content_type: str) -> str:
+    path = urlparse(url).path
+    name = Path(path).name or "generated.png"
+    if "." not in name:
+        ext = mimetypes.guess_extension(content_type or "") or ".png"
+        name = f"{name}{ext}"
+    return name.split("?")[0]
+
+
+def _public_content_url(request: Request, file_id: str) -> str:
+    # 相对路径：同源前端 / 反代均可直接使用
+    return f"/v1/images/content/{file_id}"
+
+
+async def _rehost_urls(
+    request: Request,
+    client: QwenClient,
+    acc: Any,
+    image_urls: list[str],
+    limit: int,
+) -> list[dict[str, str]]:
+    file_store = getattr(request.app.state, "file_store", None)
+    if file_store is None or not hasattr(client, "download_url"):
+        return [{"url": url, "revised_prompt": ""} for url in image_urls[:limit]]
+
+    hosted: list[dict[str, str]] = []
+    for url in image_urls[:limit]:
+        try:
+            raw, content_type = await client.download_url(url, account=acc)
+            if not raw:
+                raise RuntimeError("empty image body")
+            filename = _guess_filename(url, content_type or "image/png")
+            meta = await file_store.save_bytes(
+                filename,
+                content_type or "image/png",
+                raw,
+                GENERATED_IMAGE_PURPOSE,
+            )
+            hosted.append(
+                {
+                    "url": _public_content_url(request, str(meta["id"])),
+                    "revised_prompt": "",
+                }
+            )
+            log.info("[T2I] rehosted url -> file_id=%s size=%s", meta.get("id"), meta.get("size"))
+        except Exception as exc:
+            log.warning("[T2I] rehost failed url=%s error=%s", url[:120], exc)
+            # 回退原始 CDN（可能仍不可用，但至少不吞结果）
+            hosted.append({"url": url, "revised_prompt": ""})
+    return hosted
+
+
+@router.get("/v1/images/content/{file_id}")
+@router.get("/images/content/{file_id}")
+async def get_image_content(request: Request, file_id: str):
+    file_store = getattr(request.app.state, "file_store", None)
+    if file_store is None:
+        raise HTTPException(status_code=404, detail="Image store unavailable")
+    meta = await file_store.get(file_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Image not found")
+    if meta.get("purpose") and meta.get("purpose") != GENERATED_IMAGE_PURPOSE:
+        # 仅暴露生图结果，避免误读上下文附件
+        raise HTTPException(status_code=404, detail="Image not found")
+    path = meta.get("path")
+    if not path or not Path(path).is_file():
+        raise HTTPException(status_code=404, detail="Image file missing")
+    media_type = meta.get("content_type") or "application/octet-stream"
+    return FileResponse(path, media_type=media_type, filename=meta.get("filename") or Path(path).name)
 
 
 @router.post("/v1/images/generations")
@@ -101,7 +253,7 @@ async def create_image(request: Request):
     chat_id = None
     try:
         prompt_text = _build_image_prompt(prompt)
-        event_payloads: list[str] = []
+        events: list[dict] = []
         async for item in client.chat_stream_events_with_retry(model, prompt_text, has_custom_tools=False):
             if item.get("type") == "meta":
                 acc = item.get("acc")
@@ -109,13 +261,14 @@ async def create_image(request: Request):
                 continue
             if item.get("type") != "event":
                 continue
-            event_payloads.append(json.dumps(item.get("event", {}), ensure_ascii=False))
+            evt = item.get("event", {})
+            if isinstance(evt, dict):
+                events.append(evt)
 
         if acc is None or chat_id is None:
             raise HTTPException(status_code=500, detail="Image generation session was not created")
 
-        answer_text = "\n".join(event_payloads)
-        image_urls = _extract_image_urls(answer_text)
+        image_urls = _extract_image_urls_from_events(events)
         if not image_urls:
             try:
                 chats = await client.list_chats(acc.token, limit=20, account=acc)
@@ -124,7 +277,7 @@ async def create_image(request: Request):
                     None,
                 )
                 if current_chat:
-                    image_urls = _extract_image_urls(answer_text + "\n" + json.dumps(current_chat, ensure_ascii=False))
+                    image_urls = _extract_image_urls(json.dumps(current_chat, ensure_ascii=False))
             except Exception as exc:
                 log.debug("[T2I] current chat fallback failed chat_id=%s error=%s", chat_id, exc)
         log.info(f"[T2I] 提取到 {len(image_urls)} 张图片 URL: {image_urls}")
@@ -132,7 +285,10 @@ async def create_image(request: Request):
         if not image_urls:
             raise HTTPException(status_code=500, detail="Image generation succeeded but no URL found")
 
-        data = [{"url": url, "revised_prompt": prompt} for url in image_urls[:n]]
+        data = await _rehost_urls(request, client, acc, image_urls, n)
+        for item in data:
+            if not item.get("revised_prompt"):
+                item["revised_prompt"] = prompt
         return JSONResponse({"created": int(time.time()), "data": data})
 
     except HTTPException:

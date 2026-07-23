@@ -14,7 +14,14 @@ async def context_cleanup_loop(app, interval_seconds: int = 300):
         try:
             with request_context(surface="context-cleanup"):
                 ttl = app.state.context_offloader.settings.CONTEXT_ATTACHMENT_TTL_SECONDS
-                await app.state.file_store.cleanup_expired(ttl)
+                # 上下文附件：通用 TTL，但跳过 generated_image（其使用独立 TTL）。
+                cleaned_context = await app.state.file_store.cleanup_expired(
+                    ttl, exclude_purpose="generated_image"
+                )
+                image_ttl = int(getattr(settings, "GENERATED_IMAGE_TTL_SECONDS", ttl) or ttl)
+                cleaned_images = await app.state.file_store.cleanup_expired(
+                    image_ttl, purpose="generated_image"
+                )
                 expired_records = await app.state.session_affinity.cleanup_expired()
                 await app.state.upstream_file_cache.cleanup_expired()
                 if settings.UPSTREAM_AUTO_DELETE_ENABLED:
@@ -32,7 +39,14 @@ async def context_cleanup_loop(app, interval_seconds: int = 300):
                                 await app.state.upstream_file_uploader.delete_remote_file(acc, remote_meta)
                             except Exception as exc:
                                 log.debug("[ContextCleanup] remote delete failed session=%s error=%s", record.session_key, exc)
-                log.info("[ContextCleanup] ttl=%s expired_sessions=%s completed", ttl, len(expired_records))
+                log.info(
+                    "[ContextCleanup] ttl=%s image_ttl=%s cleaned_files=%s cleaned_images=%s expired_sessions=%s completed",
+                    ttl,
+                    image_ttl,
+                    cleaned_context,
+                    cleaned_images,
+                    len(expired_records),
+                )
         except Exception as exc:
             log.warning("[ContextCleanup] failed: %s", exc)
         await asyncio.sleep(max(60, interval_seconds))

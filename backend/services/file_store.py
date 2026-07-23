@@ -84,12 +84,28 @@ class LocalFileStore:
             self._metadata.pop(remove_id, None)
             await self.save()
 
-    async def cleanup_expired(self, ttl_seconds: int) -> None:
+    async def cleanup_expired(
+        self,
+        ttl_seconds: int,
+        purpose: str | None = None,
+        exclude_purpose: str | None = None,
+    ) -> int:
+        """删除超过 TTL 的本地文件。
+
+        - purpose: 仅清理该用途（例如 generated_image）
+        - exclude_purpose: 跳过该用途（通用清理时避开生图缓存的独立 TTL）
+        返回删除条数。
+        """
         if ttl_seconds <= 0:
-            return
+            return 0
         cutoff = time.time() - ttl_seconds
         expired_ids: list[str] = []
         for file_id, meta in list(self._metadata.items()):
+            meta_purpose = meta.get("purpose")
+            if purpose is not None and meta_purpose != purpose:
+                continue
+            if exclude_purpose is not None and meta_purpose == exclude_purpose:
+                continue
             if meta.get("created_at", 0) < cutoff:
                 expired_ids.append(file_id)
         for file_id in expired_ids:
@@ -103,3 +119,4 @@ class LocalFileStore:
             self._metadata.pop(file_id, None)
         if expired_ids:
             await self.save()
+        return len(expired_ids)

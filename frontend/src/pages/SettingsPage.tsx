@@ -145,7 +145,7 @@ export default function SettingsPage() {
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer YOUR_API_KEY" \
     -d '{
-      "model": "dall-e-3",
+      "model": "qwen3.8-max-preview",
       "prompt": "A cyberpunk cat with neon lights, ultra realistic",
       "n": 1,
       "size": "1024x1024",

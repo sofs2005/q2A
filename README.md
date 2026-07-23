@@ -168,9 +168,10 @@ flowchart LR
 qwen2API 提供与 OpenAI Images 接口兼容的图片生成能力。
 
 - 接口：`POST /v1/images/generations`
-- 默认模型别名：`dall-e-3`
-- 实际底层：`qwen3.6-plus` + 千问网页 `image_gen` 工具
-- 返回图片链接域名：通常为 `cdn.qwenlm.ai`
+- 默认模型：由环境变量 `IMAGE_GENERATION_MODEL` 控制（默认 `qwen3.8-max-preview`；不再使用 `dall-e-*` 别名）
+- 实际链路：千问网页 `image_gen` 工具 → CDN 回源转存 → 同源 `/v1/images/content/{id}`
+- 返回：本地托管图片 URL（避免 `cdn.qwenlm.ai` 签名链在浏览器 403）
+- 生图本地缓存 TTL：`GENERATED_IMAGE_TTL_SECONDS`（默认 3600）
 
 ### 请求示例
 
@@ -179,7 +180,7 @@ curl http://127.0.0.1:7860/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{
-    "model": "dall-e-3",
+    "model": "qwen3.8-max-preview",
     "prompt": "一只赛博朋克风格的猫，霓虹灯背景，超写实",
     "n": 1,
     "size": "1024x1024",

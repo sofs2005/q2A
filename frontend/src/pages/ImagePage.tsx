@@ -40,7 +40,7 @@ export default function ImagePage() {
         method: "POST",
         headers: { "Content-Type": "application/json", ...getAuthHeader() },
         body: JSON.stringify({
-          model: "dall-e-3",
+          // 模型由后端 IMAGE_GENERATION_MODEL 决定，前端不写死
           prompt: prompt.trim(),
           n,
           size: sizeStr,
@@ -92,7 +92,7 @@ export default function ImagePage() {
     <div className="w-full space-y-6">
       <div>
         <h2 className="text-2xl font-bold tracking-tight">图片生成</h2>
-        <p className="text-muted-foreground">通过 Qwen3.6-Plus 生成 AI 图片，支持多种比例。</p>
+        <p className="text-muted-foreground">通过可配置的 Qwen 模型生成 AI 图片（默认见后端 IMAGE_GENERATION_MODEL），支持多种比例。</p>
       </div>
 
       {/* 输入区域 */}

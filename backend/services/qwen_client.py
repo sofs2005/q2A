@@ -445,6 +445,73 @@ class QwenClient:
         chats = data.get("data", [])
         return chats if isinstance(chats, list) else []
 
+    async def download_url(
+        self,
+        url: str,
+        account: Account | None = None,
+        timeout: float | None = None,
+    ) -> tuple[bytes, str]:
+        """用账号指纹 session 回源下载 CDN 资源（生图签名链通常需浏览器态头）。
+
+        返回 (body_bytes, content_type)。失败抛 RuntimeError。
+        """
+        if not url or not str(url).startswith("http"):
+            raise RuntimeError("invalid download url")
+        request_timeout = timeout if timeout is not None else settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS
+        fingerprint = fingerprint_for_account(account)
+        session = await get_session(fingerprint)
+        headers = {
+            "User-Agent": fingerprint.user_agent,
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Referer": f"{BASE_URL}/",
+            "Origin": BASE_URL,
+            "sec-fetch-dest": "image",
+            "sec-fetch-mode": "no-cors",
+            "sec-fetch-site": "cross-site",
+        }
+        if fingerprint.sec_ch_ua:
+            headers["sec-ch-ua"] = fingerprint.sec_ch_ua
+            headers["sec-ch-ua-mobile"] = fingerprint.sec_ch_ua_mobile
+            headers["sec-ch-ua-platform"] = fingerprint.platform
+        # 带上 token / WAF cookie：部分 CDN key 与会话态绑定
+        token = str(getattr(account, "token", "") or "")
+        cookie_parts: list[str] = []
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        if bool(getattr(settings, "QWEN_CHAT_TRANSPORT_SEND_COOKIES", False)):
+            account_cookies = str(getattr(account, "cookies", "") or "").strip()
+            if account_cookies:
+                cookie_parts.append(account_cookies)
+        waf_cookie = self._valid_waf_cookie(account)
+        if waf_cookie:
+            cookie_parts.append(waf_cookie)
+        merged_cookie = self._merge_cookie_header(*cookie_parts)
+        if merged_cookie:
+            headers["Cookie"] = merged_cookie
+
+        try:
+            resp = await session.get(url, headers=headers, timeout=request_timeout)
+        except Exception as exc:
+            raise RuntimeError(f"download failed: {exc}") from exc
+
+        status = int(getattr(resp, "status_code", 0) or 0)
+        content = getattr(resp, "content", None)
+        if content is None:
+            text = getattr(resp, "text", "") or ""
+            content = text.encode("utf-8", errors="ignore") if isinstance(text, str) else b""
+        if status != 200 or not content:
+            raise RuntimeError(f"download HTTP {status}: empty or non-200")
+
+        content_type = ""
+        resp_headers = getattr(resp, "headers", None) or {}
+        try:
+            content_type = str(resp_headers.get("content-type") or resp_headers.get("Content-Type") or "")
+        except Exception:
+            content_type = ""
+        content_type = content_type.split(";")[0].strip() or "application/octet-stream"
+        return bytes(content), content_type
+
     async def complete_chat_once(self, token: str, chat_id: str, payload: dict, account: Account | None = None, timeout: float | None = None) -> dict:
         """非流式 completions（用于视频 t2v）：返回 {status, body}，body 为完整 JSON 文本。
 
