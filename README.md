@@ -425,7 +425,7 @@ python start.py
 | `QWEN_UPSTREAM_USAGE_ENABLED` | `true` | 接入上游 SSE 每帧的累计 `usage`，使响应展示与后台扣费同源。置 `false` 则完全回落到本地 tiktoken 估算。 |
 | `QWEN_UPSTREAM_USAGE_INCLUDES_ATTACHMENT_TOKENS` | `false` | 上游 `input_tokens` 是否已包含附件文本。默认 `false` 表示保守地在本地估算上继续叠加 `context_attachment_tokens`。 |
 | `IMAGE_GENERATION_MODEL` | `qwen3.8-max` | 生图请求 chat 级 `model`。 |
-| `IMAGE_GENERATION_META_MODEL` | 空 | 生图请求 `extra.meta.model`。留空则不发送该键，出图模型由 `IMAGE_GENERATION_MODEL` 决定。 |
+| `IMAGE_GENERATION_META_MODEL` | `qwen-image-3.0-pro` | 生图请求 `extra.meta.model`，即真正出图的模型。留空则不发送该键，出图模型交由 `IMAGE_GENERATION_MODEL` 路由。 |
 | `GENERATED_IMAGE_TTL_SECONDS` | `3600` | 生图本地缓存 TTL（秒）。 |
 
 ### 数据路径参数

@@ -155,15 +155,22 @@ class ImagesHttpTests(unittest.TestCase):
         app.state.qwen_client.delete_chat.assert_awaited_once_with("token-1", "chat-1", account=acc)
 
     def test_create_image_n_two_runs_upstream_twice(self) -> None:
-        """n>1 时上游一次 image_gen 通常只出一张，需循环请求凑满 n。"""
+        """n>1 时上游一次 image_gen 通常只出一张，需循环请求凑满 n。
+
+        同时钉住：**每一轮都走原生 t2i**。此前的实现是 `use_t2i = round_idx == 1`，
+        导致第 2 张起退回 t2t 提示词诱导 —— 出图模型不是 image-3.0，且 t2t 分支
+        不发送 size，比例从第 2 张起静默失效。
+        """
         acc = SimpleNamespace(token="token-1", email="user@example.com", inflight=0)
         call_count = {"n": 0}
+        calls: list[dict] = []
         png_a = b"\x89PNG\r\n\x1a\nimage-A"
         png_b = b"\x89PNG\r\n\x1a\nimage-B-different"
 
         async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, preferred_account=None, chat_type="t2t", media_options=None):
             call_count["n"] += 1
             idx = call_count["n"]
+            calls.append({"chat_type": chat_type, "media_options": media_options, "content": content})
             acc.inflight += 1
             yield {"type": "meta", "acc": acc, "chat_id": f"chat-{idx}"}
             yield {
@@ -223,6 +230,11 @@ class ImagesHttpTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(len(payload["data"]), 2)
         self.assertEqual(call_count["n"], 2)
+        # 两轮都必须是原生 t2i，且都带 size（否则比例从第 2 张起失效）
+        self.assertEqual([c["chat_type"] for c in calls], ["t2i", "t2i"])
+        self.assertEqual([c["media_options"] for c in calls], [{"size": "auto"}, {"size": "auto"}])
+        # 走原生通道时不包提示词诱导前缀，两轮内容都应是原始 prompt
+        self.assertEqual([c["content"] for c in calls], ["生成两张图", "生成两张图"])
         self.assertEqual(app.state.qwen_client.delete_chat.await_count, 2)
         self.assertEqual(release.call_count, 2)
 

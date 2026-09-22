@@ -152,14 +152,6 @@ def _get_token(request: Request) -> str:
     return request.headers.get("x-api-key", "").strip()
 
 
-def _build_image_prompt(prompt: str) -> str:
-    return (
-        "请直接生成图片，不要只输出文字描述。"
-        "如果可以生成图片，请返回可访问的图片链接或包含图片链接的结果。\n\n"
-        f"用户需求：{prompt}"
-    )
-
-
 def _guess_filename(url: str, content_type: str) -> str:
     path = urlparse(url).path
     name = Path(path).name or "generated.png"
@@ -355,35 +347,31 @@ async def create_image(request: Request):
 
     data: list[dict[str, str]] = []
     seen_hashes: set[str] = set()
-    # 上游一次 image_gen 通常只产 1 张；n>1 时按轮次循环请求凑满。
+    # 上游不接受 n，一次 image_gen 只产 1 张；n>1 时按轮次循环请求凑满。
+    # 每一轮都走原生 t2i：此前是"只有 round 1 走 t2i、round 2+ 退回 t2t 提示词
+    # 诱导"，导致多图请求里第 1 张是原生通道、其余全是降级通道 —— 出图模型不是
+    # image-3.0，且 t2t 分支不发送 size，比例从第 2 张起静默失效。
     # 每轮独立 chat；硬错误且尚无结果时快速失败，不空转。
     # 轮数上限收紧为 n+1：每轮内部还有 MAX_RETRIES 次换号，外层再乘 1.x 倍就是
     # 单次生图打十几到几十次上游请求，是 WAF 命中的主要放大器之一。
     max_rounds = n + 1
     round_idx = 0
     last_error: Exception | None = None
-    # 第一轮走原生 t2i；拿不到结果则回退到旧的 t2t + 提示词诱导路径
-    fallback_prompt = _build_image_prompt(prompt)
-    used_t2t_fallback = False
     try:
         while len(data) < n and round_idx < max_rounds:
             round_idx += 1
-            use_t2i = round_idx == 1
-            if not use_t2i and not used_t2t_fallback:
-                used_t2t_fallback = True
-                log.warning("[T2I] 原生 t2i 未取到图片，回退 t2t 提示词诱导路径")
             session: dict[str, Any] = {"acc": None, "chat_id": None}
             try:
                 image_urls = await _generate_once(
                     client,
                     model,
-                    prompt if use_t2i else fallback_prompt,
+                    prompt,
                     session=session,
-                    chat_type="t2i" if use_t2i else "t2t",
-                    media_options={"size": t2i_size} if use_t2i else None,
+                    chat_type="t2i",
+                    media_options={"size": t2i_size},
                 )
                 if not image_urls:
-                    log.warning("[T2I] round=%s no image urls (chat_type=%s)", round_idx, "t2i" if use_t2i else "t2t")
+                    log.warning("[T2I] round=%s no image urls", round_idx)
                     continue
                 acc = session.get("acc")
                 need = n - len(data)

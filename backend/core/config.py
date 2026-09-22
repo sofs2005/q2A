@@ -129,9 +129,10 @@ class Settings(BaseSettings):
     GENERATED_IMAGE_TTL_SECONDS: int = int(os.getenv("GENERATED_IMAGE_TTL_SECONDS", 3600))
     # /v1/images/generations 默认上游模型；升级时只改 env，无需改代码
     IMAGE_GENERATION_MODEL: str = os.getenv("IMAGE_GENERATION_MODEL", DEFAULT_QWEN_MAX_MODEL).strip() or DEFAULT_QWEN_MAX_MODEL
-    # t2i 请求 messages[].extra.meta.model 的取值（官网抓包为 qwen-image-3.0-pro）。
-    # 留空 = 不发送该键，生图模型完全由 chat 级 model（IMAGE_GENERATION_MODEL）决定。
-    IMAGE_GENERATION_META_MODEL: str = os.getenv("IMAGE_GENERATION_META_MODEL", "").strip()
+    # t2i 请求 messages[].extra.meta.model 的取值，即真正出图的模型。
+    # 默认 qwen-image-3.0-pro（官网抓包值）：留空会让上游按 chat 级 model 自行
+    # 路由，出图模型不可控，故给一个明确的默认值。
+    IMAGE_GENERATION_META_MODEL: str = os.getenv("IMAGE_GENERATION_META_MODEL", "qwen-image-3.0-pro").strip()
     CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS: int = int(os.getenv("CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS", 60))
     CONTEXT_GENERATED_DIR: str = os.getenv("CONTEXT_GENERATED_DIR", str(DATA_DIR / "context_files"))
     CONTEXT_CACHE_FILE: str = os.getenv("CONTEXT_CACHE_FILE", str(DATA_DIR / "context_cache.json"))
