@@ -148,7 +148,11 @@ async def gemini_generate_content(model: str, request: Request):
             raise HTTPException(status_code=500, detail=str(e))
 
         log.info(f"[Gemini] Request complete. Generated {len(execution.state.answer_text)} characters.")
-        return JSONResponse(build_gemini_generate_payload(execution=execution))
+        return JSONResponse(
+            build_gemini_generate_payload(
+                execution=execution, prompt=content, standard_request=standard_request
+            )
+        )
 
 
 @router.post("/v1beta/models/{model}:streamGenerateContent")

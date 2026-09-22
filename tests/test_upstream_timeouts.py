@@ -153,7 +153,7 @@ class UpstreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 "tok",
             )
 
-        self.assertEqual(result, {"status": 200, "body": "{}"})
+        self.assertEqual(result, {"status": 200, "body": "{}", "acw_tc": "", "waf_cookies": {}})
         self.assertEqual(captured["timeout"], 88.0)
 
     async def test_executor_releases_account_when_stream_is_closed_after_acquire(self) -> None:

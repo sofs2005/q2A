@@ -62,6 +62,66 @@ class UpstreamPayloadBuilderTests(unittest.TestCase):
         for banned in ("enable_tools", "enable_function_call", "tool_choice"):
             self.assertNotIn(banned, fc)
 
+    def test_payload_dual_writes_chat_id_and_parent_id(self) -> None:
+        """2026-09 官网抓包同时发 camel 与 snake 两种拼写。"""
+        payload = build_chat_payload("chat-1", "qwen3.8-max", "hello")
+        message = payload["messages"][0]
+
+        self.assertEqual(payload["chat_id"], "chat-1")
+        self.assertEqual(payload["chatId"], "chat-1")
+        # 官网顶层 camel 为 ""、snake 为 null（抓包原样），消息级两者皆 null
+        self.assertEqual(payload["parentId"], "")
+        self.assertIsNone(payload["parent_id"])
+        self.assertIsNone(message["parentId"])
+        self.assertIsNone(message["parent_id"])
+
+    def test_t2i_payload_matches_official_capture(self) -> None:
+        """生图走原生 t2i 通道（2026-09 抓包），而非 t2t 提示词诱导。"""
+        payload = build_chat_payload(
+            "chat-1", "qwen3.8-max", "一只猫", chat_type="t2i", media_options={"size": "16:9"}
+        )
+        message = payload["messages"][0]
+
+        self.assertEqual(payload["size"], "16:9")
+        self.assertEqual(message["chat_type"], "t2i")
+        self.assertEqual(message["sub_chat_type"], "t2i")
+        self.assertEqual(message["extra"]["meta"]["subChatType"], "t2i")
+        self.assertEqual(message["extra"]["meta"]["size"], "16:9")
+        fc = message["feature_config"]
+        self.assertEqual(fc["thinking_enabled"], False)
+        self.assertEqual(fc["output_schema"], "phase")
+        self.assertEqual(fc["thinking_mode"], "Fast")
+        self.assertEqual(fc["auto_thinking"], False)
+        # t2i 抓包仍是流式
+        self.assertTrue(payload["stream"])
+        self.assertTrue(payload["incremental_output"])
+
+    def test_t2i_size_defaults_to_auto(self) -> None:
+        payload = build_chat_payload("chat-1", "qwen3.8-max", "一只猫", chat_type="t2i")
+
+        self.assertEqual(payload["size"], "auto")
+        self.assertEqual(payload["messages"][0]["extra"]["meta"]["size"], "auto")
+
+    def test_t2i_pixel_size_is_mapped_to_ratio(self) -> None:
+        payload = build_chat_payload(
+            "chat-1", "qwen3.8-max", "一只猫", chat_type="t2i", media_options={"size": "1024x1024"}
+        )
+
+        self.assertEqual(payload["size"], "1:1")
+
+    def test_t2i_meta_model_only_sent_when_configured(self) -> None:
+        from backend.core.config import settings
+
+        with patch.object(settings, "IMAGE_GENERATION_META_MODEL", ""):
+            payload = build_chat_payload("chat-1", "qwen3.8-max", "cat", chat_type="t2i")
+            self.assertNotIn("model", payload["messages"][0]["extra"]["meta"])
+
+        with patch.object(settings, "IMAGE_GENERATION_META_MODEL", "qwen-image-3.0-pro"):
+            payload = build_chat_payload("chat-1", "qwen3.8-max", "cat", chat_type="t2i")
+            self.assertEqual(
+                payload["messages"][0]["extra"]["meta"]["model"], "qwen-image-3.0-pro"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

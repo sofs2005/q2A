@@ -14,7 +14,11 @@ from backend.core.request_logging import update_request_context
 from backend.runtime.command_error_adaptation import classify_command_error, build_command_error_retry_prompt, looks_like_command_error
 from backend.runtime.stream_metrics import StreamMetrics
 from backend.services import tool_parser
-from backend.services.token_calc import completion_text_for_usage, count_tokens
+from backend.services.token_calc import (
+    completion_text_for_usage,
+    count_tokens,
+    effective_extra_prompt_tokens,
+)
 from backend.toolcore.directive_parser import parse_state_tool_calls, parse_textual_tool_calls
 from backend.toolcore.policy import evaluate_tool_policy, recent_same_tool_identity_count_in_turn
 from backend.toolcore.stream_sieve import ToolStreamSieve
@@ -48,6 +52,9 @@ class RuntimeAttemptState:
     # 上游 SSE 错误帧（如 quota_limit / invalid_input），用于避免 empty_output 盲重试。
     upstream_error_code: str = ""
     upstream_error_details: str = ""
+    # 上游每帧下发的累计 usage（已归一化为 OpenAI 契约字段）；缺失时为 None。
+    # 覆盖式赋值：上游是累计值而非增量，取最后一帧即为最终值。
+    upstream_usage: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -559,6 +566,7 @@ async def collect_completion_run(
 
     upstream_error_code = ""
     upstream_error_details = ""
+    upstream_usage: dict[str, Any] | None = None
 
     def _finalize_result(*, reason: str | None = None) -> RuntimeExecutionResult:
         nonlocal final_tool_sieve_events
@@ -700,6 +708,7 @@ async def collect_completion_run(
             stage_metrics=metrics.summary(),
             upstream_error_code=upstream_error_code,
             upstream_error_details=upstream_error_details,
+            upstream_usage=upstream_usage,
         )
         return RuntimeExecutionResult(state=state, chat_id=chat_id, acc=acc)
 
@@ -750,6 +759,14 @@ async def collect_completion_run(
             evt = item.get("event", {})
             if capture_events:
                 raw_events.append(evt)
+
+            # 上游 usage 是累计值：直接覆盖，流末即为最终值。单点开关关闭时恒为 None，
+            # 下游 resolve_usage 全部自动回落到本地估算。心跳帧(response.info)也带累计
+            # usage，故在分派前统一采集，不限于 delta。
+            if settings.QWEN_UPSTREAM_USAGE_ENABLED:
+                incoming_usage = evt.get("usage")
+                if isinstance(incoming_usage, dict):
+                    upstream_usage = incoming_usage
 
             evt_type = str(evt.get("type") or "")
             if evt_type == "lifecycle":
@@ -1023,6 +1040,14 @@ def _execution_completion_text_for_usage(execution: RuntimeExecutionResult) -> s
 
 
 def _usage_delta_for_execution(execution: RuntimeExecutionResult, prompt: str, extra_prompt_tokens: int) -> int:
+    # 上游累计 usage 优先，保证响应里的 usage 与后台扣费同源
+    upstream = getattr(getattr(execution, "state", None), "upstream_usage", None)
+    if isinstance(upstream, dict):
+        total = upstream.get("total_tokens")
+        if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+            return total + _safe_extra_prompt_tokens(
+                effective_extra_prompt_tokens(extra_prompt_tokens, upstream_usage=upstream)
+            )
     return (
         count_tokens(_execution_completion_text_for_usage(execution))
         + count_tokens(prompt)

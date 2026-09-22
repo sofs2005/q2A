@@ -15,7 +15,7 @@ from backend.runtime.execution import (
     evaluate_retry_directive,
 )
 from backend.services.auth_quota import add_used_tokens
-from backend.services.token_calc import calculate_usage
+from backend.services.token_calc import resolve_usage
 from backend.toolcall.runtime_tools import (
     is_list_directory_tool_name,
     is_read_tool_name,
@@ -184,11 +184,12 @@ async def run_completion_bridge(
     usage = None
     execution_cleaned = False
     try:
-        usage = calculate_usage(
+        usage = resolve_usage(
             prompt,
             execution.state.answer_text,
             getattr(execution.state, "tool_calls", []),
             extra_prompt_tokens=getattr(standard_request, "context_attachment_tokens", 0),
+            upstream_usage=getattr(execution.state, "upstream_usage", None),
         )
         await add_used_tokens(users_db, token, usage_delta if usage_delta is not None else usage["total_tokens"])
         await cleanup_runtime_resources(
@@ -264,11 +265,12 @@ async def run_retryable_completion_bridge(
                 directive=directive,
                 history_messages=history_messages,
             )
-            usage = calculate_usage(
+            usage = resolve_usage(
                 current_prompt,
                 execution.state.answer_text,
                 getattr(execution.state, "tool_calls", []),
                 extra_prompt_tokens=getattr(standard_request, "context_attachment_tokens", 0),
+                upstream_usage=getattr(execution.state, "upstream_usage", None),
             )
             usage_delta = usage_delta_factory(execution, current_prompt) if usage_delta_factory is not None else usage["total_tokens"]
             await add_used_tokens(users_db, token, usage_delta)

@@ -167,7 +167,10 @@ qwen2API 提供与 OpenAI Images 接口兼容的图片生成能力。
 
 - 接口：`POST /v1/images/generations`
 - 默认模型：由环境变量 `IMAGE_GENERATION_MODEL` 控制（默认 `qwen3.8-max`；不再使用 `dall-e-*` 别名）。
-- 实际链路：千问网页 `image_gen` 工具 → CDN 回源转存 → 同源 `/v1/images/content/{id}`
+- 实际链路：走千问网页**原生 t2i 通道**（`chat_type` / `sub_chat_type` / `extra.meta.subChatType` 均为 `t2i`，顶层带 `size`）→ CDN 回源转存 → 同源 `/v1/images/content/{id}`
+  - t2i 一轮未取到图片时自动回退到旧的 t2t 提示词诱导路径（日志 `[T2I] 原生 t2i 未取到图片，回退 t2t 提示词诱导路径`）
+  - 图片 URL 兜底顺序：SSE 事件 → `GET /api/v2/library/list` → 当前 chat 详情
+- `extra.meta.model`：由 `IMAGE_GENERATION_META_MODEL` 控制，留空则不发送该键（出图模型由上面的 chat 级 `model` 决定）
 - 返回：本地托管图片 URL（避免 `cdn.qwenlm.ai` 签名链在浏览器 403）
 - 生图本地缓存 TTL：`GENERATED_IMAGE_TTL_SECONDS`（默认 3600）
 
@@ -209,6 +212,8 @@ curl http://127.0.0.1:7860/v1/images/generations \
 - `9:16`
 - `4:3`
 - `3:4`
+
+`size` 除上述比例外还接受 OpenAI 风格的像素值（如 `1024x1024`、`1280x720`），会按固定映射表归一为对应比例；留空或无法识别时用上游默认的 `auto`。
 
 ### Chat 接口图片意图识别
 
@@ -401,6 +406,19 @@ python start.py
 | `EMPTY_RESPONSE_RETRIES` | `1` | 空响应最大重试次数。 |
 | `RATE_LIMIT_BASE_COOLDOWN` | `600` | 账号限流基础冷却时间（秒）。 |
 | `RATE_LIMIT_MAX_COOLDOWN` | `3600` | 账号限流最大冷却时间（秒）。 |
+| `WAF_RETRY_EXTRA_COOLDOWN_SECONDS` | `5` | WAF 命中后固定账号原地重试前的额外冷却（秒），避免连续撞击加重风控。 |
+
+### 上游协议与用量参数
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `QWEN_WEB_VERSION` | `0.3.10` | 上游 `Version` 请求头，按最新官网抓包对齐。 |
+| `QWEN_BX_VERSION` | `2.5.37` | 上游 `bx-v` 请求头。 |
+| `QWEN_UPSTREAM_USAGE_ENABLED` | `true` | 接入上游 SSE 每帧的累计 `usage`，使响应展示与后台扣费同源。置 `false` 则完全回落到本地 tiktoken 估算。 |
+| `QWEN_UPSTREAM_USAGE_INCLUDES_ATTACHMENT_TOKENS` | `false` | 上游 `input_tokens` 是否已包含附件文本。默认 `false` 表示保守地在本地估算上继续叠加 `context_attachment_tokens`。 |
+| `IMAGE_GENERATION_MODEL` | `qwen3.8-max` | 生图请求 chat 级 `model`。 |
+| `IMAGE_GENERATION_META_MODEL` | 空 | 生图请求 `extra.meta.model`。留空则不发送该键，出图模型由 `IMAGE_GENERATION_MODEL` 决定。 |
+| `GENERATED_IMAGE_TTL_SECONDS` | `3600` | 生图本地缓存 TTL（秒）。 |
 
 ### 数据路径参数
 

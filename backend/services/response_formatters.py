@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from backend.runtime.execution import build_tool_directive
+from backend.services.token_calc import resolve_usage
 from backend.toolcall.markup_scan import find_tool_markup_tag_outside_ignored
 from backend.toolcore.formatter import (
     build_canonical_anthropic_message,
@@ -66,6 +67,12 @@ def _client_visible_tools(tools: list[dict[str, Any]], tool_catalog) -> list[dic
     return visible_tools
 
 
+def _upstream_usage_of(execution) -> dict[str, Any] | None:
+    """取上游累计 usage；缺失时为 None，下游自动回落本地估算。"""
+    usage = getattr(getattr(execution, "state", None), "upstream_usage", None)
+    return usage if isinstance(usage, dict) else None
+
+
 def build_openai_completion_payload(*, completion_id: str, created: int, model_name: str, prompt: str, execution, standard_request) -> dict[str, Any]:
     directive = build_tool_directive(standard_request, execution.state)
     visible_answer_text = sanitize_visible_answer_text(
@@ -81,6 +88,7 @@ def build_openai_completion_payload(*, completion_id: str, created: int, model_n
         directives=directive.tool_blocks,
         tool_catalog=standard_request.tool_catalog,
         extra_prompt_tokens=standard_request.context_attachment_tokens,
+        upstream_usage=_upstream_usage_of(execution),
     )
     oai_tool_calls = payload["choices"][0]["message"].get("tool_calls", [])
     finish_reason = payload["choices"][0]["finish_reason"]
@@ -125,6 +133,7 @@ def build_openai_response_payload(
         directives=directive.tool_blocks,
         tool_catalog=standard_request.tool_catalog,
         extra_prompt_tokens=standard_request.context_attachment_tokens,
+        upstream_usage=_upstream_usage_of(execution),
     )
     if standard_request.required_tool_name:
         name = _client_visible_tool_name(standard_request.required_tool_name, standard_request.tool_catalog)
@@ -165,8 +174,23 @@ def build_anthropic_message_payload(*, msg_id: str, model_name: str, prompt: str
         directives=directive.tool_blocks,
         tool_catalog=standard_request.tool_catalog,
         extra_prompt_tokens=standard_request.context_attachment_tokens,
+        upstream_usage=_upstream_usage_of(execution),
     )
 
 
-def build_gemini_generate_payload(*, execution) -> dict[str, Any]:
-    return build_canonical_gemini_payload(answer_text=execution.state.answer_text)
+def build_gemini_generate_payload(*, execution, prompt: str = "", standard_request=None) -> dict[str, Any]:
+    upstream_usage = _upstream_usage_of(execution)
+    extra_prompt_tokens = getattr(standard_request, "context_attachment_tokens", 0) if standard_request else 0
+    resolved = resolve_usage(
+        prompt,
+        execution.state.answer_text or "",
+        getattr(execution.state, "tool_calls", []) or [],
+        extra_prompt_tokens=extra_prompt_tokens,
+        upstream_usage=upstream_usage,
+    )
+    return build_canonical_gemini_payload(
+        answer_text=execution.state.answer_text,
+        prompt_tokens=resolved["prompt_tokens"],
+        completion_tokens=resolved["completion_tokens"],
+        total_tokens=resolved["total_tokens"],
+    )

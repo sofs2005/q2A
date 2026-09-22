@@ -25,6 +25,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from backend.core.config import resolve_model, settings
 from backend.services.qwen_client import QwenClient
+from backend.upstream.payload_builder import normalize_t2i_size
 
 log = logging.getLogger("qwen2api.images")
 router = APIRouter()
@@ -222,21 +223,54 @@ async def _rehost_urls(
     return hosted
 
 
+async def _collect_image_urls_from_library(
+    client: QwenClient,
+    acc: Any,
+    limit: int,
+) -> list[str]:
+    """兜底：GET /api/v2/library/list 取生成物列表（抓包显示这是 t2i 产物的权威来源）。"""
+    lister = getattr(client, "list_library_images", None)
+    if lister is None:
+        return []
+    try:
+        items = await lister(acc.token, limit=limit, account=acc)
+    except Exception as exc:
+        log.debug("[T2I] library/list fallback failed error=%s", exc)
+        return []
+    urls: list[str] = []
+    for item in items or []:
+        for key in ("url", "image", "image_url", "cover"):
+            candidate = item.get(key)
+            if isinstance(candidate, str) and candidate.startswith("http"):
+                urls.append(candidate)
+                break
+    return urls
+
+
 async def _generate_once(
     client: QwenClient,
     model: str,
     prompt_text: str,
     *,
     session: dict[str, Any],
+    chat_type: str = "t2i",
+    media_options: dict[str, Any] | None = None,
 ) -> list[str]:
     """单次上游生图，返回 image_urls。
 
+    chat_type="t2i" 走原生生图通道；回退路径由调用方传 "t2t" + 提示词诱导。
     session 会写入 acc/chat_id：流中途失败时调用方 finally 仍能 release / delete。
     """
     session["acc"] = None
     session["chat_id"] = None
     events: list[dict] = []
-    async for item in client.chat_stream_events_with_retry(model, prompt_text, has_custom_tools=False):
+    async for item in client.chat_stream_events_with_retry(
+        model,
+        prompt_text,
+        has_custom_tools=False,
+        chat_type=chat_type,
+        media_options=media_options,
+    ):
         if item.get("type") == "meta":
             session["acc"] = item.get("acc")
             session["chat_id"] = item.get("chat_id")
@@ -254,6 +288,10 @@ async def _generate_once(
 
     image_urls = _extract_image_urls_from_events(events)
     if not image_urls:
+        # 兜底 1：library/list（生成物列表，t2i 的权威来源）
+        image_urls = await _collect_image_urls_from_library(client, acc, limit=20)
+    if not image_urls:
+        # 兜底 2：当前 chat 详情
         try:
             chats = await client.list_chats(acc.token, limit=20, account=acc)
             current_chat = next(
@@ -310,10 +348,11 @@ async def create_image(request: Request):
 
     n: int = min(max(int(body.get("n", 1)), 1), 4)
     model = _resolve_image_model(body.get("model"))
+    # size 归一到上游 t2i 取值（"auto" 或宽高比）；OpenAI 的 1024x1024 也会被映射
+    t2i_size = normalize_t2i_size({"size": body.get("size")})
 
-    log.info(f"[T2I] model={model}, n={n}, prompt={prompt[:80]!r}")
+    log.info(f"[T2I] model={model}, n={n}, size={t2i_size}, prompt={prompt[:80]!r}")
 
-    prompt_text = _build_image_prompt(prompt)
     data: list[dict[str, str]] = []
     seen_hashes: set[str] = set()
     # 上游一次 image_gen 通常只产 1 张；n>1 时按轮次循环请求凑满。
@@ -321,14 +360,28 @@ async def create_image(request: Request):
     max_rounds = n + min(2, n)
     round_idx = 0
     last_error: Exception | None = None
+    # 第一轮走原生 t2i；拿不到结果则回退到旧的 t2t + 提示词诱导路径
+    fallback_prompt = _build_image_prompt(prompt)
+    used_t2t_fallback = False
     try:
         while len(data) < n and round_idx < max_rounds:
             round_idx += 1
+            use_t2i = round_idx == 1
+            if not use_t2i and not used_t2t_fallback:
+                used_t2t_fallback = True
+                log.warning("[T2I] 原生 t2i 未取到图片，回退 t2t 提示词诱导路径")
             session: dict[str, Any] = {"acc": None, "chat_id": None}
             try:
-                image_urls = await _generate_once(client, model, prompt_text, session=session)
+                image_urls = await _generate_once(
+                    client,
+                    model,
+                    prompt if use_t2i else fallback_prompt,
+                    session=session,
+                    chat_type="t2i" if use_t2i else "t2t",
+                    media_options={"size": t2i_size} if use_t2i else None,
+                )
                 if not image_urls:
-                    log.warning("[T2I] round=%s no image urls", round_idx)
+                    log.warning("[T2I] round=%s no image urls (chat_type=%s)", round_idx, "t2i" if use_t2i else "t2t")
                     continue
                 acc = session.get("acc")
                 need = n - len(data)

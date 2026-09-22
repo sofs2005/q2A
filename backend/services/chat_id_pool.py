@@ -175,9 +175,9 @@ class ChatIDPool:
                 err = str(exc).lower()
                 if "waf_blocked" in err or "aliyun_waf" in err:
                     # 接入层 WAF：作废 acw_tc + 短冷却，避免下一轮预热继续砸同一坏 cookie/出口
-                    # 须同时清空 waf_cookies：仅置 expires_at=0 时 _valid_waf_cookie 仍会注入旧值
-                    acc.waf_cookies = ""
-                    acc.waf_cookies_expires_at = 0
+                    from backend.services.waf_cookie_manager import WafCookieManager
+
+                    WafCookieManager.get_instance().invalidate(acc)
                     cooldown = max(1, int(float(getattr(settings, "WAF_RETRY_EXTRA_COOLDOWN_SECONDS", 5) or 5)))
                     mark_rl = getattr(self.account_pool, "mark_rate_limited", None)
                     if mark_rl is not None:

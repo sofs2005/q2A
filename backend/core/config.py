@@ -9,7 +9,7 @@ DATA_DIR = BASE_DIR / "data"
 
 DEFAULT_QWEN_MAX_MODEL = "qwen3.8-max"
 DEFAULT_QWEN_PLUS_MODEL = "qwen3.7-plus"
-DEFAULT_QWEN_WEB_VERSION = "0.2.81"
+DEFAULT_QWEN_WEB_VERSION = "0.3.10"
 DEFAULT_QWEN_BX_VERSION = "2.5.37"
 
 class Settings(BaseSettings):
@@ -83,6 +83,14 @@ class Settings(BaseSettings):
     QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS: float = float(
         os.getenv("QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS", 90)
     )
+    # 采用上游 SSE 每帧下发的累计 usage（input_tokens/output_tokens）替代本地 tiktoken 估算。
+    # 关闭后完全回落到本地估算，行为与接入前一致。
+    QWEN_UPSTREAM_USAGE_ENABLED: bool = os.getenv("QWEN_UPSTREAM_USAGE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    # 上游 input_tokens 是否已包含 context_attachment 的 token。
+    # 默认 false（保守继续叠加 extra_prompt_tokens，避免少扣）；实测确认后可打开。
+    QWEN_UPSTREAM_USAGE_INCLUDES_ATTACHMENT_TOKENS: bool = os.getenv(
+        "QWEN_UPSTREAM_USAGE_INCLUDES_ATTACHMENT_TOKENS", "false"
+    ).lower() in {"1", "true", "yes", "on"}
     QWEN_UPSTREAM_STREAM_DEDICATED_SESSION: bool = os.getenv("QWEN_UPSTREAM_STREAM_DEDICATED_SESSION", "true").lower() in {"1", "true", "yes", "on"}
     # 上游出站代理（留空=直连）。支持 socks5h://host:port、http://host:port 等，
     # 例如对接 MicroWARP（Cloudflare WARP SOCKS5）：socks5h://microwarp:1080
@@ -106,6 +114,9 @@ class Settings(BaseSettings):
     GENERATED_IMAGE_TTL_SECONDS: int = int(os.getenv("GENERATED_IMAGE_TTL_SECONDS", 3600))
     # /v1/images/generations 默认上游模型；升级时只改 env，无需改代码
     IMAGE_GENERATION_MODEL: str = os.getenv("IMAGE_GENERATION_MODEL", DEFAULT_QWEN_MAX_MODEL).strip() or DEFAULT_QWEN_MAX_MODEL
+    # t2i 请求 messages[].extra.meta.model 的取值（官网抓包为 qwen-image-3.0-pro）。
+    # 留空 = 不发送该键，生图模型完全由 chat 级 model（IMAGE_GENERATION_MODEL）决定。
+    IMAGE_GENERATION_META_MODEL: str = os.getenv("IMAGE_GENERATION_META_MODEL", "").strip()
     CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS: int = int(os.getenv("CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS", 60))
     CONTEXT_GENERATED_DIR: str = os.getenv("CONTEXT_GENERATED_DIR", str(DATA_DIR / "context_files"))
     CONTEXT_CACHE_FILE: str = os.getenv("CONTEXT_CACHE_FILE", str(DATA_DIR / "context_cache.json"))

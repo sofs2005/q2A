@@ -13,7 +13,7 @@ from backend.core.browser_fingerprint import fingerprint_for_account, get_sessio
 from backend.core.config import settings
 from backend.services.auth_resolver import BASE_URL, AuthResolver
 from backend.services.chat_id_pool import ChatIDPool
-from backend.services.waf_cookie_manager import WafCookieManager
+from backend.services.waf_cookie_manager import WafCookieManager, collect_waf_cookies
 from backend.services.captcha_solver import CaptchaSolver, extract_punish_url
 from backend.upstream.payload_builder import build_chat_payload
 from backend.upstream.sse_consumer import parse_sse_chunk
@@ -44,27 +44,34 @@ class QwenClient:
 
     @staticmethod
     def _valid_waf_cookie(account: Account | None) -> str:
-        """返回账号未过期的 WAF cookie（acw_tc），过期或缺失则返回空串。"""
+        """返回账号未过期的 WAF cookie，过期或缺失则返回空串。"""
         if account is None:
             return ""
         waf = str(getattr(account, "waf_cookies", "") or "").strip()
         if not waf:
             return ""
         expires = float(getattr(account, "waf_cookies_expires_at", 0) or 0)
-        if expires and expires <= time.time():
+        # expires<=0 视为已作废：历史实现把 0 当作「未设置过期」，导致撞 WAF 后
+        # 已失效的 cookie 仍被继续注入。作废路径统一走 WafCookieManager.invalidate()。
+        if expires <= 0 or expires <= time.time():
             return ""
         return waf
 
     @staticmethod
-    def _extract_acw_tc(resp) -> str:
-        """从上游响应提取 acw_tc（Set-Cookie）；缺失或异常返回空串。"""
+    def _extract_waf_cookies(resp) -> dict[str, str]:
+        """从上游响应按白名单收割风控 cookie；缺失或异常返回空 dict。"""
         try:
             cookies = getattr(resp, "cookies", None)
             if cookies is None:
-                return ""
-            return str(cookies.get("acw_tc", "") or "")
+                return {}
+            return collect_waf_cookies(cookies)
         except Exception:
-            return ""
+            return {}
+
+    @staticmethod
+    def _extract_acw_tc(resp) -> str:
+        """从上游响应提取 acw_tc（Set-Cookie）；缺失或异常返回空串。"""
+        return QwenClient._extract_waf_cookies(resp).get("acw_tc", "")
 
     @staticmethod
     def _merge_cookie_header(*cookie_strings: str) -> str:
@@ -240,7 +247,12 @@ class QwenClient:
                 json=body,
                 timeout=request_timeout,
             )
-            return {"status": resp.status_code, "body": getattr(resp, "text", ""), "acw_tc": self._extract_acw_tc(resp)}
+            return {
+                "status": resp.status_code,
+                "body": getattr(resp, "text", ""),
+                "acw_tc": self._extract_acw_tc(resp),
+                "waf_cookies": self._extract_waf_cookies(resp),
+            }
         except Exception as e:
             return {"status": 0, "body": str(e)}
 
@@ -270,7 +282,12 @@ class QwenClient:
                     json=body,
                     timeout=request_timeout,
                 )
-                return {"status": resp.status_code, "body": getattr(resp, "text", ""), "acw_tc": self._extract_acw_tc(resp)}
+                return {
+                    "status": resp.status_code,
+                    "body": getattr(resp, "text", ""),
+                    "acw_tc": self._extract_acw_tc(resp),
+                    "waf_cookies": self._extract_waf_cookies(resp),
+                }
             except Exception as e:
                 return {"status": 0, "body": str(e)}
 
@@ -444,6 +461,34 @@ class QwenClient:
             return []
         chats = data.get("data", [])
         return chats if isinstance(chats, list) else []
+
+    async def list_library_images(self, token: str, limit: int = 20, account: Account | None = None) -> list[dict]:
+        """GET /api/v2/library/list?type=all —— 官网生成物（生图）的权威列表。
+
+        抓包显示 t2i 产物的 CDN 签名链在这里，而不是 chat messages 里。
+        返回 data.items 列表（每项含 url / type 等）；失败返回 []。
+        """
+        res = await self._request_json(
+            "GET", "/api/v2/library/list?type=all", token, timeout=20.0, account=account, retry_waf=True
+        )
+        if res["status"] != 200 or self._looks_like_waf_challenge(res["status"], res["body"]):
+            log.warning(
+                "[list_library_images] failed email=%s status=%s body=%s",
+                getattr(account, "email", ""), res["status"], res["body"][:120],
+            )
+            return []
+        try:
+            data = json.loads(res.get("body", "{}"))
+        except Exception:
+            return []
+        payload = data.get("data", data)
+        if isinstance(payload, dict):
+            items = payload.get("items") or payload.get("list") or []
+        else:
+            items = payload
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict)][: max(0, int(limit))]
 
     async def download_url(
         self,
@@ -655,7 +700,7 @@ class QwenClient:
                 waf_mgr.update_cookies(account, pass_cookies)
 
             retry_headers = self._build_chat_transport_headers(
-                account=account, token=token, accept="text/event-stream",
+                account=account, token=token, accept="application/json",
                 referer=f"{BASE_URL}/c/{chat_id}",
             )
             # 重试走 Go-like HTTP 路径（简单可靠，避免 curl_cffi session 状态问题）
@@ -692,19 +737,23 @@ class QwenClient:
             except Exception as retry_err:
                 log.error(f"[stream_chat_once] retry request failed: {retry_err}")
 
-        # 滑块失败或重试仍被拦截：降级为 1800s 冷却
-        log.warning("[stream_chat_once] captcha failed or retry still punished, cooling down 1800s")
+        # 滑块失败或重试仍被拦截：降级为冷却（时长可配）
+        punish_cooldown = int(getattr(settings, "WAF_PUNISH_COOLDOWN", 1800) or 1800)
+        log.warning(
+            "[stream_chat_once] captcha failed or retry still punished, cooling down %ss",
+            punish_cooldown,
+        )
         if account:
             waf_mgr = WafCookieManager.get_instance()
-            waf_mgr.mark_expired(account)
+            waf_mgr.invalidate(account)
             if self.account_pool is not None:
                 self.account_pool.mark_rate_limited(
-                    account, cooldown=1800,
-                    error_message="x5sec punish interception, account cooled down 1800s",
+                    account, cooldown=punish_cooldown,
+                    error_message=f"x5sec punish interception, account cooled down {punish_cooldown}s",
                 )
         yield {
             "status": 403,
-            "body": '{"error":"x5sec punish interception, account cooled down 1800s"}',
+            "body": f'{{"error":"x5sec punish interception, account cooled down {punish_cooldown}s"}}',
         }
 
     async def stream_chat_once(self, token: str, chat_id: str, payload: dict, account: Account | None = None) -> AsyncIterator[dict]:
@@ -719,7 +768,7 @@ class QwenClient:
                 log.warning("[stream_chat_once] WAF cookie refresh failed: %s", waf_err)
 
         headers = self._build_chat_transport_headers(
-            account=account, token=token, accept="text/event-stream",
+            account=account, token=token, accept="application/json",
             referer=f"{BASE_URL}/c/{chat_id}",
         )
         if bool(getattr(settings, "QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP", False)):

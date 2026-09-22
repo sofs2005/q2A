@@ -199,12 +199,14 @@ class AuthResolver:
             # 冷却中：仅更新 token，保留 rate_limited 状态和冷却时间
             log.info(f"[Refresh] {acc.email} token 已刷新，但账号仍在冷却中，保留 rate_limited 状态")
 
-        # 自动捕获 acw_tc WAF cookie（登录响应 Set-Cookie）
-        import time as _time
-        acw_tc = resp.cookies.get("acw_tc", "")
+        # 自动捕获风控 cookie（登录响应 Set-Cookie）
+        from backend.services.waf_cookie_manager import WafCookieManager, collect_waf_cookies
+
+        waf_mgr = WafCookieManager.get_instance()
+        collected = collect_waf_cookies(resp.cookies)
 
         # 登录接口通常不返回 acw_tc，需额外发一次轻量请求触发 WAF 下发
-        if not acw_tc:
+        if not collected.get("acw_tc"):
             try:
                 seed_headers = fingerprint.build_headers(
                     token=new_token,
@@ -215,19 +217,20 @@ class AuthResolver:
                     json={"model": resolve_model("qwen-max"), "chat_type": "t2t"},
                     headers=seed_headers,
                 )
-                acw_tc = seed_resp.cookies.get("acw_tc", "")
-                if acw_tc:
+                seeded = collect_waf_cookies(seed_resp.cookies)
+                if seeded.get("acw_tc"):
+                    collected.update(seeded)
                     log.info(f"[Refresh] {acc.email} acw_tc 通过 chats/new 种子请求获取")
             except Exception as seed_err:
                 log.warning(f"[Refresh] {acc.email} 种子请求异常: {seed_err}")
 
-        if acw_tc:
-            acc.waf_cookies = f"acw_tc={acw_tc}"
-            acc.waf_cookies_expires_at = _time.time() + 1500
-            log.info(f"[Refresh] {acc.email} acw_tc 已同步刷新")
+        if collected:
+            # 合并而非覆盖：避免冲掉滑块放行后拿到的 x5sec / acw_sc__v3
+            waf_mgr.update_cookies(acc, collected)
+            log.info(f"[Refresh] {acc.email} waf cookie 已同步刷新 keys={sorted(collected)}")
         else:
-            # 登录和种子请求都没返回 acw_tc，标记过期让下次 create_chat 收割
-            acc.waf_cookies_expires_at = 0
+            # 登录和种子请求都没返回 acw_tc，作废让下次 create_chat 收割
+            waf_mgr.invalidate(acc)
             log.warning(f"[Refresh] {acc.email} 未能获取 acw_tc，将在下次 create_chat 时收割")
 
         await self.pool.save()

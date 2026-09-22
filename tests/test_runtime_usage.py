@@ -41,6 +41,52 @@ class RuntimeUsageTests(unittest.TestCase):
         self.assertEqual(usage_delta, count_tokens(prompt) + count_tokens(answer_text))
         self.assertNotEqual(usage_delta, len(prompt) + len(answer_text))
 
+    def test_usage_delta_factory_prefers_upstream_total(self) -> None:
+        """上游给了累计 total_tokens 就用它，不再本地估算。"""
+        execution = SimpleNamespace(
+            state=SimpleNamespace(
+                answer_text="answer",
+                upstream_usage={"prompt_tokens": 85, "completion_tokens": 12, "total_tokens": 97},
+            )
+        )
+
+        usage_delta = build_usage_delta_factory("prompt")(execution)
+
+        self.assertEqual(usage_delta, 97)
+
+    def test_usage_delta_factory_is_not_cumulative_across_attempts(self) -> None:
+        """上游 usage 是累计值而非增量：同一 execution 重复取不得翻倍。"""
+        execution = SimpleNamespace(
+            state=SimpleNamespace(
+                answer_text="answer",
+                upstream_usage={"prompt_tokens": 85, "completion_tokens": 12, "total_tokens": 97},
+            )
+        )
+        factory = build_usage_delta_factory("prompt")
+
+        self.assertEqual(factory(execution), factory(execution))
+        self.assertEqual(factory(execution), 97)
+
+    def test_usage_delta_factory_falls_back_when_upstream_usage_malformed(self) -> None:
+        """缺 total_tokens / 非法值 / 无该属性都必须回落本地估算，不能抛错。"""
+        prompt, answer_text = "prompt", "answer"
+        expected = count_tokens(prompt) + count_tokens(answer_text)
+        factory = build_usage_delta_factory(prompt)
+
+        for upstream in (
+            None,
+            {},
+            {"prompt_tokens": 85, "completion_tokens": 12},
+            {"total_tokens": True},
+            {"total_tokens": -1},
+            {"total_tokens": "97"},
+        ):
+            execution = SimpleNamespace(state=SimpleNamespace(answer_text=answer_text, upstream_usage=upstream))
+            self.assertEqual(factory(execution), expected, msg=f"upstream={upstream!r}")
+
+        # 老式假对象没有 upstream_usage 属性
+        self.assertEqual(factory(SimpleNamespace(state=SimpleNamespace(answer_text=answer_text))), expected)
+
 
 class CollectCompletionRunStreamingTests(unittest.IsolatedAsyncioTestCase):
     async def test_streaming_on_delta_receives_final_safe_text_tail(self) -> None:

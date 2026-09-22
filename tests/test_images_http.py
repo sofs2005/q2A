@@ -80,7 +80,7 @@ class ImagesHttpTests(unittest.TestCase):
         acc = SimpleNamespace(token="token-1", email="user@example.com", inflight=1)
         png_bytes = b"\x89PNG\r\n\x1a\nfake-image"
 
-        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, preferred_account=None):
+        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, preferred_account=None, chat_type="t2t", media_options=None):
             yield {"type": "meta", "acc": acc, "chat_id": "chat-1"}
             yield {
                 "type": "event",
@@ -161,7 +161,7 @@ class ImagesHttpTests(unittest.TestCase):
         png_a = b"\x89PNG\r\n\x1a\nimage-A"
         png_b = b"\x89PNG\r\n\x1a\nimage-B-different"
 
-        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, preferred_account=None):
+        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, preferred_account=None, chat_type="t2t", media_options=None):
             call_count["n"] += 1
             idx = call_count["n"]
             acc.inflight += 1
@@ -230,7 +230,7 @@ class ImagesHttpTests(unittest.TestCase):
         acc = SimpleNamespace(token="token-1", email="user@example.com", inflight=1)
         png_bytes = b"\x89PNG\r\n\x1a\nfake"
 
-        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, preferred_account=None):
+        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, preferred_account=None, chat_type="t2t", media_options=None):
             yield {"type": "meta", "acc": acc, "chat_id": "chat-1"}
             yield {
                 "type": "event",
@@ -286,7 +286,7 @@ class ImagesHttpTests(unittest.TestCase):
         acc = SimpleNamespace(token="token-1", email="user@example.com", inflight=1)
         png_bytes = b"\x89PNG\r\n\x1a\nfallback"
 
-        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, preferred_account=None):
+        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, preferred_account=None, chat_type="t2t", media_options=None):
             yield {"type": "meta", "acc": acc, "chat_id": "chat-1"}
             yield {"type": "event", "event": {"choices": [{"delta": {"content": "image ready"}}]}}
 
@@ -337,7 +337,7 @@ class ImagesHttpTests(unittest.TestCase):
     def test_create_image_does_not_double_release_after_stream_failure(self) -> None:
         acc = SimpleNamespace(token="token-1", email="user@example.com", inflight=1)
 
-        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, preferred_account=None):
+        async def fake_stream_events_with_retry(model, content, has_custom_tools=False, files=None, preferred_account=None, chat_type="t2t", media_options=None):
             yield {"type": "meta", "acc": acc, "chat_id": "chat-1"}
             app.state.qwen_client.account_pool.release(acc)
             raise RuntimeError("upstream failed")

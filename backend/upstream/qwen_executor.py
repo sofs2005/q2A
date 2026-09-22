@@ -59,14 +59,25 @@ class QwenExecutor:
         return None, str(account_or_token or "")
 
     @staticmethod
-    def _absorb_waf_cookie(account, acw_tc: str) -> None:
-        """把上游响应收割到的 acw_tc 写回账号 WAF cookie（与登录刷新同口径，TTL 1500s）。
-        仅在响应真的下发了新 acw_tc 时写入；为空则跳过、保留账号原有 cookie 不动。"""
-        if account is None or not acw_tc:
+    def _absorb_waf_cookie(account, waf_cookies) -> None:
+        """把上游响应收割到的风控 cookie 写回账号（与登录刷新同口径，TTL 1500s）。
+        仅在响应真的下发了新 cookie 时写入；为空则跳过、保留账号原有 cookie 不动。
+        合并而非整体覆盖——避免冲掉滑块放行后拿到的 x5sec / acw_sc__v3。"""
+        if account is None or not waf_cookies:
             return
-        account.waf_cookies = f"acw_tc={acw_tc}"
-        account.waf_cookies_expires_at = time.time() + 1500
-        log.info(f"[Executor] {getattr(account, 'email', '')} acw_tc 预热刷新")
+        from backend.services.waf_cookie_manager import WafCookieManager
+
+        if isinstance(waf_cookies, str):
+            # 兼容旧调用方传入的裸 acw_tc 值
+            payload = {"acw_tc": waf_cookies}
+        elif isinstance(waf_cookies, dict):
+            payload = {str(k): str(v) for k, v in waf_cookies.items() if v}
+        else:
+            return
+        if not payload:
+            return
+        WafCookieManager.get_instance().update_cookies(account, payload)
+        log.info(f"[Executor] {getattr(account, 'email', '')} waf cookie 预热刷新 keys={sorted(payload)}")
 
     async def create_chat(self, account_or_token, model: str, chat_type: str = "t2t") -> str:
         account, token = self._resolve_account_context(account_or_token)
@@ -77,6 +88,8 @@ class QwenExecutor:
         ts = int(time.time() * 1000)
         body = {
             "title": f"api_{ts}",
+            # 官网 chats/new 抓包带空 chatId（2026-09）
+            "chatId": "",
             "models": [model],
             "chat_mode": "normal",
             "chat_type": chat_type,
@@ -122,9 +135,9 @@ class QwenExecutor:
             data = json.loads(body_text)
             if not data.get("success") or "id" not in data.get("data", {}):
                 raise Exception("Qwen API returned error or missing id")
-            # 预热/建 chat 时顺手收割 acw_tc 刷新 WAF cookie：chats/new 走 bearer 鉴权、
+            # 预热/建 chat 时顺手收割风控 cookie：chats/new 走 bearer 鉴权、
             # 不被 WAF 拦，故能为无密码账号（登录不了、拿不到 acw_tc）也补上风控 cookie。
-            self._absorb_waf_cookie(account, r.get("acw_tc", ""))
+            self._absorb_waf_cookie(account, r.get("waf_cookies") or r.get("acw_tc", ""))
             return data["data"]["id"]
         except Exception as e:
             body_lower = body_text.lower()
@@ -425,8 +438,10 @@ class QwenExecutor:
             exclude.add(acc.email)
         elif "waf_blocked" in err_msg or "aliyun_waf" in err_msg:
             exclude.add(acc.email)
-            # WAF 命中：标记该账号 acw_tc 失效并立即刷新，为后续请求恢复风控 cookie
-            acc.waf_cookies_expires_at = 0
+            # WAF 命中：作废该账号风控 cookie（清值 + 归零过期），为后续请求重新收割
+            from backend.services.waf_cookie_manager import WafCookieManager
+
+            WafCookieManager.get_instance().invalidate(acc)
             if self.auth_resolver is not None:
                 await self.auth_resolver.auto_heal_account(acc)
             needs_heal = True

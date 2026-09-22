@@ -4,7 +4,12 @@ import json
 import uuid
 from typing import Any
 
-from backend.services.token_calc import calculate_usage, completion_text_for_usage, count_tokens
+from backend.services.token_calc import (
+    completion_text_for_usage,
+    count_tokens,
+    effective_extra_prompt_tokens,
+    resolve_usage,
+)
 from backend.toolcall.markup_scan import find_tool_markup_tag_outside_ignored
 
 
@@ -17,7 +22,11 @@ def _client_tool_name(name: str, tool_catalog=None) -> str:
     return tool_catalog.get_client_name(canonical)
 
 
-def build_canonical_openai_chat_payload(*, completion_id: str, created: int, model_name: str, prompt: str, answer_text: str, reasoning_text: str, directives: list[dict[str, Any]], tool_catalog=None, extra_prompt_tokens: int = 0) -> dict[str, Any]:
+def _extra_prompt_tokens_for(extra_prompt_tokens: int, upstream_usage: dict[str, Any] | None) -> int:
+    return effective_extra_prompt_tokens(extra_prompt_tokens, upstream_usage=upstream_usage)
+
+
+def build_canonical_openai_chat_payload(*, completion_id: str, created: int, model_name: str, prompt: str, answer_text: str, reasoning_text: str, directives: list[dict[str, Any]], tool_catalog=None, extra_prompt_tokens: int = 0, upstream_usage: dict[str, Any] | None = None) -> dict[str, Any]:
     del reasoning_text
     tool_blocks = [block for block in directives if block.get("type") == "tool_use"]
     if tool_blocks:
@@ -46,11 +55,17 @@ def build_canonical_openai_chat_payload(*, completion_id: str, created: int, mod
         "created": created,
         "model": model_name,
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": calculate_usage(prompt, answer_text, message.get("tool_calls", []), extra_prompt_tokens=extra_prompt_tokens),
+        "usage": resolve_usage(
+            prompt,
+            answer_text,
+            message.get("tool_calls", []),
+            extra_prompt_tokens=extra_prompt_tokens,
+            upstream_usage=upstream_usage,
+        ),
     }
 
 
-def build_canonical_openai_responses_payload(*, response_id: str, created: int, model_name: str, prompt: str, answer_text: str, reasoning_text: str, directives: list[dict[str, Any]], tool_catalog=None, extra_prompt_tokens: int = 0) -> dict[str, Any]:
+def build_canonical_openai_responses_payload(*, response_id: str, created: int, model_name: str, prompt: str, answer_text: str, reasoning_text: str, directives: list[dict[str, Any]], tool_catalog=None, extra_prompt_tokens: int = 0, upstream_usage: dict[str, Any] | None = None) -> dict[str, Any]:
     tool_blocks = [block for block in directives if block.get("type") == "tool_use"]
     output: list[dict[str, Any]] = []
     if tool_blocks:
@@ -85,8 +100,26 @@ def build_canonical_openai_responses_payload(*, response_id: str, created: int, 
                 "content": [{"type": "output_text", "text": answer_text, "annotations": []}],
             }
         )
-    input_tokens = count_tokens(prompt) + max(0, int(extra_prompt_tokens or 0))
-    output_tokens = count_tokens(completion_text_for_usage(answer_text, tool_blocks))
+    resolved = resolve_usage(
+        prompt,
+        completion_text_for_usage(answer_text, tool_blocks),
+        None,
+        extra_prompt_tokens=extra_prompt_tokens,
+        upstream_usage=upstream_usage,
+    )
+    input_tokens = resolved["prompt_tokens"]
+    output_tokens = resolved["completion_tokens"]
+    details = (upstream_usage or {}).get("_upstream_details") if isinstance(upstream_usage, dict) else None
+    details = details if isinstance(details, dict) else {}
+    usage: dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": resolved["total_tokens"],
+        "output_tokens_details": details.get("output_tokens_details")
+        or {"reasoning_tokens": count_tokens(reasoning_text)},
+    }
+    if isinstance(details.get("prompt_tokens_details"), dict):
+        usage["input_tokens_details"] = details["prompt_tokens_details"]
     return {
         "id": response_id,
         "object": "response",
@@ -95,16 +128,11 @@ def build_canonical_openai_responses_payload(*, response_id: str, created: int, 
         "model": model_name,
         "output": output,
         "output_text": answer_text,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-            "output_tokens_details": {"reasoning_tokens": count_tokens(reasoning_text)},
-        },
+        "usage": usage,
     }
 
 
-def build_canonical_anthropic_message(*, msg_id: str, model_name: str, prompt: str, answer_text: str, reasoning_text: str, directives: list[dict[str, Any]], tool_catalog=None, extra_prompt_tokens: int = 0) -> dict[str, Any]:
+def build_canonical_anthropic_message(*, msg_id: str, model_name: str, prompt: str, answer_text: str, reasoning_text: str, directives: list[dict[str, Any]], tool_catalog=None, extra_prompt_tokens: int = 0, upstream_usage: dict[str, Any] | None = None) -> dict[str, Any]:
     content_blocks: list[dict[str, Any]] = []
     if reasoning_text:
         content_blocks.append({"type": "thinking", "thinking": reasoning_text})
@@ -116,6 +144,13 @@ def build_canonical_anthropic_message(*, msg_id: str, model_name: str, prompt: s
             content_blocks.append(block)
     elif answer_text:
         content_blocks.append({"type": "text", "text": answer_text})
+    resolved = resolve_usage(
+        prompt,
+        answer_text,
+        None,
+        extra_prompt_tokens=extra_prompt_tokens,
+        upstream_usage=upstream_usage,
+    )
     return {
         "id": msg_id,
         "type": "message",
@@ -124,7 +159,7 @@ def build_canonical_anthropic_message(*, msg_id: str, model_name: str, prompt: s
         "content": content_blocks,
         "stop_reason": "tool_use" if any(block.get("type") == "tool_use" for block in directives) else "end_turn",
         "stop_sequence": None,
-        "usage": {"input_tokens": count_tokens(prompt) + max(0, int(extra_prompt_tokens or 0)), "output_tokens": count_tokens(answer_text)},
+        "usage": {"input_tokens": resolved["prompt_tokens"], "output_tokens": resolved["completion_tokens"]},
     }
 
 
@@ -139,7 +174,7 @@ def _strip_dsml_markup(text: str) -> str:
     return text
 
 
-def build_canonical_gemini_payload(*, answer_text: str, tool_calls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def build_canonical_gemini_payload(*, answer_text: str, tool_calls: list[dict[str, Any]] | None = None, prompt: str = "", prompt_tokens: int | None = None, completion_tokens: int | None = None, total_tokens: int | None = None) -> dict[str, Any]:
     if tool_calls:
         parts = [
             {
@@ -155,7 +190,7 @@ def build_canonical_gemini_payload(*, answer_text: str, tool_calls: list[dict[st
             parts = [{"text": _strip_dsml_markup(answer_text) or ""}]
     else:
         parts = [{"text": _strip_dsml_markup(answer_text) or ""}]
-    return {
+    payload: dict[str, Any] = {
         "candidates": [
             {
                 "content": {
@@ -167,3 +202,13 @@ def build_canonical_gemini_payload(*, answer_text: str, tool_calls: list[dict[st
             }
         ]
     }
+    # usageMetadata 为本次新增：此前 gemini 出口完全没有 token 统计
+    if prompt_tokens is not None or completion_tokens is not None:
+        in_tokens = int(prompt_tokens or 0)
+        out_tokens = int(completion_tokens or 0)
+        payload["usageMetadata"] = {
+            "promptTokenCount": in_tokens,
+            "candidatesTokenCount": out_tokens,
+            "totalTokenCount": int(total_tokens if total_tokens is not None else in_tokens + out_tokens),
+        }
+    return payload

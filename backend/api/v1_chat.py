@@ -17,7 +17,7 @@ from backend.services.command_environment import detect_command_environment, for
 from backend.services.completion_bridge import run_retryable_completion_bridge
 from backend.services.openai_stream_translator import OpenAIStreamTranslator
 from backend.services.response_formatters import build_openai_completion_payload
-from backend.services.token_calc import calculate_usage
+from backend.services.token_calc import calculate_usage, resolve_usage
 from backend.services.qwen_client import QwenClient
 from backend.services.standard_request_builder import build_chat_standard_request
 from backend.toolcore.request_singleflight import RequestSingleflight
@@ -39,7 +39,16 @@ def _stream_usage(result, prompt: str) -> dict[str, int]:
     answer_text = getattr(state, "answer_text", "") or ""
     tool_calls = getattr(state, "tool_calls", []) or []
     result_prompt = getattr(result, "prompt", prompt) or prompt
-    return calculate_usage(result_prompt, answer_text, tool_calls)
+    standard_request = getattr(result, "standard_request", None)
+    extra_prompt_tokens = getattr(standard_request, "context_attachment_tokens", 0) or 0
+    # 优先采用上游累计 usage，与扣费口径保持一致
+    return resolve_usage(
+        result_prompt,
+        answer_text,
+        tool_calls,
+        extra_prompt_tokens=extra_prompt_tokens,
+        upstream_usage=getattr(state, "upstream_usage", None),
+    )
 
 
 def _detect_openai_client_profile(request: Request, req_data: dict) -> str:
