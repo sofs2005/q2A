@@ -6,6 +6,8 @@ import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
 
 const ASPECT_RATIOS = [
+  // auto 与官网默认一致：由上游按提示词自行决定比例，w/h 仅作占位
+  { label: "自动", value: "auto", w: 0,    h: 0    },
   { label: "1:1",  value: "1:1",   w: 1024, h: 1024 },
   { label: "16:9", value: "16:9",  w: 1024, h: 576  },
   { label: "9:16", value: "9:16",  w: 576,  h: 1024 },
@@ -21,14 +23,16 @@ interface GeneratedImage {
 
 export default function ImagePage() {
   const [prompt, setPrompt] = useState("")
-  const [ratio, setRatio] = useState("1:1")
+  const [ratio, setRatio] = useState("auto")
   const [n, setN] = useState(1)
   const [loading, setLoading] = useState(false)
   const [images, setImages] = useState<GeneratedImage[]>([])
   const [error, setError] = useState<string | null>(null)
 
   const selectedRatio = ASPECT_RATIOS.find(r => r.value === ratio)!
-  const sizeStr = `${selectedRatio.w}x${selectedRatio.h}`
+  // "auto" 直接透传给上游（与官网默认一致）；其余转成 WxH，由后端映射回宽高比
+  const sizeStr = ratio === "auto" ? "auto" : `${selectedRatio.w}x${selectedRatio.h}`
+  const sizeLabel = ratio === "auto" ? "自动（由上游决定）" : sizeStr
 
   const handleGenerate = async () => {
     if (!prompt.trim() || loading) return
@@ -92,7 +96,7 @@ export default function ImagePage() {
     <div className="w-full space-y-6">
       <div>
         <h2 className="text-2xl font-bold tracking-tight">图片生成</h2>
-        <p className="text-muted-foreground">通过可配置的 Qwen 模型生成 AI 图片（默认见后端 IMAGE_GENERATION_MODEL），支持多种比例。</p>
+        <p className="text-muted-foreground">通过可配置的 Qwen 模型生成 AI 图片（默认见后端 IMAGE_GENERATION_MODEL），支持自动比例与多种固定比例。</p>
       </div>
 
       {/* 输入区域 */}
@@ -158,7 +162,7 @@ export default function ImagePage() {
 
           {/* 尺寸预览 */}
           <div className="text-xs text-muted-foreground font-mono bg-muted/50 border rounded-md px-2 py-1">
-            {sizeStr}
+            {sizeLabel}
           </div>
 
           {/* 生成按钮 */}

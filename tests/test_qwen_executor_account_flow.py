@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import types
 import unittest
@@ -46,6 +47,7 @@ class _RetryPool:
         self.invalidated = []
         self.released = []
         self.excludes = []
+        self.succeeded = []
 
     async def acquire_wait(self, timeout=60, exclude=None):
         self.excludes.append(set(exclude or set()))
@@ -55,6 +57,9 @@ class _RetryPool:
 
     def mark_invalid(self, acc):
         self.invalidated.append(acc)
+
+    def mark_success(self, acc):
+        self.succeeded.append(acc)
 
     def mark_rate_limited(self, acc):
         self.rate_limited = acc
@@ -176,6 +181,47 @@ class QwenExecutorAccountFlowTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         executor.auth_resolver.auto_heal_account.assert_called_once_with(account)
         self.assertEqual(account.waf_cookies_expires_at, 0)
+
+    async def test_401_heal_is_dispatched_without_blocking_request_path(self) -> None:
+        """401 自愈必须后台派发：await 它会把请求挂死在 5/10/20 分钟的退避上。
+
+        这是"整个系统不能用"的直接机制 —— auto_heal_account 内部失败退避合计
+        35 分钟，若在 _classify_and_release 里被 await，一次用户请求会卡到
+        acquire_wait 超时（60s）之后才轮到下一个账号，重试 3 次即数分钟无响应。
+        """
+        account = Account(email="alice@example.com", token="token-1")
+        pool = _RetryPool(account)
+        executor = QwenExecutor(SimpleNamespace(), pool)
+
+        heal_started = asyncio.Event()
+        heal_finished = asyncio.Event()
+
+        async def slow_heal(acc):
+            heal_started.set()
+            # 模拟 auto_heal_account 的失败退避：真实实现会在这里 sleep 分钟级
+            await asyncio.sleep(3600)
+            heal_finished.set()
+
+        executor.auth_resolver.auto_heal_account = slow_heal
+
+        async def fake_create_chat(acc, model, chat_type="t2t"):
+            raise Exception(
+                'unauthorized: account issue: {"success":false,'
+                '"data":{"code":"unauthorized","details":"401 Unauthorized"}}'
+            )
+
+        executor.create_chat = fake_create_chat
+
+        with patch("backend.upstream.qwen_executor.settings.MAX_RETRIES", 1):
+            with self.assertRaisesRegex(Exception, "All 1 attempts failed"):
+                async for _ in executor.chat_stream_events_with_retry("qwen3.7-plus", "hello"):
+                    pass
+
+        # 请求路径已经返回（raise 完成），而自愈仍在后台等待中 —— 证明没有被 await
+        await asyncio.sleep(0)
+        self.assertTrue(heal_started.is_set(), "自愈应已被派发")
+        self.assertFalse(heal_finished.is_set(), "自愈不应阻塞请求路径")
+        self.assertIn(account, pool.invalidated)
 
     def test_qwen_validation_challenge_is_waf_blocked(self) -> None:
         body = '{"ret":["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::SM::被挤爆啦"],"data":{"url":"https://chat.qwen.ai/api/v2/chat/completions/_____tmd_____/punish?x5secdata=secret&action=captcha"}}'

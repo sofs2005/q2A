@@ -34,7 +34,7 @@ class QwenClient:
     @staticmethod
     def _web_client_headers() -> dict[str, str]:
         return {
-            "Version": str(getattr(settings, "QWEN_WEB_VERSION", "0.2.81") or "0.2.81"),
+            "Version": str(getattr(settings, "QWEN_WEB_VERSION", "0.3.10") or "0.3.10"),
             "bx-v": str(getattr(settings, "QWEN_BX_VERSION", "2.5.37") or "2.5.37"),
             "source": "web",
             "X-Request-Id": str(uuid.uuid4()),

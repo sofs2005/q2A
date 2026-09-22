@@ -420,7 +420,7 @@ python start.py
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `QWEN_WEB_VERSION` | `0.3.10` | 上游 `Version` 请求头，按最新官网抓包对齐。 |
+| `QWEN_WEB_VERSION` | `0.3.10` | 上游 `Version` 请求头，与官网浏览器实际发送值一致。CDN 路径可能滞后，勿据此反推。 |
 | `QWEN_BX_VERSION` | `2.5.37` | 上游 `bx-v` 请求头。 |
 | `QWEN_UPSTREAM_USAGE_ENABLED` | `true` | 接入上游 SSE 每帧的累计 `usage`，使响应展示与后台扣费同源。置 `false` 则完全回落到本地 tiktoken 估算。 |
 | `QWEN_UPSTREAM_USAGE_INCLUDES_ATTACHMENT_TOKENS` | `false` | 上游 `input_tokens` 是否已包含附件文本。默认 `false` 表示保守地在本地估算上继续叠加 `context_attachment_tokens`。 |

@@ -9,6 +9,9 @@ DATA_DIR = BASE_DIR / "data"
 
 DEFAULT_QWEN_MAX_MODEL = "qwen3.8-max"
 DEFAULT_QWEN_PLUS_MODEL = "qwen3.7-plus"
+# 官网浏览器实际发送的 Version 头（真实抓包确认 0.3.10）。
+# 注意：CDN 上的 .../qwen-chat-fe/<ver>/ 路径与首页预渲染页可能滞后于线上版本，
+# 不要用 CDN 路径反推该值，以浏览器开发者工具的实际请求为准。
 DEFAULT_QWEN_WEB_VERSION = "0.3.10"
 DEFAULT_QWEN_BX_VERSION = "2.5.37"
 

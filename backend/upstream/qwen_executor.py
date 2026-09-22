@@ -421,6 +421,10 @@ class QwenExecutor:
 
                 async for evt in self.stream(acc, chat_id, model, content, has_custom_tools, files=files, chat_type=chat_type, media_options=media_options):
                     yield {"type": "event", "event": evt}
+                # 请求真的跑通了，说明该账号此刻可用：清掉此前的 401/失效标记。
+                # 否则 mark_invalid 的 valid=False 是永久终态（mark_success 全仓库
+                # 无人调用），一次偶发 401 会让账号永远进不了 ready 集合。
+                self.account_pool.mark_success(acc)
                 return
 
             except Exception as e:
@@ -456,6 +460,21 @@ class QwenExecutor:
 
         raise Exception(f"All {settings.MAX_RETRIES} attempts failed. Please check upstream accounts.")
 
+    def _schedule_heal(self, acc) -> None:
+        """后台触发账号自愈，绝不阻塞当前请求路径。
+
+        自愈本身是后台语义（auto_heal_account 的 docstring 即写 "Background
+        task"）。此前它在 _classify_and_release 里被 await，等于把一次用户请求
+        挂在自愈的失败重试上（重试期间还会 sleep），期间既不轮询下一个账号也不
+        返回响应 —— 这正是"整个系统不能用"的直接机制。改为 create_task 派发。
+        """
+        resolver = self.auth_resolver
+        if resolver is None:
+            return
+        if getattr(acc, "healing", False):
+            return
+        asyncio.create_task(resolver.auto_heal_account(acc))
+
     async def _classify_and_release(self, acc, e: Exception, exclude: set) -> bool:
         """按错误类型标记账号状态并加入排除集，最后释放账号（流式/非流式共用）。
 
@@ -483,16 +502,17 @@ class QwenExecutor:
             from backend.services.waf_cookie_manager import WafCookieManager
 
             WafCookieManager.get_instance().invalidate(acc)
-            if self.auth_resolver is not None:
-                await self.auth_resolver.auto_heal_account(acc)
+            self._schedule_heal(acc)
             needs_heal = True
         elif "unauthorized" in err_msg or "401" in err_msg or "403" in err_msg:
             self.account_pool.mark_invalid(acc)
             exclude.add(acc.email)
             if "activation" in err_msg or "pending" in err_msg:
                 acc.activation_pending = True
-            if self.auth_resolver is not None:
-                await self.auth_resolver.auto_heal_account(acc)
+            # 自愈必须后台跑：await 它会让当前请求卡在自愈的重试循环上，期间既不
+            # 换号也不返回 —— 请求表现为挂死。healing 标志位保证同一账号不被并发
+            # 重复刷新。
+            self._schedule_heal(acc)
             needs_heal = True
         else:
             exclude.add(acc.email)

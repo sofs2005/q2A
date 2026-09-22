@@ -59,9 +59,12 @@ class AuthResolver:
 
         acc.healing = True
         try:
-            # Token 刷新最多重试 3 次，带退避间隔避免连续请求触发 WAF
+            # Token 刷新重试：失败要么是瞬时网络/风控抖动（重试有意义），要么是
+            # 密码错误/账号被停用（重试多久都没用）。原实现是 5/10/20 分钟共 35 分钟
+            # 的退避，期间 healing=True 持锁、账号又是 valid=False 状态，等于把账号
+            # 锁死半小时。改为秒级退避，让自愈快速收敛：成功即恢复，失败即早暴露。
             max_retries = 3
-            retry_delays = [5*60, 10*60, 20*60]  # 分钟：第1次等5分钟，第2次等10分钟，第3次等20分钟
+            retry_delays = [5, 15, 30]  # 秒
             ok = False
             for attempt in range(max_retries):
                 ok = await self.refresh_token(acc)
@@ -229,9 +232,15 @@ class AuthResolver:
             waf_mgr.update_cookies(acc, collected)
             log.info(f"[Refresh] {acc.email} waf cookie 已同步刷新 keys={sorted(collected)}")
         else:
-            # 登录和种子请求都没返回 acw_tc，作废让下次 create_chat 收割
-            waf_mgr.invalidate(acc)
-            log.warning(f"[Refresh] {acc.email} 未能获取 acw_tc，将在下次 create_chat 时收割")
+            # 登录和种子请求都没返回 acw_tc。此时 token 已经刷新成功（上面的
+            # acc.token/valid 已赋值），而 acw_tc 本来就由 create_chat 按需收割，
+            # 不该在这里作废 —— 作废等于把账号已有的可用风控 cookie 一并清空，
+            # 让紧随其后的重试直接从"无 cookie"状态开始，反而更容易撞 WAF。
+            # 保留现有 cookie，交给读取侧的过期判定与 create_chat 收割链路处理。
+            log.info(
+                f"[Refresh] {acc.email} 本次登录/种子请求未下发 acw_tc，"
+                f"保留现有 waf cookie，交由 create_chat 收割"
+            )
 
         await self.pool.save()
         log.info(f"[Refresh] {acc.email} token 已更新")
