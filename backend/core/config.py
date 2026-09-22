@@ -9,10 +9,13 @@ DATA_DIR = BASE_DIR / "data"
 
 DEFAULT_QWEN_MAX_MODEL = "qwen3.8-max"
 DEFAULT_QWEN_PLUS_MODEL = "qwen3.7-plus"
-# 官网浏览器实际发送的 Version 头（真实抓包确认 0.3.10）。
-# 注意：CDN 上的 .../qwen-chat-fe/<ver>/ 路径与首页预渲染页可能滞后于线上版本，
-# 不要用 CDN 路径反推该值，以浏览器开发者工具的实际请求为准。
-DEFAULT_QWEN_WEB_VERSION = "0.3.10"
+# 上游 Version 头。**以实测可用性为准，不以抓包为准。**
+# 0.3.10 确为官网浏览器实际发送值，但服务端对它返回 401
+# （"Your session has expired, or the token is no longer valid."）—— 即该版本号
+# 已被服务端下线/不认。改回 0.2.91 后请求立刻恢复，故 0.2.91 才是当前真正可用的值。
+# 教训：抓包只能证明"官网在发什么"，证明不了"服务端认什么"。换版本号必须实测，
+# CDN 路径反推同样不可靠（首页预渲染页也会滞后）。
+DEFAULT_QWEN_WEB_VERSION = "0.2.91"
 DEFAULT_QWEN_BX_VERSION = "2.5.37"
 
 class Settings(BaseSettings):

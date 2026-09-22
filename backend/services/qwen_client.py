@@ -10,7 +10,7 @@ import httpx
 
 from backend.core.account_pool import Account
 from backend.core.browser_fingerprint import fingerprint_for_account, get_session, new_session
-from backend.core.config import settings
+from backend.core.config import DEFAULT_QWEN_BX_VERSION, DEFAULT_QWEN_WEB_VERSION, settings
 from backend.services.auth_resolver import BASE_URL, AuthResolver
 from backend.services.chat_id_pool import ChatIDPool
 from backend.services.waf_cookie_manager import WafCookieManager, collect_waf_cookies
@@ -34,8 +34,16 @@ class QwenClient:
     @staticmethod
     def _web_client_headers() -> dict[str, str]:
         return {
-            "Version": str(getattr(settings, "QWEN_WEB_VERSION", "0.3.10") or "0.3.10"),
-            "bx-v": str(getattr(settings, "QWEN_BX_VERSION", "2.5.37") or "2.5.37"),
+            # 兜底值引用 config 常量，不再写字面量：版本号会变（0.3.10 → 0.2.91
+            # 就是这么来的），散落的字面量会让"改了一处漏了另一处"重现。
+            "Version": str(
+                getattr(settings, "QWEN_WEB_VERSION", DEFAULT_QWEN_WEB_VERSION)
+                or DEFAULT_QWEN_WEB_VERSION
+            ),
+            "bx-v": str(
+                getattr(settings, "QWEN_BX_VERSION", DEFAULT_QWEN_BX_VERSION)
+                or DEFAULT_QWEN_BX_VERSION
+            ),
             "source": "web",
             "X-Request-Id": str(uuid.uuid4()),
             "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT%z", time.localtime()),
