@@ -223,29 +223,39 @@ class CaptchaSolver:
             if async_playwright is None:
                 raise ImportError("playwright 未安装")
 
+            # 浏览器必须与 API 走同一个出口 IP：阿里把 acw_tc/x5sec 绑定到签发 IP，
+            # API 走代理而解滑块走本机真实 IP 时，放行 cookie 跨 IP 回放是强欺诈信号。
+            from backend.core.config import settings as _settings
+
+            launch_kwargs: dict[str, Any] = {
+                "headless": True,
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins",
+                    "--disable-features=site-per-process",
+                    "--disable-client-side-phishing-detection",
+                    "--disable-hang-monitor",
+                    "--disable-popup-blocking",
+                    "--disable-prompt-on-repost",
+                    "--disable-sync",
+                    "--disable-translate",
+                    "--metrics-recording-only",
+                    "--no-first-run",
+                    "--safebrowsing-disable-auto-update",
+                ],
+            }
+            proxy = str(getattr(_settings, "UPSTREAM_PROXY", "") or "").strip()
+            if proxy:
+                launch_kwargs["proxy"] = {"server": proxy}
+                log.info("[CaptchaSolver] Chromium 走 UPSTREAM_PROXY 出口")
+
             log.info("[CaptchaSolver] 启动 Chromium 浏览器")
             try:
                 self._playwright = await async_playwright().start()
-                self._browser = await self._playwright.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-web-security",
-                        "--disable-features=IsolateOrigins",
-                        "--disable-features=site-per-process",
-                        "--disable-client-side-phishing-detection",
-                        "--disable-hang-monitor",
-                        "--disable-popup-blocking",
-                        "--disable-prompt-on-repost",
-                        "--disable-sync",
-                        "--disable-translate",
-                        "--metrics-recording-only",
-                        "--no-first-run",
-                        "--safebrowsing-disable-auto-update",
-                    ],
-                )
+                self._browser = await self._playwright.chromium.launch(**launch_kwargs)
             except Exception:
                 # launch 失败时清理已创建的 playwright,避免进程泄漏
                 await self._close_browser()
@@ -262,6 +272,7 @@ class CaptchaSolver:
         base_url: str = "https://chat.qwen.ai",
         timeout_ms: int = 15000,
         debug: bool = False,
+        account: Any | None = None,
     ) -> dict[str, str]:
         """完成 x5sec 滑块挑战,返回放行 cookie 字典。
 
@@ -271,6 +282,7 @@ class CaptchaSolver:
             base_url: chat.qwen.ai 基础 URL,用于推导 cookie domain
             timeout_ms: 挑战超时时间(毫秒),默认 15s 以避免 x5secdata 过期
             debug: 是否保存截图/日志供分析,生产环境建议 False
+            account: 目标账号; 提供时浏览器 UA 与该账号 API 指纹保持一致
 
         Returns:
             cookie 字典 {"acw_tc": "...", "x5sec": "...", ...},失败返回 {}
@@ -297,19 +309,39 @@ class CaptchaSolver:
         result: dict[str, str] = {}
         passed = False
 
+        # 浏览器 UA / sec-ch-ua 与账号 API 侧指纹保持一致：账号若用 Safari 指纹打
+        # API，却用 Chrome/136 Windows 解滑块，同一个会话里两套 UA 本身就是破绽。
+        try:
+            from backend.core.browser_fingerprint import fingerprint_for_account
+
+            fingerprint = fingerprint_for_account(account)
+            browser_ua = fingerprint.user_agent
+            browser_headers: dict[str, str] = {
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            }
+            if fingerprint.sec_ch_ua:
+                browser_headers["sec-ch-ua"] = fingerprint.sec_ch_ua
+                browser_headers["sec-ch-ua-mobile"] = fingerprint.sec_ch_ua_mobile
+                browser_headers["sec-ch-ua-platform"] = fingerprint.platform
+        except Exception:
+            fingerprint = None
+            browser_ua = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+            )
+            browser_headers = {
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            }
+
         try:
             context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-                ),
+                user_agent=browser_ua,
                 viewport={"width": 1280, "height": 720},
                 locale="zh-CN",
                 timezone_id="Asia/Shanghai",
-                extra_http_headers={
-                    "Accept-Language": "zh-CN,zh;q=0.9",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                },
+                extra_http_headers=browser_headers,
             )
             try:
                 # 注入账号 token cookie 模拟登录态

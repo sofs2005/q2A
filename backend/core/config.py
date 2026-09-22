@@ -27,14 +27,23 @@ class Settings(BaseSettings):
     ACCOUNT_BUSY_TIMEOUT_SECONDS: float = float(os.getenv("ACCOUNT_BUSY_TIMEOUT_SECONDS", 900))
     REQUEST_JITTER_MIN_MS: int = int(os.getenv("REQUEST_JITTER_MIN_MS", 120))
     REQUEST_JITTER_MAX_MS: int = int(os.getenv("REQUEST_JITTER_MAX_MS", 360))
-    WAF_RETRY_EXTRA_COOLDOWN_SECONDS: float = float(os.getenv("WAF_RETRY_EXTRA_COOLDOWN_SECONDS", 5))
+    WAF_RETRY_EXTRA_COOLDOWN_SECONDS: float = float(os.getenv("WAF_RETRY_EXTRA_COOLDOWN_SECONDS", 30))
     RATE_LIMIT_BASE_COOLDOWN: int = int(os.getenv("RATE_LIMIT_BASE_COOLDOWN", 600))
     RATE_LIMIT_MAX_COOLDOWN: int = int(os.getenv("RATE_LIMIT_MAX_COOLDOWN", 3600))
-    CHAT_ID_PREWARM_TARGET_PER_ACCOUNT: int = int(os.getenv("CHAT_ID_PREWARM_TARGET_PER_ACCOUNT", 5))
-    CHAT_ID_PREWARM_TTL_SECONDS: int = int(os.getenv("CHAT_ID_PREWARM_TTL_SECONDS", 120))
-    CHAT_ID_PREWARM_MAX_CONCURRENCY: int = int(os.getenv("CHAT_ID_PREWARM_MAX_CONCURRENCY", 16))
+    # 命中 punish 后的重试退避：base * 2^attempt，上限见 MAX。固定的 2~5s 退避在
+    # 风控看来就是"被拦后立刻接着打"，必须随重试次数拉长。
+    WAF_RETRY_BACKOFF_BASE_SECONDS: float = float(os.getenv("WAF_RETRY_BACKOFF_BASE_SECONDS", 5))
+    WAF_RETRY_BACKOFF_MAX_SECONDS: float = float(os.getenv("WAF_RETRY_BACKOFF_MAX_SECONDS", 60))
+    # 预热默认值按"低强度长驻"取：单账号单模型只留 2 个、TTL 拉到 15 分钟，
+    # 否则每轮预热本身就是一次自动化特征明显的请求脉冲。
+    CHAT_ID_PREWARM_TARGET_PER_ACCOUNT: int = int(os.getenv("CHAT_ID_PREWARM_TARGET_PER_ACCOUNT", 2))
+    CHAT_ID_PREWARM_TTL_SECONDS: int = int(os.getenv("CHAT_ID_PREWARM_TTL_SECONDS", 900))
+    CHAT_ID_PREWARM_MAX_CONCURRENCY: int = int(os.getenv("CHAT_ID_PREWARM_MAX_CONCURRENCY", 4))
     CHAT_ID_PREWARM_SPREAD_SECONDS: float = float(os.getenv("CHAT_ID_PREWARM_SPREAD_SECONDS", 6))
     CHAT_ID_PREWARM_JITTER_SECONDS: float = float(os.getenv("CHAT_ID_PREWARM_JITTER_SECONDS", 1.5))
+    # 预热补给轮询间隔（秒）。旧实现是 TTL//4，TTL 调大后会跟着放大成新的脉冲源，
+    # 故拆成独立可配项。
+    CHAT_ID_PREWARM_REFILL_INTERVAL_SECONDS: float = float(os.getenv("CHAT_ID_PREWARM_REFILL_INTERVAL_SECONDS", 300))
     # 未设置时由 ChatIDPool 跟随 qwen-max/qwen-plus 的当前目标；显式空串可关闭默认预热模型。
     CHAT_ID_PREWARM_MODELS: str | None = os.getenv("CHAT_ID_PREWARM_MODELS")
     QWEN_CHAT_TRANSPORT_SEND_COOKIES: bool = os.getenv("QWEN_CHAT_TRANSPORT_SEND_COOKIES", "false").lower() in {"1", "true", "yes", "on"}

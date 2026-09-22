@@ -357,7 +357,9 @@ async def create_image(request: Request):
     seen_hashes: set[str] = set()
     # 上游一次 image_gen 通常只产 1 张；n>1 时按轮次循环请求凑满。
     # 每轮独立 chat；硬错误且尚无结果时快速失败，不空转。
-    max_rounds = n + min(2, n)
+    # 轮数上限收紧为 n+1：每轮内部还有 MAX_RETRIES 次换号，外层再乘 1.x 倍就是
+    # 单次生图打十几到几十次上游请求，是 WAF 命中的主要放大器之一。
+    max_rounds = n + 1
     round_idx = 0
     last_error: Exception | None = None
     # 第一轮走原生 t2i；拿不到结果则回退到旧的 t2t + 提示词诱导路径

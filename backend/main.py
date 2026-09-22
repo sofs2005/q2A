@@ -54,7 +54,9 @@ async def chat_id_pool_loop(app: FastAPI):
             raise
         except Exception as exc:
             log.warning("[ChatIDPool] loop failed: %s", exc)
-        await asyncio.sleep(max(5, int(getattr(settings, "CHAT_ID_PREWARM_TTL_SECONDS", 120) or 120) // 4))
+        await asyncio.sleep(
+            max(5.0, float(getattr(settings, "CHAT_ID_PREWARM_REFILL_INTERVAL_SECONDS", 300) or 300))
+        )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

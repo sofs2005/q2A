@@ -35,6 +35,34 @@ def _is_waf_blocked_body(body: str) -> bool:
     )
 
 
+def _is_punish_error(err_msg: str) -> bool:
+    """判定异常是否来自 x5sec punish 拦截（而非普通 WAF/鉴权失败）。
+
+    punish 是"已被风控点名"的信号：此时换号继续重试等于在被拦后接着猛打，
+    只会加重标记，因此调用方应直接熔断本次请求而非进入下一次 attempt。
+    """
+    return (
+        "x5sec" in err_msg
+        or "_____tmd_____" in err_msg
+        or "fail_sys_user_validate" in err_msg
+        or "rgv587" in err_msg
+        or "/punish" in err_msg
+    )
+
+
+def _retry_backoff_seconds(attempt: int) -> float:
+    """按 attempt 指数增长的退避，叠加 WAF 额外冷却与抖动。
+
+    旧实现是固定 uniform(2.0, 5.0)，不随重试次数增长 —— 对风控而言每轮间隔
+    都一样，等于规律性脉冲。改为 base * 2^attempt 并封顶。
+    """
+    base = max(0.0, float(getattr(settings, "WAF_RETRY_BACKOFF_BASE_SECONDS", 5) or 0))
+    cap = max(base, float(getattr(settings, "WAF_RETRY_BACKOFF_MAX_SECONDS", 60) or 0))
+    extra = max(0.0, float(getattr(settings, "WAF_RETRY_EXTRA_COOLDOWN_SECONDS", 0) or 0))
+    grown = min(cap, base * (2 ** max(0, attempt)))
+    return grown + extra + random.uniform(0.0, 1.5)
+
+
 def _preview_text(value: object, limit: int = 500) -> str:
     text = str(value or "").replace("\r", "\\r").replace("\n", "\\n")
     text = re.sub(r"(x5secdata=)[^&\s\"']+", r"\1<redacted>", text, flags=re.IGNORECASE)
@@ -87,7 +115,10 @@ class QwenExecutor:
 
         ts = int(time.time() * 1000)
         body = {
-            "title": f"api_{ts}",
+            # 官网建会话不带 title（由服务端/前端后续生成）。此前发 "api_<毫秒>" 会
+            # 永久留在账号会话列表里，是辨识度极高的批量注册特征（抓包已在列表里
+            # 看到 api_1790058422946 这类标题，就是我们自己造的）。
+            "title": "",
             # 官网 chats/new 抓包带空 chatId（2026-09）
             "chatId": "",
             "models": [model],
@@ -393,6 +424,16 @@ class QwenExecutor:
                 return
 
             except Exception as e:
+                # punish 是不可重试的终态：已解过滑块仍被拦，或滑块失败。此时换号
+                # 继续打在风控看来就是"被点名后接着猛打"，只会加深标记 → 直接熔断。
+                if _is_punish_error(str(e).lower()):
+                    log.error(
+                        f"[Executor] x5sec punish: 熔断本次请求，不再换号重试 "
+                        f"account={acc.email} attempt={attempt + 1} error={e}"
+                    )
+                    self.account_pool.release(acc)
+                    raise
+
                 needs_heal = await self._classify_and_release(acc, e, exclude)
                 log.warning(
                     f"[Executor] retry attempt={attempt + 1}/{settings.MAX_RETRIES} account={acc.email} error={e}"
@@ -405,8 +446,8 @@ class QwenExecutor:
                         log.info(f"[Executor] WAF 兜底 create_chat 完成 account={acc.email}")
                     except Exception as seed_err:
                         log.warning(f"[Executor] WAF 兜底 create_chat 失败 account={acc.email} error={seed_err}")
-                # 重试前随机退避 2~5s：降低 IP 频率分，给新 cookie 生效时间
-                backoff = random.uniform(2.0, 5.0)
+                # 退避按 attempt 指数增长（+ WAF 额外冷却 + 抖动）
+                backoff = _retry_backoff_seconds(attempt)
                 log.info(f"[Executor] retry backoff {backoff:.1f}s before attempt={attempt + 2}")
                 await asyncio.sleep(backoff)
             except (asyncio.CancelledError, GeneratorExit):
@@ -504,6 +545,14 @@ class QwenExecutor:
                 self.account_pool.release(acc)
                 raise
             except Exception as e:
+                if _is_punish_error(str(e).lower()):
+                    log.error(
+                        f"[Executor] non-stream x5sec punish: 熔断本次请求，不再换号重试 "
+                        f"account={acc.email} attempt={attempt + 1} error={e}"
+                    )
+                    self.account_pool.release(acc)
+                    raise
+
                 needs_heal = await self._classify_and_release(acc, e, exclude)
                 log.warning(
                     f"[Executor] non-stream retry attempt={attempt + 1}/{settings.MAX_RETRIES} account={acc.email} error={e}"
@@ -515,5 +564,8 @@ class QwenExecutor:
                         log.info(f"[Executor] non-stream WAF 兜底 create_chat 完成 account={acc.email}")
                     except Exception as seed_err:
                         log.warning(f"[Executor] non-stream WAF 兜底 create_chat 失败 account={acc.email} error={seed_err}")
+                backoff = _retry_backoff_seconds(attempt)
+                log.info(f"[Executor] non-stream retry backoff {backoff:.1f}s before attempt={attempt + 2}")
+                await asyncio.sleep(backoff)
 
         raise Exception(f"All {settings.MAX_RETRIES} attempts failed. Please check upstream accounts.")

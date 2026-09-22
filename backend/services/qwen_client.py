@@ -505,12 +505,14 @@ class QwenClient:
         request_timeout = timeout if timeout is not None else settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS
         fingerprint = fingerprint_for_account(account)
         session = await get_session(fingerprint)
+        # 对齐浏览器加载 <img src=cdn.qwenlm.ai/...> 的实际头部：跨站 no-cors 图片
+        # 请求不带 Origin，也不带 Authorization（鉴权靠 URL 里的资源级 JWT key）。
+        # 之前同时发 Bearer + Origin 是明显的非浏览器特征。
         headers = {
             "User-Agent": fingerprint.user_agent,
             "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Referer": f"{BASE_URL}/",
-            "Origin": BASE_URL,
             "sec-fetch-dest": "image",
             "sec-fetch-mode": "no-cors",
             "sec-fetch-site": "cross-site",
@@ -519,11 +521,7 @@ class QwenClient:
             headers["sec-ch-ua"] = fingerprint.sec_ch_ua
             headers["sec-ch-ua-mobile"] = fingerprint.sec_ch_ua_mobile
             headers["sec-ch-ua-platform"] = fingerprint.platform
-        # 带上 token / WAF cookie：部分 CDN key 与会话态绑定
-        token = str(getattr(account, "token", "") or "")
         cookie_parts: list[str] = []
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
         if bool(getattr(settings, "QWEN_CHAT_TRANSPORT_SEND_COOKIES", False)):
             account_cookies = str(getattr(account, "cookies", "") or "").strip()
             if account_cookies:
@@ -688,6 +686,7 @@ class QwenClient:
         pass_cookies = await solver.solve_punish(
             punish_url=punish_url or "",
             account_token=token,
+            account=account,
         )
 
         if pass_cookies:
@@ -703,39 +702,44 @@ class QwenClient:
                 account=account, token=token, accept="application/json",
                 referer=f"{BASE_URL}/c/{chat_id}",
             )
-            # 重试走 Go-like HTTP 路径（简单可靠，避免 curl_cffi session 状态问题）
+            # 重试必须沿用主流式的 curl_cffi + 浏览器 TLS 指纹：刚解完滑块证明自己
+            # 是人，紧接着用无指纹的裸 httpx 再打一次，几乎必然二次命中并吃满冷却。
+            retry_session = new_session(fingerprint_for_account(account), timeout=timeout)
             try:
-                _proxy = getattr(settings, "UPSTREAM_PROXY", "") or None
-                async with httpx.AsyncClient(http2=False, follow_redirects=True, timeout=timeout, proxy=_proxy) as client:
-                    async with client.stream(
-                        "POST",
-                        f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
-                        headers=retry_headers,
-                        json=payload,
-                        timeout=timeout,
-                    ) as resp2:
-                        if resp2.status_code != 200:
-                            body_chunks2 = []
-                            async for chunk in resp2.aiter_bytes():
-                                body_chunks2.append(chunk)
-                            body_text2 = b"".join(body_chunks2).decode(errors="replace")[:2000]
-                            still_punish = self._is_punish_response(resp2.status_code, body_text2, dict(resp2.headers))
-                            if still_punish:
-                                log.warning("[stream_chat_once] retry still punished after captcha solve")
-                            else:
-                                log.error(f"[stream_chat_once] retry non-200 status={resp2.status_code}")
-                                yield {"status": resp2.status_code, "body": body_text2}
-                                return
+                async with retry_session.stream(
+                    "POST",
+                    f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
+                    headers=retry_headers,
+                    json=payload,
+                    timeout=timeout,
+                ) as resp2:
+                    if resp2.status_code != 200:
+                        body_chunks2 = []
+                        async for chunk in resp2.aiter_content():
+                            body_chunks2.append(chunk)
+                        body_text2 = b"".join(body_chunks2).decode(errors="replace")[:2000]
+                        still_punish = self._is_punish_response(resp2.status_code, body_text2, dict(resp2.headers))
+                        if still_punish:
+                            log.warning("[stream_chat_once] retry still punished after captcha solve")
                         else:
-                            log.info("[stream_chat_once] retry success after captcha solve")
-                            async for chunk in resp2.aiter_bytes():
-                                decoded = chunk.decode("utf-8", errors="replace")
-                                if decoded:
-                                    yield {"chunk": decoded}
-                            yield {"status": "streamed"}
+                            log.error(f"[stream_chat_once] retry non-200 status={resp2.status_code}")
+                            yield {"status": resp2.status_code, "body": body_text2}
                             return
+                    else:
+                        log.info("[stream_chat_once] retry success after captcha solve")
+                        async for chunk in resp2.aiter_content():
+                            decoded = chunk.decode("utf-8", errors="replace")
+                            if decoded:
+                                yield {"chunk": decoded}
+                        yield {"status": "streamed"}
+                        return
             except Exception as retry_err:
                 log.error(f"[stream_chat_once] retry request failed: {retry_err}")
+            finally:
+                try:
+                    await retry_session.close()
+                except Exception:
+                    pass
 
         # 滑块失败或重试仍被拦截：降级为冷却（时长可配）
         punish_cooldown = int(getattr(settings, "WAF_PUNISH_COOLDOWN", 1800) or 1800)

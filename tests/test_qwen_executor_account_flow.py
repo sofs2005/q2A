@@ -26,7 +26,13 @@ if "curl_cffi" not in sys.modules:
     sys.modules["curl_cffi.requests"] = fake_curl_cffi_requests
 
 from backend.core.account_pool import Account
-from backend.upstream.qwen_executor import QwenExecutor, _is_waf_blocked_body, _preview_text
+from backend.upstream.qwen_executor import (
+    QwenExecutor,
+    _is_punish_error,
+    _is_waf_blocked_body,
+    _preview_text,
+    _retry_backoff_seconds,
+)
 
 
 class _Pool:
@@ -215,6 +221,97 @@ class QwenExecutorAccountFlowTests(unittest.IsolatedAsyncioTestCase):
         chat_pool.remember_model.assert_awaited_once_with("qwen3.7-plus", "t2t")
         chat_pool.take.assert_awaited_once_with("alice@example.com", "qwen3.7-plus", "t2t")
         executor.create_chat.assert_not_awaited()
+
+    def test_punish_error_is_detected_from_all_known_markers(self) -> None:
+        for marker in (
+            "x5sec punish interception",
+            "punish?x5secdata=abc",
+            "https://chat.qwen.ai/api/v2/chat/completions/_____tmd_____/punish",
+            "FAIL_SYS_USER_VALIDATE",
+            "RGV587_ERROR::SM",
+        ):
+            self.assertTrue(_is_punish_error(marker.lower()), marker)
+        # 普通 WAF 挑战不算 punish：那是接入层拦截，可自愈后重试
+        self.assertFalse(_is_punish_error("waf_blocked: aliyun_waf_aa"))
+        self.assertFalse(_is_punish_error("timeout"))
+
+    def test_retry_backoff_grows_exponentially_and_caps(self) -> None:
+        with (
+            patch("backend.upstream.qwen_executor.settings.WAF_RETRY_BACKOFF_BASE_SECONDS", 5),
+            patch("backend.upstream.qwen_executor.settings.WAF_RETRY_BACKOFF_MAX_SECONDS", 60),
+            patch("backend.upstream.qwen_executor.settings.WAF_RETRY_EXTRA_COOLDOWN_SECONDS", 0),
+            patch("backend.upstream.qwen_executor.random.uniform", return_value=0.0),
+        ):
+            self.assertEqual(_retry_backoff_seconds(0), 5)
+            self.assertEqual(_retry_backoff_seconds(1), 10)
+            self.assertEqual(_retry_backoff_seconds(2), 20)
+            # 封顶，不无限增长
+            self.assertEqual(_retry_backoff_seconds(10), 60)
+
+    async def test_punish_does_not_retry_with_another_account(self) -> None:
+        """x5sec punish 是终态：必须熔断，不得换号接着打。"""
+        account = Account(email="alice@example.com", token="token-1")
+        pool = _RetryPool(account)
+        executor = QwenExecutor(SimpleNamespace(), pool)
+        executor.auth_resolver.auto_heal_account = AsyncMock()
+        calls = []
+
+        async def fake_create_chat(acc, model, chat_type="t2t"):
+            calls.append(acc.email)
+            raise Exception("waf_blocked: FAIL_SYS_USER_VALIDATE /punish?x5secdata=secret")
+
+        executor.create_chat = fake_create_chat
+
+        # 允许 3 次重试；若未熔断会 acquire 到第二个账号（_RetryPool 排除后返回 None）
+        with patch("backend.upstream.qwen_executor.settings.MAX_RETRIES", 3):
+            with self.assertRaises(Exception) as ctx:
+                async for _ in executor.chat_stream_events_with_retry("qwen3.7-plus", "hello"):
+                    pass
+
+        self.assertNotIn("All 3 attempts failed", str(ctx.exception))
+        # 只打了一次，没有换号重试
+        self.assertEqual(calls, ["alice@example.com"])
+        self.assertEqual(pool.released, [account])
+        # punish 不触发 401 自愈（那不是鉴权问题）
+        executor.auth_resolver.auto_heal_account.assert_not_called()
+
+    async def test_punish_on_non_stream_path_also_circuit_breaks(self) -> None:
+        account = Account(email="alice@example.com", token="token-1")
+        pool = _RetryPool(account)
+        calls = []
+
+        async def fake_complete(token, chat_id, payload, account=None, timeout=None):
+            calls.append(account.email)
+            return {
+                "status": 200,
+                "body": '{"ret":["FAIL_SYS_USER_VALIDATE"],"data":{"url":"/_____tmd_____/punish?x5secdata=secret"}}',
+            }
+
+        executor = QwenExecutor(SimpleNamespace(complete_chat_once=fake_complete), pool)
+        executor.create_chat = AsyncMock(return_value="chat-1")
+        executor.auth_resolver.auto_heal_account = AsyncMock()
+
+        with patch("backend.upstream.qwen_executor.settings.MAX_RETRIES", 3):
+            with self.assertRaises(Exception) as ctx:
+                await executor.complete_once_with_retry("qwen3.7-plus", "hello")
+
+        self.assertNotIn("All 3 attempts failed", str(ctx.exception))
+        self.assertEqual(calls, ["alice@example.com"])
+
+    async def test_create_chat_omits_api_title_marker(self) -> None:
+        """会话标题不得带 api_<毫秒> 前缀——它会永久留在账号会话列表里被识别。"""
+        account = Account(email="alice@example.com", token="token-1")
+        seen = {}
+
+        async def fake_request(method, path, token, body=None, timeout=None, account=None, **kwargs):
+            seen["body"] = body
+            return {"status": 200, "body": '{"success": true, "data": {"id": "chat-x"}}'}
+
+        executor = QwenExecutor(SimpleNamespace(_request_json=fake_request), _Pool())
+        await executor.create_chat(account, "qwen3.8-max")
+
+        self.assertEqual(seen["body"]["title"], "")
+        self.assertNotIn("api_", seen["body"]["title"])
 
 
 if __name__ == "__main__":

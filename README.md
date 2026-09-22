@@ -406,7 +406,15 @@ python start.py
 | `EMPTY_RESPONSE_RETRIES` | `1` | 空响应最大重试次数。 |
 | `RATE_LIMIT_BASE_COOLDOWN` | `600` | 账号限流基础冷却时间（秒）。 |
 | `RATE_LIMIT_MAX_COOLDOWN` | `3600` | 账号限流最大冷却时间（秒）。 |
-| `WAF_RETRY_EXTRA_COOLDOWN_SECONDS` | `5` | WAF 命中后固定账号原地重试前的额外冷却（秒），避免连续撞击加重风控。 |
+| `WAF_RETRY_EXTRA_COOLDOWN_SECONDS` | `30` | WAF 命中后重试前的额外冷却（秒），叠加在指数退避之上。 |
+| `WAF_RETRY_BACKOFF_BASE_SECONDS` | `5` | 重试退避基数（秒）。退避按 `base × 2^attempt` 增长并封顶于下一项，避免「被拦后立刻接着打」的固定节奏。 |
+| `WAF_RETRY_BACKOFF_MAX_SECONDS` | `60` | 重试退避上限（秒）。 |
+| `CHAT_ID_PREWARM_TARGET_PER_ACCOUNT` | `2` | 每账号每模型预热的 chat 份数。 |
+| `CHAT_ID_PREWARM_TTL_SECONDS` | `900` | 预热 chat 存活时长（秒）。 |
+| `CHAT_ID_PREWARM_MAX_CONCURRENCY` | `4` | 预热建会话并发上限。 |
+| `CHAT_ID_PREWARM_REFILL_INTERVAL_SECONDS` | `300` | 预热补给轮询间隔（秒）。 |
+
+> 命中 `x5sec punish`（滑块挑战）时**不会**换号重试：该错误是风控点名的终态信号，继续换账号打只会加深标记，因此直接熔断并让账号进入冷却。
 
 ### 上游协议与用量参数
 

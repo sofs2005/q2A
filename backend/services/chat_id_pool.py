@@ -5,6 +5,7 @@ import hashlib
 import logging
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from backend.core.config import default_prewarm_models, resolve_model, settings
 
@@ -116,57 +117,72 @@ class ChatIDPool:
             and float(getattr(acc, "next_available_at", lambda: 0.0)()) <= now
         ]
         semaphore = asyncio.Semaphore(max_concurrency)
-        # 每轮相位轮换：按轮次旋转账号起跑顺序，避免同一账号每轮都第一个打上游
+        # 每轮相位轮换：按轮次旋转账号顺序，避免同一账号每轮都排在最前面、永远
+        # 拿到最早的那批起跑时间。
         self._fill_round += 1
-        total = len(accounts)
-        offset = self._fill_round % total if total else 0
-        tasks = []
-        for idx, acc in enumerate(accounts):
-            # slot 决定该账号在错峰窗口内的相对起跑位置（0..total-1），随轮次旋转
-            slot = (idx + offset) % total if total else 0
+        if accounts:
+            rotate = self._fill_round % len(accounts)
+            accounts = accounts[rotate:] + accounts[:rotate]
+
+        # 错峰必须按「本轮第几个请求」铺开，而不是按账号序位：同一账号有
+        # TARGET × 模型数 个请求，若只按账号分档它们会拿到完全相同的 slot 与
+        # 确定性 jitter，于是同时发出 —— 单账号 10 次并发脉冲比分散还显眼。
+        pending: list[tuple[Any, str, str]] = []
+        for acc in accounts:
             for model, chat_type in desired:
                 missing = target - await self.count(acc.email, model, chat_type)
                 for _ in range(max(0, missing)):
-                    tasks.append(asyncio.create_task(
-                        self._create_warm_chat(semaphore, acc, model, chat_type, slot, total)
-                    ))
+                    pending.append((acc, model, chat_type))
+        request_total = len(pending)
+        tasks = []
+        for seq, (acc, model, chat_type) in enumerate(pending):
+            tasks.append(asyncio.create_task(
+                self._create_warm_chat(semaphore, acc, model, chat_type, seq, request_total)
+            ))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     @staticmethod
     def _jitter(email: str, model: str, chat_type: str) -> float:
-        """基于 email+model+chat_type 哈希的确定性抖动（0~JITTER_SECONDS）。
+        """基于 email+model+chat_type+秒级时间的抖动（0~JITTER_SECONDS）。
 
-        在序位铺开的基础上叠加抖动，打散"同一序位、不同模型"的并发请求，
-        并让相邻账号的起跑时间不至于过于规整，进一步弱化请求脉冲特征。
+        时间参与哈希是为了引入熵：旧实现是纯确定性哈希，同一账号同一模型每次
+        预热的等待时间完全相同，长期看毫无随机性可言。
         """
         jitter_max = max(0.0, float(getattr(settings, "CHAT_ID_PREWARM_JITTER_SECONDS", 1.5) or 0))
         if jitter_max <= 0:
             return 0.0
-        key = f"{str(email or '').strip().lower()}|{str(model or '').strip()}|{normalize_chat_type(chat_type)}"
+        key = (
+            f"{str(email or '').strip().lower()}|{str(model or '').strip()}"
+            f"|{normalize_chat_type(chat_type)}|{int(time.time())}"
+        )
         digest = hashlib.sha256(key.encode("utf-8", errors="ignore")).hexdigest()
         return (int(digest, 16) % 1000) / 1000.0 * jitter_max
 
     @staticmethod
-    def _spread_delay(slot: int, total: int, email: str, model: str, chat_type: str) -> float:
-        """账号错峰延迟：在 SPREAD_SECONDS 窗口内按序位 slot 均匀铺开 + 抖动。
+    def _spread_delay(seq: int, total: int, email: str, model: str, chat_type: str) -> float:
+        """请求错峰延迟：在 SPREAD_SECONDS 窗口内按「本轮请求序号」均匀铺开 + 抖动。
 
-        相比旧的纯哈希抖动（固定 0~2s 且账号顺序永远相同），序位均匀铺开能
-        随账号数量自适应拉开间距，配合 fill() 的轮次相位轮换实现真正的错开。
+        seq/total 是本轮全部待建会话里的全局序号，因此同一账号的多个请求（不同
+        模型、不同 TARGET 份数）也会被拉开，而不是挤在同一时刻。
         """
         spread = max(0.0, float(getattr(settings, "CHAT_ID_PREWARM_SPREAD_SECONDS", 6) or 0))
-        base = (spread * slot / total) if (spread > 0 and total > 0) else 0.0
+        base = (spread * seq / total) if (spread > 0 and total > 0) else 0.0
         return base + ChatIDPool._jitter(email, model, chat_type)
 
-    async def _create_warm_chat(self, semaphore: asyncio.Semaphore, acc, model: str, chat_type: str, slot: int = 0, total: int = 1) -> None:
+    async def _create_warm_chat(self, semaphore: asyncio.Semaphore, acc, model: str, chat_type: str, seq: int = 0, total: int = 1) -> None:
         model = resolve_model(model)
-        # 先错峰再获取信号量：按账号序位在错峰窗口内铺开起跑时间，
+        # 先错峰再获取信号量：按全局请求序号在错峰窗口内铺开起跑时间，
         # 避免高并发下所有任务同时拿到信号量后仍形成密集请求脉冲触发上游风控
-        delay = self._spread_delay(slot, total, getattr(acc, "email", ""), model, chat_type)
+        delay = self._spread_delay(seq, total, getattr(acc, "email", ""), model, chat_type)
         if delay > 0:
             await asyncio.sleep(delay)
         async with semaphore:
             try:
+                # 建 chat 与普通请求同属上游流量，必须一起受 ACCOUNT_MIN_INTERVAL_MS
+                # 约束，否则预热是唯一不受节奏闸门管制的路径（next_available_at 只
+                # 看 last_request_started，而这里此前从不更新它）。
+                acc.last_request_started = time.time()
                 chat_id = await self.client.executor.create_chat(acc, model, chat_type=chat_type)
             except Exception as exc:
                 log.warning("[ChatIDPool] create_failed email=%s model=%s chat_type=%s error=%s", acc.email, model, chat_type, exc)
@@ -178,7 +194,7 @@ class ChatIDPool:
                     from backend.services.waf_cookie_manager import WafCookieManager
 
                     WafCookieManager.get_instance().invalidate(acc)
-                    cooldown = max(1, int(float(getattr(settings, "WAF_RETRY_EXTRA_COOLDOWN_SECONDS", 5) or 5)))
+                    cooldown = max(1, int(float(getattr(settings, "WAF_RETRY_EXTRA_COOLDOWN_SECONDS", 30) or 30)))
                     mark_rl = getattr(self.account_pool, "mark_rate_limited", None)
                     if mark_rl is not None:
                         mark_rl(

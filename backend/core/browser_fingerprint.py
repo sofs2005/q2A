@@ -58,80 +58,86 @@ class BrowserFingerprint:
         return headers
 
 
+# curl_cffi 0.15.0 的全部 impersonate target 在 TLS/JA4 层都是 macOS，
+# 故 UA / sec-ch-ua-platform / sec-ch-ua 必须跟着说 macOS —— 否则风控拿
+# "UA 说 Windows、握手说 macOS" 的交叉校验就能识破伪装。
+# sec_ch_ua 的品牌串按各版本实测原值填，不要统一成同一个（真实浏览器随版本变）。
+# 注：指纹 id 是内部标识（会持久化进 accounts.json），历史命名里的 windows/linux
+# 不再改，避免老账号 fingerprint_id 失配后集体回落到默认指纹。
 SUPPORTED_BROWSER_FINGERPRINTS: tuple[BrowserFingerprint, ...] = (
     BrowserFingerprint(
         id="chrome146_windows",
         browser="chrome",
         impersonate="chrome146",
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        platform='"Windows"',
-        sec_ch_ua='"Chromium";v="146", "Google Chrome";v="146", "Not_A Brand";v="99"',
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        platform='"macOS"',
+        sec_ch_ua='"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
     ),
     BrowserFingerprint(
         id="chrome145_macos",
         browser="chrome",
         impersonate="chrome145",
-        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
         platform='"macOS"',
-        sec_ch_ua='"Chromium";v="145", "Google Chrome";v="145", "Not_A Brand";v="99"',
+        sec_ch_ua='"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
     ),
     BrowserFingerprint(
         id="chrome142_linux",
         browser="chrome",
         impersonate="chrome142",
-        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-        platform='"Linux"',
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+        platform='"macOS"',
         sec_ch_ua='"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
     ),
     BrowserFingerprint(
         id="firefox147_windows",
         browser="firefox",
         impersonate="firefox147",
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
-        platform='"Windows"',
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:147.0) Gecko/20100101 Firefox/147.0",
+        platform='"macOS"',
     ),
     BrowserFingerprint(
         id="firefox144_macos",
         browser="firefox",
         impersonate="firefox144",
-        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 15.7; rv:144.0) Gecko/20100101 Firefox/144.0",
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:144.0) Gecko/20100101 Firefox/144.0",
         platform='"macOS"',
     ),
     BrowserFingerprint(
         id="firefox135_linux",
         browser="firefox",
         impersonate="firefox135",
-        user_agent="Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0",
-        platform='"Linux"',
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0",
+        platform='"macOS"',
     ),
     BrowserFingerprint(
         id="safari2601_macos",
         browser="safari",
         impersonate="safari2601",
-        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0.1 Safari/605.1.15",
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0.1 Safari/605.1.15",
         platform='"macOS"',
     ),
     BrowserFingerprint(
         id="safari260_macos",
         browser="safari",
         impersonate="safari260",
-        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 15_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
         platform='"macOS"',
     ),
     BrowserFingerprint(
         id="safari184_macos",
         browser="safari",
         impersonate="safari184",
-        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 15_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Safari/605.1.15",
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Safari/605.1.15",
         platform='"macOS"',
     ),
     BrowserFingerprint(
         id="chrome136_windows",
         browser="chrome",
         impersonate="chrome136",
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-        platform='"Windows"',
-        sec_ch_ua='"Chromium";v="136", "Google Chrome";v="136", "Not_A Brand";v="99"',
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        platform='"macOS"',
+        sec_ch_ua='"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
     ),
 )
 
