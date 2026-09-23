@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, type JSX } from "react"
 import { Button } from "../components/ui/button"
 import { Send, RefreshCw, Bot } from "lucide-react"
 import { getAuthHeader } from "../lib/auth"
