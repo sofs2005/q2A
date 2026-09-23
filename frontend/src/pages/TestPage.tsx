@@ -3,6 +3,7 @@ import { Button } from "../components/ui/button"
 import { Send, RefreshCw, Bot } from "lucide-react"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
+import { PageShell } from "../components/ui/page-shell"
 import { toast } from "sonner"
 
 // 渲染消息内容：自动把 Markdown 图片和图片 URL 渲染成 <img>
@@ -216,37 +217,31 @@ export default function TestPage() {
   }
 
   return (
-    <div className="w-full space-y-6">
-      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-        <div>
-          <h2 className="text-2xl font-semibold tracking-tight">接口测试</h2>
-          <p className="mt-1 text-sm text-muted-foreground">在此测试您的 API 分发是否正常工作。</p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="flex flex-col gap-1">
-            <div className="flex h-10 items-center gap-2 rounded-md border bg-background px-3 text-sm">
-              <label htmlFor="test-model-select" className="font-medium text-muted-foreground">模型</label>
-              <select
-                id="test-model-select"
-                value={model}
-                onChange={e => setModel(e.target.value)}
-                className="min-w-0 bg-transparent font-mono text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-60"
-                disabled={modelsLoading || models.length === 0}
-              >
-                {modelsLoading ? (
-                  <option value="">加载模型中...</option>
-                ) : models.length > 0 ? (
-                  models.map(item => (
-                    <option key={item} value={item}>
-                      {item}
-                    </option>
-                  ))
-                ) : (
-                  <option value="">暂无可用模型</option>
-                )}
-              </select>
-            </div>
-            {modelsError && <p className="text-xs text-red-600 dark:text-red-400">{modelsError}</p>}
+    <PageShell
+      actions={
+        <>
+          {/* 会话配置：模型与传输方式，与消息舞台分离 */}
+          <div className="flex h-10 items-center gap-2 rounded-md border bg-background px-3 text-sm">
+            <label htmlFor="test-model-select" className="shrink-0 font-medium text-muted-foreground">模型</label>
+            <select
+              id="test-model-select"
+              value={model}
+              onChange={e => setModel(e.target.value)}
+              className="min-w-0 max-w-[12rem] bg-transparent font-mono text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={modelsLoading || models.length === 0}
+            >
+              {modelsLoading ? (
+                <option value="">加载模型中...</option>
+              ) : models.length > 0 ? (
+                models.map(item => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))
+              ) : (
+                <option value="">暂无可用模型</option>
+              )}
+            </select>
           </div>
           {/* 语义化开关：label 关联 checkbox，键盘可用 */}
           <label
@@ -260,66 +255,74 @@ export default function TestPage() {
               onChange={e => setStream(e.target.checked)}
               className="h-4 w-4 cursor-pointer rounded border-input accent-[hsl(var(--primary))]"
             />
-            <span className="font-medium">流式传输 (Stream)</span>
+            <span className="font-medium">流式传输</span>
           </label>
-          <Button variant="outline" onClick={() => setMessages([])}>
+          <Button variant="outline" onClick={() => setMessages([])} disabled={messages.length === 0}>
             <RefreshCw className="mr-2 h-4 w-4" /> 清空对话
           </Button>
-        </div>
-      </div>
+        </>
+      }
+    >
+      <div className="space-y-3">
+        {modelsError && <p className="text-xs text-red-600 dark:text-red-400">{modelsError}</p>}
 
-      <div className="flex h-[calc(100vh-10rem)] flex-col overflow-hidden rounded-xl border bg-card">
-        <div className="flex-1 overflow-y-auto p-6 space-y-6 flex flex-col">
-          {messages.length === 0 && (
-            <div className="h-full flex flex-col items-center justify-center text-muted-foreground space-y-4">
-              <Bot className="h-12 w-12 text-muted-foreground/30" />
-              <p className="text-sm">
-                {modelsError
-                  ? "当前没有可用模型，请先检查 /v1/models 返回值。"
-                  : "发送一条消息以开始测试，系统将通过 /v1/chat/completions 进行调用。"}
-              </p>
-            </div>
-          )}
-          {messages.map((msg, i) => (
-            <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-              <div className={`max-w-[85%] rounded-xl px-4 py-3 text-sm sm:max-w-[80%]
-                ${msg.role === "user"
-                  ? "bg-primary text-primary-foreground"
-                  : msg.error
-                    ? "border border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300"
-                    : "border bg-muted/40 text-foreground"}`}>
-                {msg.role === "assistant" && !msg.content && loading ? (
-                  <span className="animate-pulse flex items-center gap-2 text-muted-foreground">
-                    <Bot className="h-4 w-4" /> 思考中...
-                  </span>
-                ) : msg.role === "assistant" && !msg.error ? (
-                  <MessageContent content={msg.content} />
-                ) : (
-                  <div className="whitespace-pre-wrap leading-relaxed">{msg.content}</div>
-                )}
+        {/* 全高对话舞台：消息区占主体，composer 固定在底部 */}
+        <div className="flex h-[calc(100vh-13rem)] min-h-[26rem] flex-col overflow-hidden rounded-xl border border-border bg-card">
+          <div className="flex flex-1 flex-col space-y-6 overflow-y-auto p-4 sm:p-6">
+            {messages.length === 0 && (
+              <div className="flex h-full flex-col items-center justify-center space-y-4 text-center text-muted-foreground">
+                <Bot className="h-12 w-12 text-muted-foreground/30" aria-hidden="true" />
+                <div className="space-y-1">
+                  <p className="text-sm font-medium text-foreground">开始一轮测试对话</p>
+                  <p className="text-sm">
+                    {modelsError
+                      ? "当前没有可用模型，请先检查 /v1/models 返回值。"
+                      : "发送一条消息，系统将通过 /v1/chat/completions 调用网关。"}
+                  </p>
+                </div>
               </div>
-            </div>
-          ))}
-          <div ref={bottomRef} />
-        </div>
+            )}
+            {messages.map((msg, i) => (
+              <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+                <div className={`max-w-[85%] rounded-xl px-4 py-3 text-sm sm:max-w-[80%]
+                  ${msg.role === "user"
+                    ? "bg-primary text-primary-foreground"
+                    : msg.error
+                      ? "border border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300"
+                      : "border bg-muted/40 text-foreground"}`}>
+                  {msg.role === "assistant" && !msg.content && loading ? (
+                    <span className="flex animate-pulse items-center gap-2 text-muted-foreground">
+                      <Bot className="h-4 w-4" /> 思考中...
+                    </span>
+                  ) : msg.role === "assistant" && !msg.error ? (
+                    <MessageContent content={msg.content} />
+                  ) : (
+                    <div className="whitespace-pre-wrap leading-relaxed">{msg.content}</div>
+                  )}
+                </div>
+              </div>
+            ))}
+            <div ref={bottomRef} />
+          </div>
 
-        <div className="flex items-center gap-3 border-t bg-muted/30 p-3 sm:p-4">
-          <input
-            type="text"
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            onKeyDown={e => e.key === "Enter" && handleSend()}
-            className="flex h-11 w-full min-w-0 rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors placeholder:text-muted-foreground/70 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50 sm:px-4"
-            placeholder="输入测试消息..."
-            aria-label="测试消息"
-            disabled={loading}
-          />
-          <Button onClick={handleSend} disabled={loading || !input.trim() || !model || modelsLoading} className="h-11 shrink-0 gap-2 px-4 sm:px-6">
-            {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-            <span className="hidden sm:inline">{loading ? "发送中" : "发送"}</span>
-          </Button>
+          <div className="flex items-center gap-3 border-t border-border bg-muted/30 p-3 sm:p-4">
+            <input
+              type="text"
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && handleSend()}
+              className="flex h-11 w-full min-w-0 rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors placeholder:text-muted-foreground/70 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50 sm:px-4"
+              placeholder="输入测试消息..."
+              aria-label="测试消息"
+              disabled={loading}
+            />
+            <Button onClick={handleSend} disabled={loading || !input.trim() || !model || modelsLoading} className="h-11 shrink-0 gap-2 px-4 sm:px-6">
+              {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+              <span className="hidden sm:inline">{loading ? "发送中" : "发送"}</span>
+            </Button>
+          </div>
         </div>
       </div>
-    </div>
+    </PageShell>
   )
 }

@@ -8,44 +8,41 @@ function read(path) {
   return readFileSync(new URL(path, root), "utf8")
 }
 
-function rootClass(source) {
-  const match = source.match(/return \([\s\S]*?<div className="([^"]+)"/)
-  assert.ok(match, "expected a root className")
+/** 页面根块必须是纯布局容器：只有间距，不设宽度。 */
+function pageRootClass(source, page) {
+  const match = source.match(/<PageShell[\s\S]*?>\s*<div className="([^"]+)"/)
+  assert.ok(match, `expected ${page} to open a root content div inside PageShell`)
   return match[1]
 }
 
-function topBarClass(source) {
-  const match = source.match(/<div className="([^"]*justify-between[^"]*)">\s*<div>/)
-  assert.ok(match, "expected a top bar className")
-  return match[1]
-}
-
-test("Tokens, Settings, and Test pages share the same page rhythm", () => {
+test("pages share the same content rhythm", () => {
   const pages = [
-    ["pages/TokensPage.tsx", true],
-    ["pages/SettingsPage.tsx", true],
-    ["pages/TestPage.tsx", false],
+    "pages/Dashboard.tsx",
+    "pages/AccountsPage.tsx",
+    "pages/TokensPage.tsx",
+    "pages/SettingsPage.tsx",
+    "pages/ImagePage.tsx",
+    "pages/TestPage.tsx",
+    "pages/VideoPage.tsx",
   ]
 
-  for (const [path] of pages) {
-    const source = read(path)
-    const rootClasses = rootClass(source)
-    assert.match(rootClasses, /(?:^|\s)w-full(?:\s|$)/)
-    assert.match(rootClasses, /(?:^|\s)space-y-6(?:\s|$)/)
-    assert.doesNotMatch(rootClasses, /max-w-/)
-    if (path === "pages/SettingsPage.tsx") {
-      assert.match(source, /className="grid grid-cols-1 gap-6"/)
-    }
-
-    const barClasses = topBarClass(source)
-    assert.match(barClasses, /flex/)
-    assert.match(barClasses, /gap-4/)
-    assert.match(barClasses, /md:flex-row/)
-    assert.match(barClasses, /md:items-start/)
+  for (const page of pages) {
+    const rootClasses = pageRootClass(read(page), page)
+    assert.match(rootClasses, /(?:^|\s)space-y-\d+(?:\s|$)/, `${page} should space its sections`)
+    assert.doesNotMatch(rootClasses, /max-w-/, `${page} should not set its own width`)
   }
 })
 
-test("Settings usage example still scrolls horizontally", () => {
+test("page header band stays sticky and hosts the page description", () => {
+  const source = read("components/ui/page-header.tsx")
+  assert.match(source, /export function PageHeaderBand/)
+  assert.match(source, /sticky top-0/)
+  // 面包屑提供“当前位置”，避免依赖浏览器后退按钮找路。
+  assert.match(source, /aria-label="当前位置"/)
+  assert.match(source, /aria-current="page"/)
+})
+
+test("settings usage example still scrolls horizontally", () => {
   const source = read("pages/SettingsPage.tsx")
   assert.match(source, /overflow-x-auto/)
 })
