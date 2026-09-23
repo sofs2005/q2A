@@ -1,9 +1,11 @@
 import { useState, useEffect } from "react"
-import { Settings2, RefreshCw, KeyRound, ServerCrash, Code } from "lucide-react"
+import { Settings2, RefreshCw, KeyRound, ServerCrash, Code, ShieldCheck } from "lucide-react"
 import { Button } from "../components/ui/button"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
+import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "../components/ui/card"
+import { Input, Textarea, Field, Notice } from "../components/ui/field"
 
 type AdminSettings = {
   version?: string
@@ -16,6 +18,7 @@ export default function SettingsPage() {
   const [sessionKey, setSessionKey] = useState(() => localStorage.getItem("qwen2api_key") || "")
   const [maxInflight, setMaxInflight] = useState(4)
   const [modelAliases, setModelAliases] = useState("")
+  const [loadError, setLoadError] = useState(false)
 
   const fetchSettings = () => {
     fetch(`${API_BASE}/api/admin/settings`, { headers: getAuthHeader() })
@@ -27,8 +30,12 @@ export default function SettingsPage() {
         setSettings(data)
         setMaxInflight(data.max_inflight_per_account || 4)
         setModelAliases(JSON.stringify(data.model_aliases || {}, null, 2))
+        setLoadError(false)
       })
-      .catch(() => toast.error("配置获取失败，请检查会话 Key"))
+      .catch(() => {
+        setLoadError(true)
+        toast.error("配置获取失败，请检查会话 Key")
+      })
   }
 
   useEffect(() => {
@@ -166,124 +173,148 @@ export default function SettingsPage() {
     <div className="w-full space-y-6">
       <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
         <div>
-          <h2 className="text-2xl font-bold tracking-tight">系统设置</h2>
-          <p className="text-muted-foreground">管理控制台认证与网关运行时配置。</p>
+          <h2 className="text-2xl font-semibold tracking-tight">系统设置</h2>
+          <p className="mt-1 text-sm text-muted-foreground">管理控制台认证与网关运行时配置。</p>
         </div>
-        <Button variant="outline" onClick={() => {fetchSettings(); toast.success("配置已刷新")}}>
-          <RefreshCw className="mr-2 h-4 w-4" /> 刷新配置
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="outline" onClick={() => {fetchSettings(); toast.success("配置已刷新")}}>
+            <RefreshCw className="mr-2 h-4 w-4" /> 刷新配置
+          </Button>
+        </div>
       </div>
+
+      {loadError && (
+        <Notice tone="error">
+          无法读取网关配置。请先在下方「当前会话 Key」中填入有效的 API Key 并保存。
+        </Notice>
+      )}
 
       <div className="grid grid-cols-1 gap-6">
         {/* Session Key */}
-        <div className="w-full min-w-0 rounded-xl border bg-card text-card-foreground shadow-sm">
-          <div className="flex flex-col space-y-1.5 p-6 border-b bg-muted/30">
+        <Card>
+          <CardHeader>
             <div className="flex items-center gap-2">
-              <KeyRound className="h-5 w-5 text-primary" />
-              <h3 className="font-semibold leading-none tracking-tight">当前会话 Key</h3>
+              <KeyRound className="h-4 w-4 text-primary" />
+              <CardTitle>当前会话 Key</CardTitle>
             </div>
-            <p className="text-sm text-muted-foreground">将已有的 API Key 粘贴到此处，控制台将使用它进行所有的管理操作。（保存在浏览器本地）</p>
-          </div>
-          <div className="p-6">
-            <div className="flex gap-2 items-center">
-              <input 
-                type="password" 
-                value={sessionKey}
-                onChange={e => setSessionKey(e.target.value)}
-                placeholder="sk-qwen-... 或默认管理员密钥 admin" 
-                className="flex h-10 w-full flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm"
-              />
-              <Button onClick={handleSaveSessionKey}>保存</Button>
-              <Button variant="ghost" onClick={handleClearSessionKey}>清除</Button>
-            </div>
-          </div>
-        </div>
+            <CardDescription>
+              将已有的 API Key 粘贴到此处，控制台将使用它进行所有的管理操作。（保存在浏览器本地）
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Field label="会话 Key">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <Input
+                  type="password"
+                  value={sessionKey}
+                  onChange={e => setSessionKey(e.target.value)}
+                  placeholder="sk-qwen-... 或默认管理员密钥 admin"
+                  className="sm:flex-1"
+                  autoComplete="off"
+                />
+                <div className="flex gap-2">
+                  <Button onClick={handleSaveSessionKey} className="flex-1 sm:flex-none">保存</Button>
+                  <Button variant="ghost" onClick={handleClearSessionKey} className="flex-1 sm:flex-none">清除</Button>
+                </div>
+              </div>
+            </Field>
+          </CardContent>
+        </Card>
 
         {/* Connection Info */}
-        <div className="w-full min-w-0 rounded-xl border bg-card text-card-foreground shadow-sm">
-          <div className="flex flex-col space-y-1.5 p-6 border-b bg-muted/30">
+        <Card>
+          <CardHeader>
             <div className="flex items-center gap-2">
-              <ServerCrash className="h-5 w-5 text-primary" />
-              <h3 className="font-semibold leading-none tracking-tight">连接信息</h3>
+              <ServerCrash className="h-4 w-4 text-primary" />
+              <CardTitle>连接信息</CardTitle>
             </div>
-          </div>
-          <div className="p-6">
-            <div className="space-y-1">
-              <label className="text-sm font-medium">API 基础地址 (Base URL)</label>
-              <input type="text" readOnly value={baseUrl} className="flex h-10 w-full rounded-md border border-input bg-muted px-3 py-2 text-sm font-mono text-muted-foreground" />
-            </div>
-          </div>
-        </div>
+            <CardDescription>下游客户端应使用的网关地址。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Field label="API 基础地址 (Base URL)">
+              <Input readOnly value={baseUrl} className="bg-muted font-mono text-muted-foreground" />
+            </Field>
+          </CardContent>
+        </Card>
 
         {/* Core Settings */}
-        <div className="w-full min-w-0 rounded-xl border bg-card text-card-foreground shadow-sm">
-          <div className="flex flex-col space-y-1.5 p-6 border-b bg-muted/30">
+        <Card>
+          <CardHeader>
             <div className="flex items-center gap-2">
-              <Settings2 className="h-5 w-5 text-primary" />
-              <h3 className="font-semibold leading-none tracking-tight">核心并发参数</h3>
+              <Settings2 className="h-4 w-4 text-primary" />
+              <CardTitle>核心并发参数</CardTitle>
             </div>
-            <p className="text-sm text-muted-foreground">运行时并发槽位与排队阈值（需要在后端 config.json 中修改后重启生效）。</p>
-          </div>
-          <div className="p-6 space-y-4">
-            <div className="flex justify-between items-center py-2 border-b">
-              <div className="space-y-1">
+            <CardDescription>
+              运行时并发槽位与排队阈值（需要在后端 config.json 中修改后重启生效）。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="divide-y divide-border py-0">
+            <div className="flex flex-col gap-2 py-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="h-4 w-4 text-muted-foreground" />
                 <span className="text-sm font-medium">当前系统版本</span>
               </div>
-              <span className="font-mono text-sm">{settings?.version || "..."}</span>
+              <span className="tabular font-mono text-sm text-muted-foreground">{settings?.version || "…"}</span>
             </div>
-            <div className="flex justify-between items-center py-2 border-b">
-              <div className="space-y-1">
+            <div className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0 space-y-1">
                 <span className="text-sm font-medium">单账号最大并发 (max_inflight)</span>
                 <p className="text-xs text-muted-foreground">控制每个上游账号同时处理的请求数量，避免被封禁。</p>
               </div>
-              <div className="flex gap-2 items-center">
-                <input 
-                  type="number" 
-                  min="1" 
-                  max="10" 
-                  value={maxInflight} 
+              <div className="flex shrink-0 items-center gap-2">
+                <Input
+                  type="number"
+                  min="1"
+                  max="10"
+                  value={maxInflight}
                   onChange={e => setMaxInflight(Number(e.target.value))}
-                  className="flex h-8 w-20 rounded-md border border-input bg-background px-3 py-1 text-sm text-center"
+                  className="tabular h-9 w-20 text-center"
+                  aria-label="单账号最大并发"
                 />
                 <Button size="sm" onClick={handleSaveConcurrency}>保存</Button>
               </div>
             </div>
-          </div>
-        </div>
+          </CardContent>
+        </Card>
 
         {/* Model Mapping */}
-        <div className="w-full min-w-0 rounded-xl border bg-card text-card-foreground shadow-sm">
-          <div className="flex flex-col space-y-1.5 p-6 border-b bg-muted/30">
-            <h3 className="font-semibold leading-none tracking-tight">自动模型映射规则 (Model Aliases)</h3>
-            <p className="text-sm text-muted-foreground">下游传入的模型名称将被网关自动路由至以下千问实际模型。请使用标准 JSON 格式编辑。</p>
-          </div>
-          <div className="p-6">
-            <textarea 
+        <Card>
+          <CardHeader>
+            <CardTitle>自动模型映射规则 (Model Aliases)</CardTitle>
+            <CardDescription>
+              下游传入的模型名称将被网关自动路由至以下千问实际模型。请使用标准 JSON 格式编辑。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <Textarea
               rows={8}
               value={modelAliases}
               onChange={e => setModelAliases(e.target.value)}
-              className="flex min-h-[160px] w-full rounded-md border border-input bg-slate-950 text-slate-300 px-3 py-2 text-sm font-mono"
+              className="code-surface min-h-[180px] font-mono"
+              spellCheck={false}
+              aria-label="模型映射 JSON"
             />
-            <div className="mt-4 flex justify-end">
+            <div className="flex justify-end">
               <Button onClick={handleSaveAliases}>保存映射</Button>
             </div>
-          </div>
-        </div>
+          </CardContent>
+        </Card>
 
         {/* Usage Example */}
-        <div className="w-full min-w-0 rounded-xl border bg-card text-card-foreground shadow-sm">
-          <div className="flex flex-col space-y-1.5 p-6 border-b bg-muted/30">
+        <Card>
+          <CardHeader>
             <div className="flex items-center gap-2">
-              <Code className="h-5 w-5 text-primary" />
-              <h3 className="font-semibold leading-none tracking-tight">使用示例</h3>
+              <Code className="h-4 w-4 text-primary" />
+              <CardTitle>使用示例</CardTitle>
             </div>
-          </div>
-          <div className="p-6 min-w-0">
-            <div className="max-w-full min-w-0 overflow-x-auto whitespace-pre rounded-lg bg-slate-950 p-4 text-sm font-mono text-slate-300">
+            <CardDescription>各协议下调用本网关的最小可用请求示例。</CardDescription>
+          </CardHeader>
+          <CardContent className="min-w-0">
+            <div className="code-surface max-w-full min-w-0 overflow-x-auto whitespace-pre rounded-lg p-4 text-sm font-mono">
               {curlExample}
             </div>
-          </div>
-        </div>
+          </CardContent>
+        </Card>
       </div>
     </div>
   )

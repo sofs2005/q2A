@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import { Button } from "../components/ui/button"
-import { Trash2, Plus, RefreshCw, Bot, ShieldCheck, MailWarning, X, Settings } from "lucide-react"
+import { Trash2, Plus, RefreshCw, Bot, ShieldCheck, MailWarning, X, Settings, ChevronDown } from "lucide-react"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
 import { checkRegisterUnlock } from "../lib/registerUnlock"
+import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "../components/ui/card"
+import { StatusBadge, type BadgeTone } from "../components/ui/badge"
+import { Input, Field, Notice } from "../components/ui/field"
 
 type AccountItem = {
   email: string
@@ -103,22 +106,22 @@ function canClearChats(acc: AccountItem) {
   return Boolean(acc.cookies || acc.token)
 }
 
-function statusStyle(code?: string) {
+function statusTone(code?: string): BadgeTone {
   switch (code) {
     case "valid":
-      return "bg-green-500/10 text-green-700 dark:text-green-400 ring-green-500/20"
+      return "success"
     case "pending_activation":
-      return "bg-orange-500/10 text-orange-700 dark:text-orange-400 ring-orange-500/20"
+      return "warning"
     case "rate_limited":
-      return "bg-yellow-500/10 text-yellow-700 dark:text-yellow-300 ring-yellow-500/20"
+      return "warning"
     case "banned":
-      return "bg-red-500/10 text-red-700 dark:text-red-400 ring-red-500/20"
+      return "danger"
     case "disabled":
-      return "bg-slate-500/10 text-slate-700 dark:text-slate-300 ring-slate-500/20"
+      return "neutral"
     case "auth_error":
-      return "bg-slate-500/10 text-slate-700 dark:text-slate-300 ring-slate-500/20"
+      return "neutral"
     default:
-      return "bg-red-500/10 text-red-700 dark:text-red-400 ring-red-500/20"
+      return "danger"
   }
 }
 
@@ -207,6 +210,8 @@ export default function AccountsPage() {
   const [registerUnlocked, setRegisterUnlocked] = useState(false)
   const [verifying, setVerifying] = useState<string | null>(null)
   const [verifyingAll, setVerifyingAll] = useState(false)
+  const [loadFailed, setLoadFailed] = useState(false)
+  const [loaded, setLoaded] = useState(false)
   const [selectedEmails, setSelectedEmails] = useState<string[]>([])
   const [currentPage, setCurrentPage] = useState(1)
   const [pageSize, setPageSize] = useState<(typeof PAGE_SIZE_OPTIONS)[number]>(10)
@@ -248,8 +253,13 @@ export default function AccountsPage() {
         const nextAccounts = data.accounts || []
         setAccounts(nextAccounts)
         setSelectedEmails(prev => prev.filter(email => nextAccounts.some((acc: AccountItem) => acc.email === email)))
+        setLoadFailed(false)
       })
-      .catch(() => toast.error("刷新账号列表失败，请检查会话密钥"))
+      .catch(() => {
+        setLoadFailed(true)
+        toast.error("刷新账号列表失败，请检查会话密钥")
+      })
+      .finally(() => setLoaded(true))
   }
 
   useEffect(() => {
@@ -758,16 +768,107 @@ export default function AccountsPage() {
   const actionsBusy = personalizationBusy || statusActionBusy
   const selectedCount = selectedEmails.length
 
+  const statCards = [
+    { label: "可用", value: stats.valid, tone: "success" as BadgeTone },
+    { label: "未激活", value: stats.pending, tone: "warning" as BadgeTone },
+    { label: "限流", value: stats.rateLimited, tone: "warning" as BadgeTone },
+    { label: "封禁", value: stats.banned, tone: "danger" as BadgeTone },
+    { label: "已禁用", value: stats.disabled, tone: "neutral" as BadgeTone },
+    { label: "其他失效", value: stats.invalid, tone: "danger" as BadgeTone },
+  ]
+
+  const renderRowActions = (acc: AccountItem) => {
+    const clearDisabled = !canClearChats(acc)
+    const showActivate =
+      acc.status_code !== "disabled" &&
+      acc.status_code !== "valid" &&
+      acc.status_code !== "rate_limited" &&
+      acc.status_code !== "banned"
+
+    return (
+      <>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => openSinglePersonalization(acc.email)}
+          disabled={personalizationBusy || personalizationLoading || actionsBusy || clearDisabled}
+          title={clearDisabled ? "缺少 cookies 和 token，无法设置" : "管理该账号的设置"}
+        >
+          <Settings className="mr-1 h-4 w-4" /> 账号设置
+        </Button>
+        {acc.status_code === "disabled" ? (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => runAccountStatusChange("enable", acc.email)}
+            disabled={actionsBusy}
+          >
+            {statusChangingEmail === acc.email && statusChangingAction === "enable"
+              ? <RefreshCw className="mr-1 h-4 w-4 animate-spin" />
+              : <ShieldCheck className="mr-1 h-4 w-4" />}
+            启用
+          </Button>
+        ) : (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => runAccountStatusChange("disable", acc.email)}
+            disabled={actionsBusy}
+          >
+            {statusChangingEmail === acc.email && statusChangingAction === "disable"
+              ? <RefreshCw className="mr-1 h-4 w-4 animate-spin" />
+              : <X className="mr-1 h-4 w-4" />}
+            禁用
+          </Button>
+        )}
+        {showActivate && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => handleActivate(acc.email)}
+            className="border-orange-500/30 font-medium text-orange-700 hover:bg-orange-500/10 dark:text-orange-300"
+          >
+            <MailWarning className="mr-1 h-4 w-4" /> 激活
+          </Button>
+        )}
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => handleVerify(acc.email)}
+          disabled={verifying === acc.email || actionsBusy}
+          title="单独验证"
+          aria-label={`验证账号 ${acc.email}`}
+        >
+          {verifying === acc.email
+            ? <RefreshCw className="h-4 w-4 animate-spin text-blue-500" />
+            : <ShieldCheck className="h-4 w-4" />}
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => handleDelete(acc.email)}
+          className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+          title="删除账号"
+          aria-label={`删除账号 ${acc.email}`}
+        >
+          <Trash2 className="h-4 w-4" />
+        </Button>
+      </>
+    )
+  }
+
   return (
-    <div className="space-y-6 relative">
-      <div className="flex justify-between items-center">
-        <div>
-          <h2 className="text-3xl font-extrabold tracking-tight">{"账号管理"}</h2>
-          <p className="text-muted-foreground mt-1">{"统一管理上游账号池，并区分未激活、限流、封禁、已禁用与失效状态。"}</p>
+    <div className="w-full space-y-6">
+      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+        <div className="min-w-0">
+          <h2 className="text-2xl font-semibold tracking-tight">账号管理</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            统一管理上游账号池，并区分未激活、限流、封禁、已禁用与失效状态。
+          </p>
         </div>
-        <div className="flex gap-2 flex-wrap justify-end">
-          <Button variant="secondary" onClick={handleVerifyAll} disabled={verifyingAll}>
-            <ShieldCheck className={`mr-2 h-4 w-4 ${verifyingAll ? 'animate-pulse' : ''}`} /> {"全量巡检"}
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="outline" onClick={handleVerifyAll} disabled={verifyingAll}>
+            <ShieldCheck className={`mr-2 h-4 w-4 ${verifyingAll ? "animate-pulse" : ""}`} /> 全量巡检
           </Button>
           <div className="relative">
             <Button
@@ -778,29 +879,35 @@ export default function AccountsPage() {
               aria-haspopup="menu"
               aria-expanded={statusBatchMenuOpen}
             >
-              <ShieldCheck className="mr-2 h-4 w-4" /> {`批量启停 (${selectedCount})`}
+              <ShieldCheck className="mr-2 h-4 w-4" /> 批量启停 ({selectedCount})
+              <ChevronDown className="ml-1.5 h-3.5 w-3.5" />
             </Button>
             {statusBatchMenuOpen && (
-              <div className="absolute right-0 z-20 mt-2 w-44 rounded-xl border bg-background p-2 shadow-lg">
+              <div
+                role="menu"
+                className="absolute right-0 z-20 mt-2 w-48 rounded-xl border bg-popover p-1.5 shadow-lg"
+              >
                 <Button
                   variant="ghost"
                   size="sm"
+                  role="menuitem"
                   className="w-full justify-start"
                   onClick={() => runAccountStatusChange("enable")}
                   disabled={disabledSelectedEmails.length === 0}
                   title={disabledSelectedEmails.length > 0 ? "批量启用所选账号" : "所选账号中没有已禁用账号"}
                 >
-                  <ShieldCheck className="mr-2 h-4 w-4" /> {`批量启用 (${disabledSelectedEmails.length})`}
+                  <ShieldCheck className="mr-2 h-4 w-4" /> 批量启用 ({disabledSelectedEmails.length})
                 </Button>
                 <Button
                   variant="ghost"
                   size="sm"
+                  role="menuitem"
                   className="w-full justify-start"
                   onClick={() => runAccountStatusChange("disable")}
                   disabled={enabledSelectedEmails.length === 0}
                   title={enabledSelectedEmails.length > 0 ? "批量禁用所选账号" : "所选账号中没有未禁用账号"}
                 >
-                  <X className="mr-2 h-4 w-4" /> {`批量禁用 (${enabledSelectedEmails.length})`}
+                  <X className="mr-2 h-4 w-4" /> 批量禁用 ({enabledSelectedEmails.length})
                 </Button>
               </div>
             )}
@@ -811,13 +918,13 @@ export default function AccountsPage() {
             disabled={personalizationLoading || personalizationBusy || statusActionBusy || clearableSelectedEmails.length === 0}
             title={clearableSelectedEmails.length > 0 ? "管理所选账号的设置" : "请先勾选可设置的账号"}
           >
-            <Settings className="mr-2 h-4 w-4" /> {`批量账号设置 (${clearableSelectedEmails.length})`}
+            <Settings className="mr-2 h-4 w-4" /> 批量账号设置 ({clearableSelectedEmails.length})
           </Button>
           <Button variant="outline" onClick={() => { fetchAccounts(); toast.success("账号列表已刷新") }}>
-            <RefreshCw className="mr-2 h-4 w-4" /> {"刷新状态"}
+            <RefreshCw className="mr-2 h-4 w-4" /> 刷新状态
           </Button>
           {registerUnlocked && (
-            <Button variant="default" onClick={handleAutoRegister} disabled={registering}>
+            <Button onClick={handleAutoRegister} disabled={registering}>
               {registering ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" /> : <Bot className="mr-2 h-4 w-4" />}
               {registering ? "正在注册..." : "一键获取新号"}
             </Button>
@@ -825,191 +932,215 @@ export default function AccountsPage() {
         </div>
       </div>
 
-      <div className="grid gap-3 md:grid-cols-6">
-        <div className="rounded-xl border bg-card p-4"><div className="text-sm text-muted-foreground">{"可用"}</div><div className="text-2xl font-bold">{stats.valid}</div></div>
-        <div className="rounded-xl border bg-card p-4"><div className="text-sm text-muted-foreground">{"未激活"}</div><div className="text-2xl font-bold">{stats.pending}</div></div>
-        <div className="rounded-xl border bg-card p-4"><div className="text-sm text-muted-foreground">{"限流"}</div><div className="text-2xl font-bold">{stats.rateLimited}</div></div>
-        <div className="rounded-xl border bg-card p-4"><div className="text-sm text-muted-foreground">{"封禁"}</div><div className="text-2xl font-bold">{stats.banned}</div></div>
-        <div className="rounded-xl border bg-card p-4"><div className="text-sm text-muted-foreground">{"已禁用"}</div><div className="text-2xl font-bold">{stats.disabled}</div></div>
-        <div className="rounded-xl border bg-card p-4"><div className="text-sm text-muted-foreground">{"其他失效"}</div><div className="text-2xl font-bold">{stats.invalid}</div></div>
+      {/* 状态摘要 */}
+      {loadFailed && (
+        <Notice tone="error">
+          无法读取账号列表。请在「系统设置」中确认当前会话 Key 是否正确。
+        </Notice>
+      )}
+
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+        {statCards.map(stat => (
+          <Card key={stat.label} className="px-4 py-3">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-medium text-muted-foreground">{stat.label}</span>
+              <span
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                  stat.tone === "success"
+                    ? "bg-emerald-500"
+                    : stat.tone === "warning"
+                      ? "bg-amber-500"
+                      : stat.tone === "danger"
+                        ? "bg-red-500"
+                        : "bg-muted-foreground/40"
+                }`}
+                aria-hidden="true"
+              />
+            </div>
+            <div className="tabular mt-1.5 text-2xl font-semibold tracking-tight">{stat.value}</div>
+          </Card>
+        ))}
       </div>
 
-      <div className="rounded-2xl border bg-card/40 p-6 space-y-4">
-        <div>
-          <h3 className="text-base font-bold">{"添加账号"}</h3>
-          <p className="text-sm text-muted-foreground">{"填写账号邮箱和密码，系统将自动登录并获取 Token。"}</p>
-        </div>
-        <div className="flex flex-col md:flex-row gap-4 items-end">
-          <div className="flex-1 w-full">
-            <label className="text-xs font-semibold mb-1.5 block">{"邮箱"}</label>
-            <input type="text" value={email} onChange={e => setEmail(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder={"账号邮箱地址"} />
+      {/* 添加账号 */}
+      <Card>
+        <CardHeader>
+          <CardTitle>添加账号</CardTitle>
+          <CardDescription>填写账号邮箱和密码，系统将自动登录并获取 Token。</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="flex flex-col gap-4 md:flex-row md:items-end">
+            <Field label="邮箱" className="w-full md:flex-1">
+              <Input
+                type="text"
+                value={email}
+                onChange={e => setEmail(e.target.value)}
+                placeholder="账号邮箱地址"
+                autoComplete="off"
+              />
+            </Field>
+            <Field label="密码" className="w-full md:flex-1">
+              <Input
+                type="password"
+                value={password}
+                onChange={e => setPassword(e.target.value)}
+                placeholder="账号密码"
+                autoComplete="new-password"
+              />
+            </Field>
+            <Button onClick={handleAdd} variant="secondary" className="h-10 w-full font-medium md:w-auto">
+              <Plus className="mr-2 h-4 w-4" /> 添加账号
+            </Button>
           </div>
-          <div className="flex-1 w-full">
-            <label className="text-xs font-semibold mb-1.5 block">{"密码"}</label>
-            <input type="password" value={password} onChange={e => setPassword(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder={"账号密码"} />
-          </div>
-          <Button onClick={handleAdd} variant="secondary" className="h-10 w-full md:w-auto font-semibold">
-            <Plus className="mr-2 h-4 w-4" /> {"添加账号"}
-          </Button>
-        </div>
-      </div>
+        </CardContent>
+      </Card>
 
-      <div className="rounded-2xl border bg-card/30 overflow-hidden">
-        <div className="flex items-center justify-between p-6 border-b bg-muted/10">
-          <h3 className="text-xl font-bold">{"账号列表"}</h3>
-          <span className="inline-flex items-center justify-center bg-primary/10 text-primary rounded-full px-3 py-1 text-xs font-bold">{accounts.length}</span>
+      {/* 账号列表 */}
+      <Card className="overflow-hidden">
+        <div className="flex items-center justify-between gap-3 border-b bg-muted/40 px-5 py-4">
+          <div className="flex items-center gap-2">
+            <CardTitle>账号列表</CardTitle>
+            <StatusBadge tone="accent" className="tabular">{accounts.length}</StatusBadge>
+          </div>
+          {selectedCount > 0 && (
+            <span className="text-xs text-muted-foreground">
+              已选 <span className="tabular font-medium text-foreground">{selectedCount}</span> 个账号
+            </span>
+          )}
         </div>
-        <table className="w-full text-sm text-left">
-          <thead className="bg-muted/30 border-b text-muted-foreground text-xs uppercase tracking-wider font-semibold">
-            <tr>
-              <th className="h-12 px-6 align-middle w-12">
-                <input
-                  ref={pageSelectAllRef}
-                  type="checkbox"
-                  checked={isCurrentPageAllSelected}
-                  onChange={toggleCurrentPageSelection}
-                  aria-label="选择当前页账号"
-                  disabled={currentPageEmails.length === 0 || actionsBusy}
-                  className="h-4 w-4 rounded border-input"
-                />
-              </th>
-              <th className="h-12 px-6 align-middle w-20">{"序号"}</th>
-              <th className="h-12 px-6 align-middle">{"账号"}</th>
-              <th className="h-12 px-6 align-middle">{"状态"}</th>
-              <th className="h-12 px-6 align-middle">{"并发负载"}</th>
-              <th className="h-12 px-6 align-middle text-right">{"操作"}</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-border/50">
-            {accounts.length === 0 && (
+
+        {/* 桌面端表格 */}
+        <div className="hidden overflow-x-auto md:block">
+          <table className="w-full text-left text-sm">
+            <thead className="border-b bg-muted/30 text-xs font-medium text-muted-foreground">
               <tr>
-                <td colSpan={6} className="px-6 py-12 text-center text-muted-foreground">{"暂无账号，请手动注入或一键获取新号。"}</td>
+                <th scope="col" className="h-11 w-12 px-5 align-middle">
+                  <input
+                    ref={pageSelectAllRef}
+                    type="checkbox"
+                    checked={isCurrentPageAllSelected}
+                    onChange={toggleCurrentPageSelection}
+                    aria-label="选择当前页账号"
+                    disabled={currentPageEmails.length === 0 || actionsBusy}
+                    className="h-4 w-4 rounded border-input accent-[hsl(var(--primary))]"
+                  />
+                </th>
+                <th scope="col" className="h-11 w-16 px-5 align-middle">序号</th>
+                <th scope="col" className="h-11 px-5 align-middle">账号</th>
+                <th scope="col" className="h-11 px-5 align-middle">状态</th>
+                <th scope="col" className="h-11 px-5 align-middle">并发负载</th>
+                <th scope="col" className="h-11 px-5 text-right align-middle">操作</th>
               </tr>
-            )}
-            {pagedAccounts.map((acc, index) => {
-              const clearDisabled = !canClearChats(acc)
-              const rowNumber = pageStartIndex + index + 1
-
-              return (
-                <tr key={acc.email} className="transition-colors hover:bg-black/5 dark:hover:bg-white/5">
-                  <td className="px-6 py-4 align-middle">
-                    <input
-                      type="checkbox"
-                      checked={selectedEmails.includes(acc.email)}
-                      onChange={() => toggleSelectedEmail(acc.email)}
-                      aria-label={`选择 ${acc.email}`}
-                      disabled={actionsBusy}
-                      className="h-4 w-4 rounded border-input"
-                    />
-                  </td>
-                  <td className="px-6 py-4 align-middle font-mono text-muted-foreground">{rowNumber}</td>
-                  <td className="px-6 py-4 align-middle font-medium font-mono text-foreground/90">{acc.email}</td>
-                  <td className="px-6 py-4 align-middle">
-                    <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-bold ring-1 ${statusStyle(acc.status_code)}`}>
-                      {statusText(acc)}
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 align-middle font-mono">
-                    <span className="inline-flex items-center justify-center bg-muted/50 px-2 py-1 rounded text-xs border">
-                      {acc.inflight || 0} {"线程"}
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 align-middle text-right">
-                    <div className="flex items-center justify-end gap-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => openSinglePersonalization(acc.email)}
-                        disabled={personalizationBusy || personalizationLoading || actionsBusy || clearDisabled}
-                        title={clearDisabled ? "缺少 cookies 和 token，无法设置" : "管理该账号的设置"}
-                      >
-                        <Settings className="h-4 w-4 mr-1" /> {"账号设置"}
-                      </Button>
-                      {acc.status_code === "disabled" ? (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => runAccountStatusChange("enable", acc.email)}
-                          disabled={actionsBusy}
-                          className="text-slate-700 dark:text-slate-300 border-slate-500/30 hover:bg-slate-500/10 font-medium"
-                        >
-                          {statusChangingEmail === acc.email && statusChangingAction === "enable"
-                            ? <RefreshCw className="h-4 w-4 mr-1 animate-spin" />
-                            : <ShieldCheck className="h-4 w-4 mr-1" />}
-                          {"启用"}
-                        </Button>
-                      ) : (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => runAccountStatusChange("disable", acc.email)}
-                          disabled={actionsBusy}
-                          className="text-slate-700 dark:text-slate-300 border-slate-500/30 hover:bg-slate-500/10 font-medium"
-                        >
-                          {statusChangingEmail === acc.email && statusChangingAction === "disable"
-                            ? <RefreshCw className="h-4 w-4 mr-1 animate-spin" />
-                            : <X className="h-4 w-4 mr-1" />}
-                          {"禁用"}
-                        </Button>
-                      )}
-                      {acc.status_code !== "disabled" && acc.status_code !== "valid" && acc.status_code !== "rate_limited" && acc.status_code !== "banned" && (
-                        <Button variant="outline" size="sm" onClick={() => handleActivate(acc.email)} className="text-orange-600 dark:text-orange-400 border-orange-500/30 hover:bg-orange-500/10 font-medium">
-                          <MailWarning className="h-4 w-4 mr-1" /> {"激活"}
-                        </Button>
-                      )}
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => handleVerify(acc.email)}
-                        disabled={verifying === acc.email || actionsBusy}
-                        title={"单独验证"}
-                        aria-label={`验证账号 ${acc.email}`}
-                      >
-                        {verifying === acc.email ? <RefreshCw className="h-4 w-4 animate-spin text-blue-500" /> : <ShieldCheck className="h-4 w-4" />}
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => handleDelete(acc.email)}
-                        className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-                        title={"删除账号"}
-                        aria-label={`删除账号 ${acc.email}`}
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </div>
+            </thead>
+            <tbody className="divide-y divide-border">
+              {accounts.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="px-5 py-14 text-center text-muted-foreground">
+                    {loaded ? "暂无账号，请手动注入或一键获取新号。" : "正在加载账号列表…"}
                   </td>
                 </tr>
-              )
-            })}
-          </tbody>
-        </table>
-        <div className="flex flex-col gap-3 border-t bg-muted/10 px-6 py-4 text-sm text-muted-foreground md:flex-row md:items-center md:justify-between">
-          <div>
+              )}
+              {pagedAccounts.map((acc, index) => {
+                const rowNumber = pageStartIndex + index + 1
+
+                return (
+                  <tr key={acc.email} className="transition-colors hover:bg-muted/40">
+                    <td className="px-5 py-3 align-middle">
+                      <input
+                        type="checkbox"
+                        checked={selectedEmails.includes(acc.email)}
+                        onChange={() => toggleSelectedEmail(acc.email)}
+                        aria-label={`选择 ${acc.email}`}
+                        disabled={actionsBusy}
+                        className="h-4 w-4 rounded border-input accent-[hsl(var(--primary))]"
+                      />
+                    </td>
+                    <td className="tabular px-5 py-3 align-middle font-mono text-xs text-muted-foreground">{rowNumber}</td>
+                    <td className="px-5 py-3 align-middle font-mono text-sm text-foreground">{acc.email}</td>
+                    <td className="px-5 py-3 align-middle">
+                      <StatusBadge tone={statusTone(acc.status_code)}>{statusText(acc)}</StatusBadge>
+                    </td>
+                    <td className="tabular px-5 py-3 align-middle font-mono text-xs text-muted-foreground">
+                      {acc.inflight || 0} 线程
+                    </td>
+                    <td className="px-5 py-3 align-middle">
+                      <div className="flex items-center justify-end gap-1.5">
+                        {renderRowActions(acc)}
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        {/* 移动端卡片：同一份数据与操作，避免表格在窄屏被裁切 */}
+        <div className="divide-y divide-border md:hidden">
+          {accounts.length === 0 && (
+            <p className="px-4 py-12 text-center text-sm text-muted-foreground">
+              {loaded ? "暂无账号，请手动注入或一键获取新号。" : "正在加载账号列表…"}
+            </p>
+          )}
+          {pagedAccounts.map((acc, index) => {
+            const rowNumber = pageStartIndex + index + 1
+
+            return (
+              <div key={acc.email} className="space-y-3 px-4 py-4">
+                <div className="flex items-start gap-3">
+                  <input
+                    type="checkbox"
+                    checked={selectedEmails.includes(acc.email)}
+                    onChange={() => toggleSelectedEmail(acc.email)}
+                    aria-label={`选择 ${acc.email}`}
+                    disabled={actionsBusy}
+                    className="mt-0.5 h-4 w-4 shrink-0 rounded border-input accent-[hsl(var(--primary))]"
+                  />
+                  <div className="min-w-0 flex-1 space-y-2">
+                    <div className="flex items-start justify-between gap-2">
+                      <span className="min-w-0 break-all font-mono text-sm text-foreground">{acc.email}</span>
+                      <span className="tabular shrink-0 font-mono text-xs text-muted-foreground">#{rowNumber}</span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <StatusBadge tone={statusTone(acc.status_code)}>{statusText(acc)}</StatusBadge>
+                      <StatusBadge tone="neutral" className="tabular font-mono">{acc.inflight || 0} 线程</StatusBadge>
+                    </div>
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {renderRowActions(acc)}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+
+        <div className="flex flex-col gap-3 border-t bg-muted/30 px-5 py-4 text-sm text-muted-foreground md:flex-row md:items-center md:justify-between">
+          <div className="tabular">
             {accounts.length > 0
               ? `显示第 ${pageStartIndex + 1}-${pageEndIndex} 条，共 ${accounts.length} 条`
               : "共 0 条账号"}
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <label className="flex items-center gap-2">
-              <span>{"每页"}</span>
+              <span>每页</span>
               <select
                 value={pageSize}
                 onChange={event => changePageSize(Number(event.target.value))}
-                className="h-9 rounded-md border border-input bg-background px-2 text-sm text-foreground"
+                className="h-9 rounded-md border border-input bg-background px-2 text-sm text-foreground focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
                 aria-label="每页账号数量"
               >
                 {PAGE_SIZE_OPTIONS.map(option => (
                   <option key={option} value={option}>{option}</option>
                 ))}
               </select>
-              <span>{"条"}</span>
+              <span>条</span>
             </label>
             <div className="flex items-center gap-2">
               <Button variant="outline" size="sm" onClick={() => goToPage(safeCurrentPage - 1)} disabled={safeCurrentPage <= 1}>
                 上一页
               </Button>
-              <span className="min-w-20 text-center text-foreground">
+              <span className="tabular min-w-20 text-center text-foreground">
                 {safeCurrentPage} / {totalPages}
               </span>
               <Button variant="outline" size="sm" onClick={() => goToPage(safeCurrentPage + 1)} disabled={safeCurrentPage >= totalPages}>
@@ -1018,13 +1149,13 @@ export default function AccountsPage() {
             </div>
           </div>
         </div>
-      </div>
+      </Card>
 
       {personalizationTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4" onClick={closePersonalizationModal}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4 py-6" onClick={closePersonalizationModal}>
           <div
             ref={personalizationModalRef}
-            className="w-full max-w-3xl rounded-2xl border bg-background p-6 shadow-2xl max-h-[90vh] overflow-y-auto"
+            className="max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-2xl border bg-background p-5 shadow-xl sm:p-6"
             onClick={e => e.stopPropagation()}
             role="dialog"
             aria-modal="true"
@@ -1033,7 +1164,7 @@ export default function AccountsPage() {
           >
             <div className="flex items-start justify-between gap-4">
               <div>
-                <h4 id={PERSONALIZATION_MODAL_TITLE_ID} className="text-lg font-bold">
+                <h4 id={PERSONALIZATION_MODAL_TITLE_ID} className="text-base font-semibold">
                   {personalizationTarget.kind === "batch"
                     ? `管理所选 ${personalizationTarget.emails.length} 个账号的个性化设置`
                     : `管理 ${personalizationTarget.email} 的个性化设置`}
@@ -1044,19 +1175,19 @@ export default function AccountsPage() {
                     : `目标账号：${personalizationTarget.email}`}
                 </p>
               </div>
-              <Button variant="ghost" size="sm" onClick={closePersonalizationModal} disabled={personalizationBusy} aria-label="关闭个性化设置弹窗">
+              <Button variant="ghost" size="icon" onClick={closePersonalizationModal} disabled={personalizationBusy} aria-label="关闭个性化设置弹窗">
                 <X className="h-4 w-4" />
               </Button>
             </div>
 
             <div className="mt-5 space-y-4">
-              <section className="rounded-xl border bg-muted/20 p-4">
-                <h5 className="text-sm font-semibold">{"记忆设置"}</h5>
-                <div className="mt-3 space-y-3">
+              <section className="rounded-xl border bg-muted/30 p-4">
+                <h5 className="text-sm font-semibold">记忆设置</h5>
+                <div className="mt-3 space-y-2">
                   <label className="flex items-center justify-between gap-4 rounded-lg border bg-background px-3 py-2 text-sm">
                     <span>
-                      <span className="font-medium">{"启用记忆"}</span>
-                      <span className="ml-2 text-xs text-muted-foreground">{"让账号保留长期记忆"}</span>
+                      <span className="font-medium">启用记忆</span>
+                      <span className="ml-2 text-xs text-muted-foreground">让账号保留长期记忆</span>
                     </span>
                     <input
                       type="checkbox"
@@ -1069,13 +1200,13 @@ export default function AccountsPage() {
                         },
                       }))}
                       disabled={personalizationBusy}
-                      className="h-4 w-4 rounded border-input"
+                      className="h-4 w-4 shrink-0 rounded border-input accent-[hsl(var(--primary))]"
                     />
                   </label>
                   <label className="flex items-center justify-between gap-4 rounded-lg border bg-background px-3 py-2 text-sm">
                     <span>
-                      <span className="font-medium">{"启用历史记忆"}</span>
-                      <span className="ml-2 text-xs text-muted-foreground">{"让账号保留历史上下文记忆"}</span>
+                      <span className="font-medium">启用历史记忆</span>
+                      <span className="ml-2 text-xs text-muted-foreground">让账号保留历史上下文记忆</span>
                     </span>
                     <input
                       type="checkbox"
@@ -1088,22 +1219,22 @@ export default function AccountsPage() {
                         },
                       }))}
                       disabled={personalizationBusy}
-                      className="h-4 w-4 rounded border-input"
+                      className="h-4 w-4 shrink-0 rounded border-input accent-[hsl(var(--primary))]"
                     />
                   </label>
                 </div>
               </section>
 
-              <section className="rounded-xl border bg-muted/20 p-4">
-                <h5 className="text-sm font-semibold">{"工具设置"}</h5>
-                <p className="mt-1 text-xs text-muted-foreground">{"共 9 个工具开关，保存时会按当前勾选状态同步到目标账号。"}</p>
-                <div className="mt-3 grid gap-3 md:grid-cols-2">
+              <section className="rounded-xl border bg-muted/30 p-4">
+                <h5 className="text-sm font-semibold">工具设置</h5>
+                <p className="mt-1 text-xs text-muted-foreground">共 9 个工具开关，保存时会按当前勾选状态同步到目标账号。</p>
+                <div className="mt-3 grid gap-2 md:grid-cols-2">
                   {PERSONALIZATION_TOOL_OPTIONS.map(option => (
-                    <label key={option.key} className="flex items-center justify-between gap-4 rounded-lg border bg-background px-3 py-2 text-sm">
+                    <label key={option.key} className="flex items-start justify-between gap-4 rounded-lg border bg-background px-3 py-2 text-sm">
                       <span className="min-w-0">
                         <span className="block font-medium">{option.label}</span>
                         <span className="block text-xs text-muted-foreground">{option.description}</span>
-                        <span className="block truncate text-[11px] font-mono text-muted-foreground/70">{option.key}</span>
+                        <span className="block truncate font-mono text-[11px] text-muted-foreground/70">{option.key}</span>
                       </span>
                       <input
                         type="checkbox"
@@ -1116,16 +1247,16 @@ export default function AccountsPage() {
                           },
                         }))}
                         disabled={personalizationBusy}
-                        className="h-4 w-4 rounded border-input"
+                        className="mt-0.5 h-4 w-4 shrink-0 rounded border-input accent-[hsl(var(--primary))]"
                       />
                     </label>
                   ))}
                 </div>
               </section>
 
-              <section className="rounded-xl border border-red-500/20 bg-red-500/5 p-4">
-                <h5 className="text-sm font-semibold text-red-700 dark:text-red-300">{"清空上游记录"}</h5>
-                <p className="mt-1 text-xs text-red-700/80 dark:text-red-200/80">
+              <section className="rounded-xl border border-destructive/25 bg-destructive/5 p-4">
+                <h5 className="text-sm font-semibold text-destructive">清空上游记录</h5>
+                <p className="mt-1 text-xs text-destructive/80">
                   {personalizationTarget.kind === "batch"
                     ? `如需清理所选 ${personalizationTarget.emails.length} 个账号的上游聊天记录，请输入确认短语。`
                     : `如需清理 ${personalizationTarget.email} 的上游聊天记录，请输入确认短语。`}
@@ -1133,7 +1264,7 @@ export default function AccountsPage() {
                 <label
                   htmlFor={PERSONALIZATION_MODAL_CONFIRM_INPUT_ID}
                   id={PERSONALIZATION_MODAL_CONFIRM_HELP_ID}
-                  className="mt-3 block text-sm font-medium text-red-700 dark:text-red-300"
+                  className="mt-3 block text-sm font-medium text-destructive"
                 >
                   {`请输入「${CLEAR_CONFIRM_TEXT}」以确认执行清理操作。`}
                 </label>
@@ -1143,7 +1274,7 @@ export default function AccountsPage() {
                   value={personalizationPhrase}
                   onChange={e => setPersonalizationPhrase(e.target.value)}
                   disabled={personalizationBusy}
-                  className="mt-3 flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  className="mt-3 flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
                   placeholder={CLEAR_CONFIRM_TEXT}
                   aria-describedby={PERSONALIZATION_MODAL_CONFIRM_HELP_ID}
                 />

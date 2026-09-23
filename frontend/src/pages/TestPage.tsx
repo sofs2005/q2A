@@ -219,17 +219,18 @@ export default function TestPage() {
     <div className="w-full space-y-6">
       <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
         <div>
-          <h2 className="text-2xl font-bold tracking-tight">接口测试</h2>
-          <p className="text-muted-foreground">在此测试您的 API 分发是否正常工作。</p>
+          <h2 className="text-2xl font-semibold tracking-tight">接口测试</h2>
+          <p className="mt-1 text-sm text-muted-foreground">在此测试您的 API 分发是否正常工作。</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <div className="flex flex-col gap-1">
-            <div className="flex items-center gap-2 text-sm bg-card border px-3 py-1.5 rounded-md">
-              <span className="font-medium text-muted-foreground">模型:</span>
+            <div className="flex h-10 items-center gap-2 rounded-md border bg-background px-3 text-sm">
+              <label htmlFor="test-model-select" className="font-medium text-muted-foreground">模型</label>
               <select
+                id="test-model-select"
                 value={model}
                 onChange={e => setModel(e.target.value)}
-                className="bg-transparent font-mono outline-none"
+                className="min-w-0 bg-transparent font-mono text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-60"
                 disabled={modelsLoading || models.length === 0}
               >
                 {modelsLoading ? (
@@ -245,22 +246,29 @@ export default function TestPage() {
                 )}
               </select>
             </div>
-            {modelsError && <p className="text-xs text-red-500">{modelsError}</p>}
+            {modelsError && <p className="text-xs text-red-600 dark:text-red-400">{modelsError}</p>}
           </div>
-          <div
-            className="flex items-center gap-2 text-sm bg-card border px-3 py-1.5 rounded-md cursor-pointer"
-            onClick={() => setStream(!stream)}
+          {/* 语义化开关：label 关联 checkbox，键盘可用 */}
+          <label
+            htmlFor="test-stream-toggle"
+            className="flex h-10 cursor-pointer items-center gap-2 rounded-md border bg-background px-3 text-sm transition-colors hover:bg-accent focus-within:ring-2 focus-within:ring-ring/40"
           >
-            <input type="checkbox" checked={stream} onChange={() => {}} className="cursor-pointer" />
+            <input
+              id="test-stream-toggle"
+              type="checkbox"
+              checked={stream}
+              onChange={e => setStream(e.target.checked)}
+              className="h-4 w-4 cursor-pointer rounded border-input accent-[hsl(var(--primary))]"
+            />
             <span className="font-medium">流式传输 (Stream)</span>
-          </div>
+          </label>
           <Button variant="outline" onClick={() => setMessages([])}>
             <RefreshCw className="mr-2 h-4 w-4" /> 清空对话
           </Button>
         </div>
       </div>
 
-      <div className="flex h-[calc(100vh-10rem)] flex-col overflow-hidden rounded-xl border bg-card shadow-sm">
+      <div className="flex h-[calc(100vh-10rem)] flex-col overflow-hidden rounded-xl border bg-card">
         <div className="flex-1 overflow-y-auto p-6 space-y-6 flex flex-col">
           {messages.length === 0 && (
             <div className="h-full flex flex-col items-center justify-center text-muted-foreground space-y-4">
@@ -274,12 +282,12 @@ export default function TestPage() {
           )}
           {messages.map((msg, i) => (
             <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-              <div className={`max-w-[80%] rounded-xl px-4 py-3 text-sm shadow-sm
+              <div className={`max-w-[85%] rounded-xl px-4 py-3 text-sm sm:max-w-[80%]
                 ${msg.role === "user"
                   ? "bg-primary text-primary-foreground"
                   : msg.error
-                    ? "bg-red-500/10 border border-red-500/30 text-red-400"
-                    : "bg-muted/30 border text-foreground"}`}>
+                    ? "border border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300"
+                    : "border bg-muted/40 text-foreground"}`}>
                 {msg.role === "assistant" && !msg.content && loading ? (
                   <span className="animate-pulse flex items-center gap-2 text-muted-foreground">
                     <Bot className="h-4 w-4" /> 思考中...
@@ -295,18 +303,20 @@ export default function TestPage() {
           <div ref={bottomRef} />
         </div>
 
-        <div className="p-4 border-t bg-muted/30 flex gap-3 items-center">
+        <div className="flex items-center gap-3 border-t bg-muted/30 p-3 sm:p-4">
           <input
             type="text"
             value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={e => e.key === "Enter" && handleSend()}
-            className="flex h-12 w-full rounded-md border border-input bg-background px-4 py-2 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+            className="flex h-11 w-full min-w-0 rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors placeholder:text-muted-foreground/70 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50 sm:px-4"
             placeholder="输入测试消息..."
+            aria-label="测试消息"
             disabled={loading}
           />
-          <Button onClick={handleSend} disabled={loading || !input.trim() || !model || modelsLoading} className="h-12 px-6">
+          <Button onClick={handleSend} disabled={loading || !input.trim() || !model || modelsLoading} className="h-11 shrink-0 gap-2 px-4 sm:px-6">
             {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+            <span className="hidden sm:inline">{loading ? "发送中" : "发送"}</span>
           </Button>
         </div>
       </div>

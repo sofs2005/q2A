@@ -1,9 +1,12 @@
 import { useState } from "react"
-import { Film, RefreshCw, Download, Wand2 } from "lucide-react"
+import { Film, RefreshCw, Download, Wand2, ExternalLink } from "lucide-react"
 import { Button } from "../components/ui/button"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
+import { Card, CardContent } from "../components/ui/card"
+import { Notice, SegmentedGroup, Textarea } from "../components/ui/field"
+import { StatusBadge } from "../components/ui/badge"
 
 const ASPECT_RATIOS = [
   { label: "16:9", value: "16:9" },
@@ -131,175 +134,117 @@ export default function VideoPage() {
   return (
     <div className="w-full space-y-6">
       <div>
-        <h2 className="text-2xl font-bold tracking-tight">视频生成</h2>
-        <p className="text-muted-foreground">通过 Qwen3.6-Plus 生成 AI 视频，支持多种比例与时长。</p>
+        <h2 className="text-2xl font-semibold tracking-tight">视频生成</h2>
+        <p className="mt-1 text-sm text-muted-foreground">通过 Qwen3.6-Plus 生成 AI 视频，支持多种比例与时长。</p>
       </div>
 
       {/* 输入区域 */}
-      <div className="rounded-xl border bg-card shadow-sm p-6 space-y-4">
-        <div className="space-y-2">
-          <label className="text-sm font-medium">视频描述 (Prompt)</label>
-          <textarea
-            rows={3}
-            value={prompt}
-            onChange={e => setPrompt(e.target.value)}
-            placeholder="描述你想生成的视频，例如：一只白色小猫在樱花树下奔跑，阳光洒落，电影感运镜"
-            className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm resize-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-            disabled={loading}
-            onKeyDown={e => {
-              if (e.key === "Enter" && e.ctrlKey) handleGenerate()
-            }}
-          />
-          <p className="text-xs text-muted-foreground">Ctrl+Enter 快速生成</p>
-        </div>
+      <Card>
+        <CardContent className="space-y-4">
+          <div className="space-y-2">
+            <label htmlFor="video-prompt" className="text-sm font-medium">视频描述 (Prompt)</label>
+            <Textarea
+              id="video-prompt"
+              rows={3}
+              value={prompt}
+              onChange={e => setPrompt(e.target.value)}
+              placeholder="描述你想生成的视频，例如：一只白色小猫在樱花树下奔跑，阳光洒落，电影感运镜"
+              className="resize-none"
+              disabled={loading}
+              onKeyDown={e => {
+                if (e.key === "Enter" && e.ctrlKey) handleGenerate()
+              }}
+            />
+            <p className="text-xs text-muted-foreground">Ctrl+Enter 快速生成</p>
+          </div>
 
-        <div className="flex flex-wrap gap-4 items-end">
-          {/* 比例选择 */}
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">视频比例</label>
-            <div className="flex gap-2">
-              {ASPECT_RATIOS.map(r => (
-                <button
-                  key={r.value}
-                  onClick={() => setRatio(r.value)}
-                  className={`px-3 py-1.5 rounded-md text-sm font-medium border transition-all ${
-                    ratio === r.value
-                      ? "bg-primary text-primary-foreground border-primary shadow-sm"
-                      : "bg-background border-border text-muted-foreground hover:text-foreground hover:border-foreground/30"
-                  }`}
-                  disabled={loading}
-                >
-                  {r.label}
-                </button>
-              ))}
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+            <div className="flex flex-wrap gap-5">
+              <SegmentedGroup
+                label="视频比例"
+                value={ratio}
+                onChange={setRatio}
+                disabled={loading}
+                options={ASPECT_RATIOS}
+              />
+              <SegmentedGroup
+                label="时长（秒）"
+                value={String(duration)}
+                onChange={value => setDuration(Number(value))}
+                disabled={loading}
+                options={DURATIONS.map(v => ({ label: `${v}s`, value: String(v) }))}
+              />
+              <SegmentedGroup
+                label="生成数量"
+                value={String(n)}
+                onChange={value => setN(Number(value))}
+                disabled={loading}
+                options={[1, 2].map(v => ({ label: `${v} 个`, value: String(v) }))}
+              />
             </div>
+
+            <Button
+              onClick={handleGenerate}
+              disabled={loading || !prompt.trim()}
+              className="h-10 shrink-0 gap-2 px-6"
+            >
+              {loading
+                ? <><RefreshCw className="h-4 w-4 animate-spin" /> 生成中...</>
+                : <><Wand2 className="h-4 w-4" /> 生成视频</>
+              }
+            </Button>
           </div>
 
-          {/* 时长选择 */}
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">时长（秒）</label>
-            <div className="flex gap-2">
-              {DURATIONS.map(v => (
-                <button
-                  key={v}
-                  onClick={() => setDuration(v)}
-                  className={`px-3 py-1.5 rounded-md text-sm font-medium border transition-all ${
-                    duration === v
-                      ? "bg-primary text-primary-foreground border-primary shadow-sm"
-                      : "bg-background border-border text-muted-foreground hover:text-foreground hover:border-foreground/30"
-                  }`}
-                  disabled={loading}
-                >
-                  {v}s
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* 数量选择 */}
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">生成数量</label>
-            <div className="flex gap-2">
-              {[1, 2].map(v => (
-                <button
-                  key={v}
-                  onClick={() => setN(v)}
-                  className={`px-3 py-1.5 rounded-md text-sm font-medium border transition-all ${
-                    n === v
-                      ? "bg-primary text-primary-foreground border-primary shadow-sm"
-                      : "bg-background border-border text-muted-foreground hover:text-foreground hover:border-foreground/30"
-                  }`}
-                  disabled={loading}
-                >
-                  {v} 个
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* 生成按钮 */}
-          <Button
-            onClick={handleGenerate}
-            disabled={loading || !prompt.trim()}
-            className="ml-auto h-10 px-6 gap-2"
-          >
-            {loading
-              ? <><RefreshCw className="h-4 w-4 animate-spin" /> 生成中...</>
-              : <><Wand2 className="h-4 w-4" /> 生成视频</>
-            }
-          </Button>
-        </div>
-
-        {/* 错误提示 */}
-        {error && (
-          <div className="rounded-md bg-red-500/10 border border-red-500/30 text-red-400 px-4 py-3 text-sm">
-            {error}
-          </div>
-        )}
-      </div>
+          {error && <Notice tone="error">{error}</Notice>}
+        </CardContent>
+      </Card>
 
       {/* 加载状态占位 */}
       {loading && (
-        <div className="rounded-xl border bg-card shadow-sm p-8">
-          <div className="flex flex-col items-center justify-center gap-4 text-muted-foreground">
+        <Card>
+          <CardContent className="flex flex-col items-center justify-center gap-4 py-12 text-muted-foreground">
             <div className="relative">
-              <Film className="h-16 w-16 text-muted-foreground/20" />
-              <RefreshCw className="h-6 w-6 animate-spin absolute -bottom-1 -right-1 text-primary" />
+              <Film className="h-14 w-14 text-muted-foreground/20" />
+              <RefreshCw className="absolute -bottom-1 -right-1 h-6 w-6 animate-spin text-primary" />
             </div>
             <div className="text-center">
-              <p className="font-medium">正在生成视频...</p>
-              <p className="text-sm text-muted-foreground/70 mt-1">视频生成耗时较长（最长约 7 分钟），请保持页面打开耐心等待</p>
+              <p className="font-medium text-foreground">正在生成视频…</p>
+              <p className="mt-1 text-sm text-muted-foreground">视频生成耗时较长（最长约 7 分钟），请保持页面打开耐心等待</p>
             </div>
-          </div>
-        </div>
+          </CardContent>
+        </Card>
       )}
 
       {/* 视频展示区 */}
       {videos.length > 0 && !loading && (
         <div className="space-y-4">
           <div className="flex items-center justify-between">
-            <h3 className="font-semibold">生成结果 ({videos.length} 个)</h3>
-            <Button variant="ghost" size="sm" onClick={() => setVideos([])}>
-              清空
-            </Button>
+            <h3 className="text-sm font-semibold">生成结果 ({videos.length} 个)</h3>
+            <Button variant="ghost" size="sm" onClick={() => setVideos([])}>清空</Button>
           </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             {videos.map((vid, idx) => (
-              <div key={`${vid.url}-${idx}`} className="rounded-xl border bg-card shadow-sm overflow-hidden">
+              <Card key={`${vid.url}-${idx}`} className="overflow-hidden">
                 <div className="relative bg-black">
-                  <video
-                    src={vid.url}
-                    controls
-                    playsInline
-                    className="w-full h-auto"
-                  />
+                  <video src={vid.url} controls playsInline className="h-auto w-full" />
                 </div>
-                <div className="p-3 space-y-2">
-                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                    <span className="bg-muted rounded px-1.5 py-0.5 font-mono">{vid.ratio}</span>
-                    <span className="bg-muted rounded px-1.5 py-0.5 font-mono">{vid.duration}s</span>
-                    <span className="truncate">{vid.revised_prompt.slice(0, 80)}</span>
+                <CardContent className="space-y-3 py-3">
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                    <StatusBadge tone="neutral" className="font-mono">{vid.ratio}</StatusBadge>
+                    <StatusBadge tone="neutral" className="font-mono">{vid.duration}s</StatusBadge>
+                    <span className="min-w-0 truncate">{vid.revised_prompt.slice(0, 80)}</span>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      onClick={() => handleDownload(vid.url, idx)}
-                      className="gap-1.5"
-                    >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button size="sm" variant="outline" onClick={() => handleDownload(vid.url, idx)} className="gap-1.5">
                       <Download className="h-3.5 w-3.5" /> 下载
                     </Button>
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      onClick={() => window.open(vid.url, "_blank")}
-                    >
-                      在新窗口打开
+                    <Button size="sm" variant="ghost" onClick={() => window.open(vid.url, "_blank")} className="gap-1.5">
+                      <ExternalLink className="h-3.5 w-3.5" /> 新窗口打开
                     </Button>
                   </div>
-                  <div className="text-xs text-muted-foreground font-mono truncate">{vid.url}</div>
-                </div>
-              </div>
+                  <div className="truncate font-mono text-xs text-muted-foreground/80">{vid.url}</div>
+                </CardContent>
+              </Card>
             ))}
           </div>
         </div>
@@ -307,15 +252,15 @@ export default function VideoPage() {
 
       {/* 空状态 */}
       {videos.length === 0 && !loading && (
-        <div className="rounded-xl border bg-card/50 shadow-sm p-12">
-          <div className="flex flex-col items-center gap-4 text-muted-foreground">
-            <Film className="h-16 w-16 text-muted-foreground/20" />
+        <Card>
+          <CardContent className="flex flex-col items-center gap-4 py-14 text-muted-foreground">
+            <Film className="h-14 w-14 text-muted-foreground/20" />
             <div className="text-center">
-              <p className="font-medium">还没有生成视频</p>
-              <p className="text-sm text-muted-foreground/70 mt-1">在上方输入描述，点击「生成视频」开始创作</p>
+              <p className="font-medium text-foreground">还没有生成视频</p>
+              <p className="mt-1 text-sm text-muted-foreground">在上方输入描述，点击「生成视频」开始创作</p>
             </div>
-          </div>
-        </div>
+          </CardContent>
+        </Card>
       )}
     </div>
   )
