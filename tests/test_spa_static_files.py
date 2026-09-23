@@ -21,6 +21,14 @@ class SPAStaticFilesTests(unittest.TestCase):
         async def api_status() -> dict[str, str]:
             return {"status": "ok"}
 
+        @app.post("/images/generations")
+        async def images_generations() -> dict[str, str]:
+            return {"result": "image"}
+
+        @app.post("/videos/generations")
+        async def videos_generations() -> dict[str, str]:
+            return {"result": "video"}
+
         app.mount("/", SPAStaticFiles(directory=dist_dir, html=True), name="frontend")
         return TestClient(app)
 
@@ -32,6 +40,38 @@ class SPAStaticFilesTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("text/html", response.headers["content-type"])
         self.assertEqual(response.text, "<div id=\"root\"></div>")
+
+    def test_media_page_routes_fall_back_to_index_html(self) -> None:
+        """UI 页面路由 /images、/videos 必须可直接打开和刷新。"""
+        client = self._create_client()
+
+        for path in ("/images", "/images/", "/videos", "/videos/"):
+            with self.subTest(path=path):
+                response = client.get(path)
+
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("text/html", response.headers["content-type"])
+                self.assertEqual(response.text, "<div id=\"root\"></div>")
+
+    def test_unmatched_media_api_paths_still_return_404(self) -> None:
+        """页面路由放行不能把未注册的媒体 API 子路径变成 HTML。"""
+        client = self._create_client()
+
+        for path in ("/images/missing", "/videos/missing", "/images/content", "/videos/generations/extra"):
+            with self.subTest(path=path):
+                response = client.get(path)
+
+                self.assertEqual(response.status_code, 404)
+
+    def test_registered_media_api_routes_still_win(self) -> None:
+        client = self._create_client()
+
+        for path in ("/images/generations", "/videos/generations"):
+            with self.subTest(path=path):
+                response = client.post(path)
+
+                self.assertEqual(response.status_code, 200)
+                self.assertNotIn("text/html", response.headers["content-type"])
 
     def test_missing_api_paths_still_return_404(self) -> None:
         client = self._create_client()
