@@ -3,7 +3,7 @@ import { Film, RefreshCw, Download, Wand2, ExternalLink } from "lucide-react"
 import { Button } from "../components/ui/button"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
-import { API_BASE } from "../lib/api"
+import { API_BASE, errorMessage, responseDetail, responseItems, sseErrorDetail, type VideoResponseItem } from "../lib/api"
 import { Card, CardContent } from "../components/ui/card"
 import { Notice, SegmentedGroup, Textarea } from "../components/ui/field"
 import { StatusBadge } from "../components/ui/badge"
@@ -26,7 +26,7 @@ interface GeneratedVideo {
 }
 
 // 读取 SSE 心跳流：忽略 `: heartbeat` 注释，返回首个 data 事件的 JSON
-async function readSSEResult(res: Response): Promise<any> {
+async function readSSEResult(res: Response): Promise<unknown> {
   const reader = res.body?.getReader()
   if (!reader) return null
   const decoder = new TextDecoder()
@@ -82,23 +82,23 @@ export default function VideoPage() {
 
       // 鉴权/参数错误以普通 JSON 返回（非 SSE）
       if (!res.ok && !res.headers.get("content-type")?.includes("text/event-stream")) {
-        const errData = await res.json().catch(() => ({}))
-        const detail = errData?.detail || errData?.error || `HTTP ${res.status}`
-        setError(String(detail))
-        toast.error(`生成失败: ${String(detail).slice(0, 80)}`)
+        const errData: unknown = await res.json().catch(() => ({}))
+        const detail = responseDetail(errData, `HTTP ${res.status}`)
+        setError(detail)
+        toast.error(`生成失败: ${detail.slice(0, 80)}`)
         return
       }
 
       // SSE 心跳流：跳过心跳注释，解析最终 data 事件
       const data = await readSSEResult(res)
-      if (data?.error) {
-        const detail = data.error?.message || data.error || "生成失败"
-        setError(String(detail))
-        toast.error(`生成失败: ${String(detail).slice(0, 80)}`)
+      const sseError = sseErrorDetail(data)
+      if (sseError) {
+        setError(sseError)
+        toast.error(`生成失败: ${sseError.slice(0, 80)}`)
         return
       }
 
-      const newVideos: GeneratedVideo[] = (data?.data || []).map((item: any) => ({
+      const newVideos: GeneratedVideo[] = responseItems<VideoResponseItem>(data).map(item => ({
         url: item.url,
         revised_prompt: item.revised_prompt || prompt,
         ratio: item.ratio || ratio,
@@ -113,8 +113,8 @@ export default function VideoPage() {
 
       setVideos(prev => [...newVideos, ...prev])
       toast.success(`成功生成 ${newVideos.length} 个视频`)
-    } catch (err: any) {
-      const msg = err.message || "网络错误"
+    } catch (err: unknown) {
+      const msg = errorMessage(err)
       setError(msg)
       toast.error(`生成失败: ${msg}`)
     } finally {

@@ -3,7 +3,7 @@ import { Image as ImageIcon, RefreshCw, Download, Wand2, ExternalLink } from "lu
 import { Button } from "../components/ui/button"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
-import { API_BASE } from "../lib/api"
+import { API_BASE, errorMessage, responseDetail, responseItems, type ImageResponseItem } from "../lib/api"
 import { Card, CardContent } from "../components/ui/card"
 import { Notice, SegmentedGroup, Textarea } from "../components/ui/field"
 import { StatusBadge } from "../components/ui/badge"
@@ -55,15 +55,15 @@ export default function ImagePage() {
         }),
       })
 
-      const data = await res.json()
+      const data: unknown = await res.json()
       if (!res.ok) {
-        const detail = data?.detail || data?.error || `HTTP ${res.status}`
-        setError(String(detail))
-        toast.error(`生成失败: ${String(detail).slice(0, 80)}`)
+        const detail = responseDetail(data, `HTTP ${res.status}`)
+        setError(detail)
+        toast.error(`生成失败: ${detail.slice(0, 80)}`)
         return
       }
 
-      const newImages: GeneratedImage[] = (data.data || []).map((item: any) => ({
+      const newImages: GeneratedImage[] = responseItems<ImageResponseItem>(data).map(item => ({
         url: item.url,
         revised_prompt: item.revised_prompt || prompt,
         ratio,
@@ -77,8 +77,8 @@ export default function ImagePage() {
 
       setImages(prev => [...newImages, ...prev])
       toast.success(`成功生成 ${newImages.length} 张图片`)
-    } catch (err: any) {
-      const msg = err.message || "网络错误"
+    } catch (err: unknown) {
+      const msg = errorMessage(err)
       setError(msg)
       toast.error(`生成失败: ${msg}`)
     } finally {

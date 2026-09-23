@@ -52,4 +52,6 @@ const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
 )
 Button.displayName = "Button"
 
-export { Button, buttonVariants }
+// 只导出组件：buttonVariants 目前无外部消费者，导出它会让本文件混入非组件
+// 导出，导致 Fast Refresh 退化为整页刷新。将来确需复用变体时再单独抽出。
+export { Button }
