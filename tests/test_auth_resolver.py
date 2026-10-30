@@ -61,6 +61,20 @@ class _FakeSession:
 
 
 class AuthResolverTests(unittest.IsolatedAsyncioTestCase):
+    """HTTP signin 路径的测试。
+
+    浏览器签发短效 token 的逻辑默认被 patch 掉（返回空串），让这些用例继续
+    只验证 HTTP 回落路径；浏览器路径单独在 test_token_provider.py 覆盖。
+    """
+
+    def setUp(self) -> None:
+        self._browser_patch = patch(
+            "backend.services.auth_resolver.ensure_fresh_token",
+            AsyncMock(return_value=""),
+        )
+        self._browser_patch.start()
+        self.addCleanup(self._browser_patch.stop)
+
     async def test_refresh_token_uses_curl_cffi_signin(self) -> None:
         pool = _DummyPool()
         resolver = AuthResolver(pool)
@@ -80,7 +94,7 @@ class AuthResolverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account.last_error, "")
         self.assertFalse(account.activation_pending)
         self.assertEqual(pool.saved, 1)
-        self.assertEqual(calls[0][0], f"{BASE_URL}/api/v1/auths/signin")
+        self.assertEqual(calls[0][0], f"{BASE_URL}/api/v2/auths/signin")
         self.assertEqual(calls[0][1]["email"], "user@example.com")
         self.assertNotEqual(calls[0][1]["password"], "secret")
         self.assertEqual(calls[0][2]["User-Agent"], fingerprint.user_agent)

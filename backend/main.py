@@ -42,6 +42,39 @@ install_stack_dump_handler(
 log = logging.getLogger("qwen2api")
 
 
+async def token_refresh_loop(app: FastAPI):
+    """后台给账号续签短效 access_token。
+
+    上游只认 900s 的 access_token，且该 token 只能由浏览器签发，签发一次要几秒。
+    放在后台提前续，避免用户请求打到"token 刚好过期"的窗口上。
+    """
+    from backend.services.token_provider import ensure_fresh_token, is_token_usable
+
+    interval = max(15.0, float(getattr(settings, "QWEN_TOKEN_REFRESH_INTERVAL_SECONDS", 60)))
+    while True:
+        try:
+            if getattr(settings, "QWEN_BROWSER_TOKEN_ENABLED", True):
+                pool = getattr(app.state, "account_pool", None)
+                accounts = list(getattr(pool, "accounts", []) or [])
+                changed = False
+                for acc in accounts:
+                    if not getattr(acc, "valid", False) or not getattr(acc, "password", ""):
+                        continue
+                    if is_token_usable(getattr(acc, "token", ""), margin=180):
+                        continue
+                    token = await ensure_fresh_token(acc)
+                    if token:
+                        acc.token = token
+                        changed = True
+                if changed and pool is not None:
+                    await pool.save()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("[TokenRefresh] loop failed: %s", exc)
+        await asyncio.sleep(interval)
+
+
 async def chat_id_pool_loop(app: FastAPI):
     chat_pool = getattr(app.state.qwen_client, "chat_id_pool", None)
     if chat_pool is None:
@@ -91,6 +124,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(garbage_collect_chats(app))
         asyncio.create_task(context_cleanup_loop(app))
         app.state.chat_id_pool_task = asyncio.create_task(chat_id_pool_loop(app))
+        app.state.token_refresh_task = asyncio.create_task(token_refresh_loop(app))
 
         app.state.event_loop_watchdog_stop = asyncio.Event()
         app.state.event_loop_watchdog_task = None
@@ -117,6 +151,19 @@ async def lifespan(app: FastAPI):
                 await watchdog_task
             except asyncio.CancelledError:
                 pass
+        token_task = getattr(app.state, "token_refresh_task", None)
+        if token_task is not None:
+            token_task.cancel()
+            try:
+                await token_task
+            except asyncio.CancelledError:
+                pass
+        try:
+            from backend.services.token_provider import BrowserTokenProvider
+
+            await BrowserTokenProvider.get_instance().close()
+        except Exception:
+            pass
         chat_pool_task = getattr(app.state, "chat_id_pool_task", None)
         if chat_pool_task is not None:
             chat_pool_task.cancel()

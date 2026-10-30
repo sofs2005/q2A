@@ -4,11 +4,26 @@ import logging
 
 from backend.core.account_pool import Account, AccountPool
 from backend.core.browser_fingerprint import fingerprint_for_account, get_session
-from backend.core.config import resolve_model
+from backend.core.config import resolve_model, settings
+from backend.services.token_provider import ensure_fresh_token, is_token_usable
 
 log = logging.getLogger(__name__)
 
 BASE_URL = "https://chat.qwen.ai"
+
+
+def _extract_token_from_signin(data: object) -> str:
+    """从 signin 响应里取 token。
+
+    v2 的响应形如 {"success": true, "data": {"token": "..."}}，
+    老代码只读顶层 token 字段，v2 下会一直取到空串。
+    """
+    if not isinstance(data, dict):
+        return ""
+    token = data.get("token")
+    if not token and isinstance(data.get("data"), dict):
+        token = data["data"].get("token")
+    return str(token or "").strip()
 
 
 async def get_fresh_token(email: str, password: str) -> str:
@@ -120,7 +135,7 @@ class AuthResolver:
             fingerprint = fingerprint_for_account(temp_acc)
             session = await get_session(fingerprint)
             resp = await session.post(
-                f"{BASE_URL}/api/v1/auths/signin",
+                f"{BASE_URL}/api/v2/auths/signin",
                 json=payload,
                 headers=fingerprint.build_headers(content_type="application/json"),
             )
@@ -143,7 +158,7 @@ class AuthResolver:
             log.warning(f"[Login] {email} 登录响应不是 JSON")
             return False, "", "登录响应不是 JSON"
 
-        new_token = str(data.get("token", "") or "").strip()
+        new_token = _extract_token_from_signin(data)
         if not new_token:
             log.warning(f"[Login] {email} 登录响应缺少 token 字段")
             return False, "", "登录响应缺少 token 字段"
@@ -153,6 +168,27 @@ class AuthResolver:
 
     async def refresh_token(self, acc: Account) -> bool:
         """Re-login with email+password via curl_cffi to get a fresh token."""
+        # 上游现在只认 type=access_token 的短效 token（900s），而这种 token 只能由
+        # 真浏览器签发：HTTP signin 只发长期 token，且 auth 域被 AWSC 风控挑战。
+        # 浏览器签发成功后直接返回，跳过下面的 curl 登录与 WAF 种子请求。
+        if getattr(settings, "QWEN_BROWSER_TOKEN_ENABLED", True):
+            browser_token = await ensure_fresh_token(acc)
+            if browser_token and is_token_usable(browser_token):
+                acc.token = browser_token
+                acc.activation_pending = False
+                # 冷却状态不动：WAF 封锁是 IP/行为级，与 token 有效性无关
+                if acc.status_code != "rate_limited":
+                    acc.valid = True
+                    acc.status_code = "valid"
+                acc.last_error = ""
+                log.info("[Refresh] %s 已通过浏览器签发短效 access_token", acc.email)
+                try:
+                    await self.pool.save()
+                except Exception as save_err:
+                    log.warning("[Refresh] %s 保存 token 失败: %s", acc.email, save_err)
+                return True
+            log.warning("[Refresh] %s 浏览器签发失败，回落到 HTTP signin（长期 token）", acc.email)
+
         if not acc.email or not acc.password:
             log.warning(f"[Refresh] 账号 {acc.email} 无密码，无法刷新")
             return False
@@ -167,7 +203,7 @@ class AuthResolver:
             fingerprint = fingerprint_for_account(acc)
             session = await get_session(fingerprint)
             resp = await session.post(
-                f"{BASE_URL}/api/v1/auths/signin",
+                f"{BASE_URL}/api/v2/auths/signin",
                 json=payload,
                 headers=fingerprint.build_headers(content_type="application/json"),
             )
@@ -185,7 +221,7 @@ class AuthResolver:
             log.warning(f"[Refresh] {acc.email} 登录响应不是 JSON")
             return False
 
-        new_token = str(data.get("token", "") or "").strip()
+        new_token = _extract_token_from_signin(data)
         if not new_token:
             log.warning(f"[Refresh] {acc.email} 登录响应缺少 token 字段")
             return False

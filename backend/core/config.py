@@ -15,7 +15,11 @@ DEFAULT_QWEN_PLUS_MODEL = "qwen3.7-plus"
 # 已被服务端下线/不认。改回 0.2.91 后请求立刻恢复，故 0.2.91 才是当前真正可用的值。
 # 教训：抓包只能证明"官网在发什么"，证明不了"服务端认什么"。换版本号必须实测，
 # CDN 路径反推同样不可靠（首页预渲染页也会滞后）。
-DEFAULT_QWEN_WEB_VERSION = "0.2.91"
+# 2026-10-30 二次实测修正：0.3.27 在「短效 access_token」下可正常出流；
+# 0.2.91 反而返回 Bad_Request。此前"0.3.27 被判 401"的结论是因为当时用的是
+# 账号池里的长期 token —— 两个变量纠缠导致的误判。换版本号必须连同 token 类型
+# 一起实测（见 backend/services/token_provider.py 的模块说明）。
+DEFAULT_QWEN_WEB_VERSION = "0.3.27"
 DEFAULT_QWEN_BX_VERSION = "2.5.37"
 
 class Settings(BaseSettings):
@@ -71,6 +75,11 @@ class Settings(BaseSettings):
     # 官网请求头版本，跟随抓包验证结果，允许部署侧独立调整。
     QWEN_WEB_VERSION: str = os.getenv("QWEN_WEB_VERSION", DEFAULT_QWEN_WEB_VERSION).strip() or DEFAULT_QWEN_WEB_VERSION
     QWEN_BX_VERSION: str = os.getenv("QWEN_BX_VERSION", DEFAULT_QWEN_BX_VERSION).strip() or DEFAULT_QWEN_BX_VERSION
+    # 短效 access_token 只能由真浏览器签发（HTTP signin 只发长期 token，且 auth 域
+    # 被 AWSC 挑战）。关闭后回落到纯 HTTP 长期 token 路径（上游现在会判 401）。
+    QWEN_BROWSER_TOKEN_ENABLED: bool = os.getenv("QWEN_BROWSER_TOKEN_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    # 后台续期轮询间隔：token 只有 900s，提前 120s 续，60s 轮询足够
+    QWEN_TOKEN_REFRESH_INTERVAL_SECONDS: float = float(os.getenv("QWEN_TOKEN_REFRESH_INTERVAL_SECONDS", 60))
     QWEN_CODE_CODER_MODEL: str = os.getenv("QWEN_CODE_CODER_MODEL", "qwen3-coder-plus")
     QWEN_CODE_FORCE_CODER_FOR_TOOL_CALLS: bool = os.getenv("QWEN_CODE_FORCE_CODER_FOR_TOOL_CALLS", "true").lower() in {"1", "true", "yes", "on"}
     QWEN_CODE_FORCE_CODER_FOR_CODING_TASKS: bool = os.getenv("QWEN_CODE_FORCE_CODER_FOR_CODING_TASKS", "true").lower() in {"1", "true", "yes", "on"}
