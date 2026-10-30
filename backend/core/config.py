@@ -95,8 +95,10 @@ class Settings(BaseSettings):
     QWEN_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECONDS: float = float(
         os.getenv("QWEN_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECONDS", 300)
     )
+    # 首帧/空闲超时。上游风控软拦会以 200 + 裸 JSON 返回（非 SSE），代码会立即判错，
+    # 不再干等；此处只需覆盖「真·静默断流」，故默认 20s 而非 90s。
     QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS: float = float(
-        os.getenv("QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS", 90)
+        os.getenv("QWEN_UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS", 20)
     )
     # 采用上游 SSE 每帧下发的累计 usage（input_tokens/output_tokens）替代本地 tiktoken 估算。
     # 关闭后完全回落到本地估算，行为与接入前一致。

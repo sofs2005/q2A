@@ -90,6 +90,66 @@ def _parse_upstream_error(evt: dict) -> dict | None:
     }
 
 
+def _parse_bare_json_error(chunk: str) -> dict | None:
+    """识别「非 SSE 裸 JSON 错误体」（上游风控软拦的典型形态）。
+
+    上游 AWSC 风控生效后，/api/v2/chat/completions 不再回 SSE 流，而是
+    HTTP 200 + 一个裸 JSON 信封：
+
+        {"success": false, "request_id": "...",
+         "data": {"code": "Bad_Request", "details": "Internal error ..."}}
+
+    旧实现只解析 `data:` 开头的行，这类响应一个事件都不产出、连 WARNING 都
+    不打，错误被静默吞掉，调用方只能干等到 idle 超时。此处把它翻译成与
+    `_parse_upstream_error` 完全同形的错误事件，让上层能立刻判错。
+
+    Args:
+        chunk: 单个 SSE 分片（此处约定分片内不含任何 `data:` 行）。
+
+    Returns:
+        错误事件 dict；不是裸 JSON 错误体时返回 None。
+    """
+    text = str(chunk or "").strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    # 形态一：上游信封 {"success": false, "data": {"code", "details"}}
+    if payload.get("success") is False:
+        data = payload.get("data")
+        data = data if isinstance(data, dict) else {}
+        code = _first_string(data.get("code"), data.get("type"), payload.get("code"))
+        details = _first_string(
+            data.get("details"),
+            data.get("message"),
+            data.get("msg"),
+            payload.get("msg"),
+            payload.get("message"),
+            json.dumps(payload, ensure_ascii=False),
+        )
+        if not code and not details:
+            return None
+        # 复用 _parse_upstream_error 保证事件形状一致；完整信封放进 extra 便于运维排查
+        error_obj: dict = {"code": code or "unknown", "details": details or code or "upstream error"}
+        if payload.get("request_id") is not None:
+            error_obj["request_id"] = payload.get("request_id")
+        return _parse_upstream_error(
+            {
+                "error": error_obj,
+                "response_id": _first_string(payload.get("request_id"), payload.get("response_id")) or None,
+                "response_index": payload.get("response_index"),
+            }
+        )
+
+    # 形态二：顶层直接带 error 对象
+    return _parse_upstream_error(payload)
+
+
 def _parse_response_created(evt: dict) -> dict | None:
     """识别流生命周期事件 response.created（非内容，不应当 unparsed）。"""
     created = evt.get("response.created")
@@ -208,6 +268,20 @@ def parse_sse_chunk(chunk: str) -> list[dict]:
     parsed = []
     for evt in events:
         parsed.extend(_parse_qwen_event(evt))
+
+    # 本次分片里没有任何 data: 行 —— 可能整段就是一个裸 JSON 错误体（上游风控软拦）。
+    # 必须放在正常 SSE 解析之后、且严格以「无 data: 行」为前提，保证正常流行为不变。
+    if not data_lines:
+        bare_error = _parse_bare_json_error(chunk)
+        if bare_error is not None:
+            log.warning(
+                "[SSE] non-sse json error body code=%s details=%r preview=%r",
+                bare_error.get("code"),
+                bare_error.get("details"),
+                _preview(chunk),
+            )
+            return [bare_error]
+
     if not parsed and data_lines:
         if invalid_data_lines:
             log.warning(

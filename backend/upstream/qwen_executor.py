@@ -72,6 +72,58 @@ def _preview_text(value: object, limit: int = 500) -> str:
     return f"{text[:limit]}..."
 
 
+# 上游「确定性错误」码集合：换账号 / 重试都不会好，应立即失败。
+# 均为小写比较（大小写不敏感），与上游实际返回的大小写写法无关。
+_DETERMINISTIC_ERROR_CODES = frozenset(
+    {"bad_request", "unauthorized", "forbidden", "invalid_argument", "invalidparameter"}
+)
+
+
+class DeterministicUpstreamError(Exception):
+    """上游确定性错误（如风控软拦返回 Bad_Request）。
+
+    语义是「换账号 / 重试都不会好的错误」，调用方必须立即失败而不是进入
+    attempt 循环 —— 否则既让用户白等，又给账号池反复记 strike。
+    """
+
+    def __init__(self, code: str = "", details: str = "", *, status: int | None = None) -> None:
+        self.code = str(code or "")
+        self.details = str(details or "")
+        self.status = status
+        super().__init__(
+            f"deterministic upstream error: code={self.code or 'unknown'} "
+            f"details={self.details or 'unknown'}"
+        )
+
+
+def _is_deterministic_upstream_error(code: object, details: object) -> bool:
+    """判定上游错误是否为「确定性错误」（换账号 / 重试也不会好）。
+
+    Args:
+        code: 上游错误码，如 "Bad_Request" / "invalid_argument"。
+        details: 上游错误详情文本。
+
+    Returns:
+        True 表示确定性错误，调用方应直接失败而非重试。
+    """
+    code_text = str(code or "").strip().lower()
+    if code_text in _DETERMINISTIC_ERROR_CODES:
+        return True
+    # 风控软拦的 details 固定含 "Internal error"（大小写不敏感匹配）
+    return "internal error" in str(details or "").lower()
+
+
+def _deterministic_error_from_event(evt: dict) -> DeterministicUpstreamError | None:
+    """把错误事件翻译成 DeterministicUpstreamError；非确定性错误返回 None。"""
+    if not isinstance(evt, dict) or evt.get("type") != "error":
+        return None
+    code = evt.get("code")
+    details = evt.get("details")
+    if not _is_deterministic_upstream_error(code, details):
+        return None
+    return DeterministicUpstreamError(code=str(code or ""), details=str(details or ""))
+
+
 class QwenExecutor:
     def __init__(self, engine, account_pool):
         self.engine = engine
@@ -349,6 +401,11 @@ class QwenExecutor:
                                 log.info(
                                     f"[Executor] first parsed event after {(time.perf_counter() - started_at):.3f}s chat_id={chat_id}"
                                 )
+                            # 确定性错误（上游风控软拦的 200+裸 JSON）：立即失败，
+                            # 不再等下一个 chunk，也不进入重试循环。
+                            det_err = _deterministic_error_from_event(evt)
+                            if det_err is not None:
+                                raise det_err
                             yield evt
         except Exception as e:
             elapsed = time.perf_counter() - started_at
@@ -368,6 +425,11 @@ class QwenExecutor:
                     log.info(
                         f"[Executor] first parsed event after {(time.perf_counter() - started_at):.3f}s chat_id={chat_id}"
                     )
+                # 上游直接回裸 JSON 错误体时不会带 "\n\n"，只能落到这里的尾部分片，
+                # 同样需要立即判错（否则会被当成正常结束，产出 0 事件的空响应）。
+                det_err = _deterministic_error_from_event(evt)
+                if det_err is not None:
+                    raise det_err
                 yield evt
 
         if chunk_count > 0 and parsed_event_count == 0:
@@ -426,6 +488,18 @@ class QwenExecutor:
                 # 无人调用），一次偶发 401 会让账号永远进不了 ready 集合。
                 self.account_pool.mark_success(acc)
                 return
+
+            except DeterministicUpstreamError as e:
+                # 确定性错误（上游风控软拦：200 + 裸 JSON 的 Bad_Request）：
+                # 换账号 / 重试都不会好，直接失败。绝不能走 _classify_and_release
+                # 的重试链路 —— 那会 90s × MAX_RETRIES 空转，并把账号池打成 disabled。
+                log.error(
+                    f"[Executor] deterministic upstream error: 不再重试 "
+                    f"account={acc.email} attempt={attempt + 1} code={e.code} details={e.details}"
+                )
+                # 只释放，不做失败归类（避免误记 strike / 误标 invalid）
+                self.account_pool.release(acc)
+                raise
 
             except Exception as e:
                 # punish 是不可重试的终态：已解过滑块仍被拦，或滑块失败。此时换号
