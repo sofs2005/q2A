@@ -30,7 +30,6 @@ import asyncio
 import base64
 import json
 import logging
-import random
 import time
 from typing import Any
 
@@ -187,55 +186,6 @@ class BrowserTokenProvider:
 
     # ---- 登录 -----------------------------------------------------------
 
-    async def _drag_login_slider(self, page) -> bool:
-        """拖动登录页的阿里云「访问验证」滑块（aliyunCaptcha 新版组件）。
-
-        与 punish 页的 nc_1_n1z 不是同一套 DOM，故单独实现：
-        滑块 #aliyunCaptcha-sliding-slider（40px），轨道宽 300px，需拖 260px。
-        """
-        slider = await page.query_selector("#aliyunCaptcha-sliding-slider")
-        if slider is None:
-            slider = await page.query_selector(".aliyunCaptcha-sliding-slider")
-        if slider is None:
-            return False
-        box = await slider.bounding_box()
-        if not box:
-            return False
-
-        # 轨道宽度优先从容器量，量不到用默认 300-40
-        distance = 260.0
-        for sel in ("#aliyunCaptcha-sliding-text-box", "#aliyunCaptcha-sliding"):
-            node = await page.query_selector(sel)
-            if node is not None:
-                nbox = await node.bounding_box()
-                if nbox and nbox["width"] > box["width"]:
-                    distance = nbox["width"] - box["width"]
-                    break
-
-        start_x = box["x"] + box["width"] / 2
-        start_y = box["y"] + box["height"] / 2
-        try:
-            await page.mouse.move(start_x, start_y)
-            await page.mouse.down()
-            # 先小幅移动再加速，末段减速，模拟人手（匀速直线是滑块风控最容易识别的特征）
-            steps = 22
-            for i in range(1, steps + 1):
-                ratio = i / steps
-                eased = 1 - (1 - ratio) ** 2  # ease-out
-                await page.mouse.move(
-                    start_x + distance * eased,
-                    start_y + random.uniform(-1.2, 1.2),
-                )
-                await page.wait_for_timeout(random.randint(8, 22))
-            await page.mouse.move(start_x + distance, start_y)
-            await page.wait_for_timeout(random.randint(60, 160))
-            await page.mouse.up()
-        except Exception as exc:
-            log.warning("[TokenProvider] 滑块拖动异常: %s", str(exc)[:120])
-            return False
-        await page.wait_for_timeout(2500)
-        return True
-
     async def _challenge_present(self, page) -> bool:
         """判断登录页是否弹出了「访问验证」滑块。
 
@@ -254,25 +204,20 @@ class BrowserTokenProvider:
         return ("访问验证" in text) or ("验证您是真人" in text)
 
     async def _solve_login_challenge(self, page) -> None:
-        """拖动登录页滑块，并在通过后重新提交表单。"""
-        log.info("[TokenProvider] 登录页触发滑块验证，尝试拖动")
-        dragged = False
-        deadline = time.time() + 12
-        while time.time() < deadline:
-            try:
-                if await self._drag_login_slider(page):
-                    dragged = True
-                    break
-            except Exception as exc:
-                log.warning("[TokenProvider] 新版滑块拖动异常: %s", str(exc)[:120])
-            await page.wait_for_timeout(700)
-        if not dragged:
-            try:
-                from backend.services.captcha_solver import CaptchaSolver
+        """过登录页「访问验证」滑块，并在通过后重新提交表单。
 
-                await CaptchaSolver.get_instance()._drag_slider(page, max_wait_ms=8000)
-            except Exception as exc:
-                log.warning("[TokenProvider] 通用滑块拖动失败: %s", str(exc)[:120])
+        拖动逻辑与选择器全部复用 `CaptchaSolver`（它本来就支持 iframe/shadow DOM、
+        缓动拖动与轨道宽度探测），本模块只负责"检测 + 触发 + 重新提交"。
+        注意：滑块选择器和轨道探测都已在 CaptchaSolver 里补了阿里云新版
+        aliyunCaptcha 组件（#aliyunCaptcha-sliding-slider / -text-box）。
+        """
+        log.info("[TokenProvider] 登录页触发滑块验证，尝试拖动")
+        try:
+            from backend.services.captcha_solver import CaptchaSolver
+
+            await CaptchaSolver.get_instance()._drag_slider(page, max_wait_ms=12000)
+        except Exception as exc:
+            log.warning("[TokenProvider] 滑块拖动失败: %s", str(exc)[:120])
         await page.wait_for_timeout(2500)
 
         # 挑战可能发生在提交之前，通过后需要再提交一次

@@ -51,6 +51,11 @@ _SLIDER_SELECTORS = [
     ".nc_scale span.btn_slide",
     ".nc_wrapper .nc_scale span",
     ".btn_slide",
+    # 阿里云新版 aliyunCaptcha 组件（登录页「访问验证」用的就是这套，
+    # 与 punish 页的 nc_1_n1z 不是同一个 DOM）
+    "#aliyunCaptcha-sliding-slider",
+    "[id*='aliyunCaptcha-sliding-slider']",
+    ".aliyunCaptcha-sliding-slider",
 ]
 
 try:
@@ -722,7 +727,13 @@ Function.prototype.toString = function() {
             track_info = await slider.evaluate("""
 (el) => {
     // 多级轨道探测：.nc_scale → .nc_wrapper → 父容器 → 视口估算
-    const candidates = ['.nc_scale', '.nc_wrapper', '[class*="scale"]', '[class*="track"]'];
+    const candidates = [
+        '.nc_scale', '.nc_wrapper', '[class*="scale"]', '[class*="track"]',
+        // 阿里云新版组件：轨道是 #aliyunCaptcha-sliding-text-box（宽 300），
+        // 不补这两条会回落到视口估算（320px），比真实轨道多拖 60px 必然失败
+        '#aliyunCaptcha-sliding-text-box',
+        '[class*="aliyunCaptcha-sliding-text-box"]',
+    ];
     for (const sel of candidates) {
         const track = el.closest ? el.closest(sel) : null;
         if (track) {
