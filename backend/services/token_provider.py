@@ -28,19 +28,35 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
+import os
 import time
+import uuid
+from pathlib import Path
 from typing import Any
 
-from backend.core.config import settings
+from backend.core.config import DATA_DIR, settings
 
 log = logging.getLogger("qwen2api.token_provider")
 
 BASE_URL = "https://chat.qwen.ai"
+# refresh 走 auth 域（与 chat 域不同源，但共用登录 cookie）
+AUTH_BASE_URL = "https://auth.qwen.ai"
 
 # token 剩余寿命低于该秒数就提前续期（access_token 只有 900s）
 REFRESH_MARGIN_SECONDS = 120
+
+# 浏览器会话（cookies）落盘目录。短效 access_token 靠 GET /auths/refresh 续，
+# 而 refresh 只认登录 cookie —— 所以 cookie 必须持久化，否则每次进程重启都要
+# 重新走一遍密码登录（那是滑块与风控的唯一入口）。
+SESSION_DIR = Path(DATA_DIR) / "browser_sessions"
+
+# refresh 请求头里的 version。官网 2026-10-30 抓包为 0.3.28，允许部署侧覆盖。
+_REFRESH_VERSION = os.getenv("QWEN_REFRESH_VERSION", "0.3.28").strip() or "0.3.28"
+# 同上：bx-v 也是 auth 域校验的必需头
+_BX_VERSION = os.getenv("QWEN_BX_VERSION", "2.5.37").strip() or "2.5.37"
 
 # chromium 启动参数：--disable-quic 是容器内的硬要求，见模块 docstring
 _LAUNCH_ARGS = [
@@ -149,19 +165,123 @@ class BrowserTokenProvider:
             return self._browser
 
     async def _context_for(self, account) -> Any:
-        """按账号复用 BrowserContext（cookie 与登录态保留）。"""
+        """按账号复用 BrowserContext（cookie 与登录态保留）。
+
+        首次创建时若磁盘上有 storage_state，直接恢复登录 cookie —— 这是
+        「不用每 15 分钟重新输密码」的关键：cookie 在，refresh 就能一直续。
+        """
         email = str(getattr(account, "email", "") or "")
         ctx = self._contexts.get(email)
         if ctx is not None:
             return ctx
         browser = await self._ensure_browser()
-        ctx = await browser.new_context(locale="zh-CN", viewport={"width": 1280, "height": 800})
+        state_path = self._session_path(email)
+        kwargs: dict[str, Any] = {
+            "locale": "zh-CN",
+            "viewport": {"width": 1280, "height": 800},
+        }
+        if state_path.exists():
+            kwargs["storage_state"] = str(state_path)
+            log.info("[TokenProvider] %s 复用已保存的浏览器会话", email)
+        ctx = await browser.new_context(**kwargs)
         try:
             await ctx.add_init_script(_STEALTH_SCRIPT)
         except Exception:
             pass
         self._contexts[email] = ctx
         return ctx
+
+    # ---- 会话持久化 -----------------------------------------------------
+
+    @staticmethod
+    def _session_path(email: str) -> Path:
+        safe = hashlib.sha1(str(email or "").encode("utf-8")).hexdigest()[:16]
+        return SESSION_DIR / f"{safe}.json"
+
+    async def _save_session(self, email: str, ctx: Any) -> None:
+        """把 context 的 cookie 落盘（原子替换，避免半截文件）。"""
+        if not email:
+            return
+        try:
+            SESSION_DIR.mkdir(parents=True, exist_ok=True)
+            path = self._session_path(email)
+            tmp = path.with_name(path.name + ".tmp")
+            await ctx.storage_state(path=str(tmp))
+            tmp.replace(path)
+        except Exception as exc:  # 落盘失败不影响本次 token 使用
+            log.warning("[TokenProvider] %s 会话保存失败: %s", email, str(exc)[:120])
+
+    async def _harvest_waf_cookies(self, account, ctx: Any) -> None:
+        """把浏览器里的风控 cookie 回写给账号，供 httpx/curl_cffi 业务请求复用。"""
+        try:
+            from backend.services.waf_cookie_manager import collect_waf_cookies
+
+            cookies = await ctx.cookies()
+            jar = {c.get("name"): c.get("value") for c in cookies if c.get("name")}
+            collected = collect_waf_cookies(jar)
+            if not collected:
+                return
+            merged = {}
+            for part in str(getattr(account, "waf_cookies", "") or "").split(";"):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    merged[k.strip()] = v.strip()
+            merged.update(collected)
+            account.waf_cookies = "; ".join(f"{k}={v}" for k, v in merged.items() if v)
+            account.waf_cookies_expires_at = time.time() + 600
+        except Exception as exc:
+            log.warning(
+                "[TokenProvider] %s WAF cookie 回写失败: %s",
+                getattr(account, "email", ""), str(exc)[:120],
+            )
+
+    # ---- 静默续期（不登录、无滑块） -------------------------------------
+
+    async def _refresh_once(self, account) -> str:
+        """用已登录的会话 cookie 调 GET /auths/refresh 换短效 access_token。
+
+        这是官网前端自己走的路径（页面加载后立刻发一次），不涉及密码与滑块，
+        只要 cookie 还在就能无限续。
+        """
+        email = str(getattr(account, "email", "") or "")
+        if not self._session_path(email).exists():
+            return ""
+        ctx = await self._context_for(account)
+        try:
+            resp = await ctx.request.get(
+                f"{AUTH_BASE_URL}/api/v2/auths/refresh",
+                headers={
+                    "accept": "application/json, text/plain, */*",
+                    "accept-language": "zh-CN,zh;q=0.9",
+                    "x-request-id": str(uuid.uuid4()),
+                    "x-request-origin": BASE_URL,
+                    "source": "web",
+                    "version": _REFRESH_VERSION,
+                    "bx-v": _BX_VERSION,
+                    # 这两个头缺一个都会 200 + {"code":"Bad_Request","details":"Invalid request header"}
+                    "referer": f"{BASE_URL}/",
+                    "timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT+0000", time.gmtime()),
+                },
+                timeout=30000,
+            )
+            data = await resp.json()
+        except Exception as exc:
+            log.info("[TokenProvider] %s refresh 请求异常: %s", email, str(exc)[:120])
+            return ""
+        if not isinstance(data, dict) or not data.get("success"):
+            detail = ""
+            if isinstance(data, dict):
+                payload = data.get("data")
+                if isinstance(payload, dict):
+                    detail = str(payload.get("details") or payload.get("code") or "")
+            log.info("[TokenProvider] %s refresh 未成功: %s", email, detail[:80])
+            return ""
+        payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+        token = str(payload.get("access_token") or payload.get("token") or "").strip()
+        if not token or not is_token_usable(token):
+            return ""
+        await self._harvest_waf_cookies(account, ctx)
+        return token
 
     async def close(self) -> None:
         """关闭所有 context 与浏览器，静默处理异常。"""
@@ -291,6 +411,9 @@ class BrowserTokenProvider:
                     email, page.url, snippet,
                 )
                 return ""
+            # 登录成功：立刻把会话 cookie 落盘，后续续期走 refresh，不再重登
+            await self._save_session(email, ctx)
+            await self._harvest_waf_cookies(account, ctx)
             return token
         except Exception as exc:
             log.warning("[TokenProvider] %s 浏览器登录失败: %s", email, str(exc)[:160])
@@ -302,7 +425,11 @@ class BrowserTokenProvider:
                 pass
 
     async def get_token(self, account, *, force: bool = False) -> str:
-        """取账号的短效 token；缓存够用直接返回，否则重新登录签发。"""
+        """取账号的短效 token。
+
+        顺序：进程内缓存 → 静默 refresh（有已保存会话时）→ 浏览器登录。
+        登录是最后手段：那是唯一会撞滑块的路径，必须尽量少走。
+        """
         email = str(getattr(account, "email", "") or "")
         if not email:
             return ""
@@ -319,6 +446,18 @@ class BrowserTokenProvider:
                 if cached and exp - time.time() > REFRESH_MARGIN_SECONDS:
                     return cached
 
+            # 1) 静默续期：只发一个 GET，无密码、无滑块
+            token = await self._refresh_once(account)
+            if token:
+                exp = token_expires_at(token) or (time.time() + 600)
+                self._cache[email] = (token, exp)
+                log.info(
+                    "[TokenProvider] %s refresh 续期 ok kind=%s ttl=%.0fs",
+                    email, token_kind(token), exp - time.time(),
+                )
+                return token
+
+            # 2) 兜底：浏览器登录（唯一会触发滑块的路径）
             async with self._login_lock:
                 token = await self._login_once(account)
             if not token:
