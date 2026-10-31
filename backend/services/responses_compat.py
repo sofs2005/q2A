@@ -61,6 +61,22 @@ def normalize_response_content(content: Any) -> Any:
                     "mime_type": part.get("mime_type", ""),
                 }
             )
+        elif part_type == "input_audio":
+            normalized.append(
+                {
+                    "type": "input_audio",
+                    "file_id": part.get("file_id", ""),
+                    "mime_type": part.get("mime_type", ""),
+                }
+            )
+        elif part_type == "input_video":
+            normalized.append(
+                {
+                    "type": "input_video",
+                    "file_id": part.get("file_id", ""),
+                    "mime_type": part.get("mime_type", ""),
+                }
+            )
     return normalized
 
 

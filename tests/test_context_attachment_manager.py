@@ -1,7 +1,10 @@
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from backend.runtime.attachment_types import NormalizedAttachment
 from backend.services.client_profiles import OPENCLAW_OPENAI_PROFILE
 from backend.services.context_attachment_manager import derive_session_key, prepare_context_attachments
 from backend.services.upstream_file_uploader import FileUploadRateLimitedError
@@ -785,6 +788,236 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         acquire_wait.assert_awaited_once_with(timeout=60, exclude={"blocked@example.com"})
+
+
+class InlineMediaAttachmentTests(unittest.IsolatedAsyncioTestCase):
+    """图片 / 音频 / 视频走 data URI 内联；文档仍走 OSS 上传。"""
+
+    def _build_app(self, *, uploader, inline_enabled: bool = True, max_bytes: int = 10 * 1024 * 1024):
+        delete_path = AsyncMock()
+        app = SimpleNamespace(state=SimpleNamespace(
+            context_offloader=ContextOffloader(SimpleNamespace(
+                CONTEXT_INLINE_MAX_CHARS=4000,
+                CONTEXT_FORCE_FILE_MAX_CHARS=10000,
+                CONTEXT_ATTACHMENT_TTL_SECONDS=600,
+                INLINE_ATTACHMENT_ENABLED=inline_enabled,
+                INLINE_ATTACHMENT_MAX_BYTES=max_bytes,
+            )),
+            account_pool=SimpleNamespace(
+                acquire_wait=AsyncMock(return_value=SimpleNamespace(email="bot@example.com")),
+                acquire_wait_preferred=AsyncMock(return_value=SimpleNamespace(email="bot@example.com")),
+                release=lambda _acc: None,
+                mark_file_upload_limited=lambda *a, **k: None,
+                file_upload_blocked_emails=lambda: set(),
+                save=AsyncMock(),
+            ),
+            file_store=SimpleNamespace(delete_path=delete_path),
+            session_affinity=SimpleNamespace(
+                get=AsyncMock(return_value=None),
+                bind_account=AsyncMock(),
+                add_uploaded_file=AsyncMock(),
+            ),
+            upstream_file_cache=SimpleNamespace(get=AsyncMock(return_value=None), set=AsyncMock()),
+            upstream_file_uploader=uploader,
+        ))
+        return app, delete_path
+
+    def _payload(self) -> dict:
+        return {"model": "qwen3.8-max", "messages": [{"role": "user", "content": "what is this"}]}
+
+    def _attachment(self, filename: str, content_type: str, raw: bytes) -> tuple[NormalizedAttachment, str]:
+        handle = tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix)
+        handle.write(raw)
+        handle.close()
+        attachment = NormalizedAttachment(
+            file_id="local-1",
+            filename=filename,
+            content_type=content_type,
+            source="inline-image",
+            local_path=handle.name,
+            sha256="abc",
+            purpose="user-upload",
+        )
+        return attachment, handle.name
+
+    async def test_image_is_inlined_without_upload_or_account_binding(self) -> None:
+        uploader = SimpleNamespace(upload_local_file=AsyncMock())
+        app, delete_path = self._build_app(uploader=uploader)
+        attachment, local_path = self._attachment("a.png", "image/png", b"png-bytes")
+        try:
+            result = await prepare_context_attachments(
+                app=app,
+                payload=self._payload(),
+                surface="openai",
+                auth_token="tok",
+                client_profile=OPENCLAW_OPENAI_PROFILE,
+                session_key="openai:inline",
+                existing_attachments=[attachment],
+            )
+        finally:
+            Path(local_path).unlink(missing_ok=True)
+
+        self.assertEqual(len(result["upstream_files"]), 1)
+        ref = result["upstream_files"][0]
+        self.assertEqual(ref["type"], "image")
+        self.assertEqual(ref["show_type"] if "show_type" in ref else ref["showType"], "image")
+        self.assertEqual(ref["file_class"], "vision")
+        self.assertEqual(ref["size"], len(b"png-bytes"))
+        self.assertTrue(ref["url"].startswith("data:image/png;base64,"))
+        self.assertEqual(ref["id"], "")
+        self.assertIsNone(result["bound_account"])
+        self.assertIsNone(result["bound_account_email"])
+        uploader.upload_local_file.assert_not_awaited()
+        app.state.account_pool.acquire_wait.assert_not_awaited()
+        app.state.session_affinity.bind_account.assert_not_awaited()
+        delete_path.assert_awaited()
+
+    async def test_audio_and_video_are_inlined(self) -> None:
+        uploader = SimpleNamespace(upload_local_file=AsyncMock())
+        app, _ = self._build_app(uploader=uploader)
+        audio, audio_path = self._attachment("voice.mp3", "audio/mpeg", b"mp3-bytes")
+        video, video_path = self._attachment("clip.mp4", "video/mp4", b"mp4-bytes")
+        try:
+            result = await prepare_context_attachments(
+                app=app,
+                payload=self._payload(),
+                surface="openai",
+                auth_token="tok",
+                client_profile=OPENCLAW_OPENAI_PROFILE,
+                session_key="openai:inline",
+                existing_attachments=[audio, video],
+            )
+        finally:
+            Path(audio_path).unlink(missing_ok=True)
+            Path(video_path).unlink(missing_ok=True)
+
+        refs = result["upstream_files"]
+        self.assertEqual([ref["type"] for ref in refs], ["audio", "video"])
+        self.assertEqual([ref["showType"] for ref in refs], ["audio", "video"])
+        self.assertEqual([ref["file_class"] for ref in refs], ["audio", "video"])
+        # 音频 / 视频不能带 context="full"（那是文档 parse 才需要的字段）
+        self.assertNotIn("context", refs[0])
+        self.assertNotIn("context", refs[1])
+        self.assertTrue(refs[0]["url"].startswith("data:audio/mpeg;base64,"))
+        self.assertTrue(refs[1]["url"].startswith("data:video/mp4;base64,"))
+        uploader.upload_local_file.assert_not_awaited()
+
+    async def test_document_still_uses_upstream_upload(self) -> None:
+        uploaded: list[str] = []
+
+        async def upload_local_file(acc, local_meta):
+            uploaded.append(local_meta["filename"])
+            return {"remote_ref": {"file_id": "remote-doc", "filename": local_meta["filename"]}}
+
+        app, _ = self._build_app(uploader=SimpleNamespace(upload_local_file=upload_local_file))
+        document, document_path = self._attachment("notes.pdf", "application/pdf", b"%PDF-1.4")
+        image, image_path = self._attachment("a.png", "image/png", b"png-bytes")
+        try:
+            result = await prepare_context_attachments(
+                app=app,
+                payload=self._payload(),
+                surface="openai",
+                auth_token="tok",
+                client_profile=OPENCLAW_OPENAI_PROFILE,
+                session_key="openai:mixed",
+                existing_attachments=[document, image],
+            )
+        finally:
+            Path(document_path).unlink(missing_ok=True)
+            Path(image_path).unlink(missing_ok=True)
+
+        self.assertEqual(uploaded, ["notes.pdf"])
+        types = [ref.get("type") for ref in result["upstream_files"]]
+        self.assertIn("image", types)
+        self.assertIn("remote-doc", [ref.get("file_id") for ref in result["upstream_files"]])
+        self.assertIsNotNone(result["bound_account"])
+
+    async def test_inline_disabled_falls_back_to_upload(self) -> None:
+        uploaded: list[str] = []
+
+        async def upload_local_file(acc, local_meta):
+            uploaded.append(local_meta["filename"])
+            return {"remote_ref": {"file_id": "remote-img", "filename": local_meta["filename"]}}
+
+        app, _ = self._build_app(
+            uploader=SimpleNamespace(upload_local_file=upload_local_file),
+            inline_enabled=False,
+        )
+        attachment, local_path = self._attachment("a.png", "image/png", b"png-bytes")
+        try:
+            result = await prepare_context_attachments(
+                app=app,
+                payload=self._payload(),
+                surface="openai",
+                auth_token="tok",
+                client_profile=OPENCLAW_OPENAI_PROFILE,
+                session_key="openai:fallback",
+                existing_attachments=[attachment],
+            )
+        finally:
+            Path(local_path).unlink(missing_ok=True)
+
+        self.assertEqual(uploaded, ["a.png"])
+        self.assertEqual(result["upstream_files"][0]["file_id"], "remote-img")
+
+    async def test_oversized_inline_media_falls_back_to_upload(self) -> None:
+        uploaded: list[str] = []
+
+        async def upload_local_file(acc, local_meta):
+            uploaded.append(local_meta["filename"])
+            return {"remote_ref": {"file_id": "remote-img", "filename": local_meta["filename"]}}
+
+        app, _ = self._build_app(
+            uploader=SimpleNamespace(upload_local_file=upload_local_file),
+            max_bytes=4,
+        )
+        attachment, local_path = self._attachment("a.png", "image/png", b"png-bytes")
+        try:
+            result = await prepare_context_attachments(
+                app=app,
+                payload=self._payload(),
+                surface="openai",
+                auth_token="tok",
+                client_profile=OPENCLAW_OPENAI_PROFILE,
+                session_key="openai:oversize",
+                existing_attachments=[attachment],
+            )
+        finally:
+            Path(local_path).unlink(missing_ok=True)
+
+        self.assertEqual(uploaded, ["a.png"])
+        self.assertEqual(result["upstream_files"][0]["file_id"], "remote-img")
+
+    async def test_missing_local_file_falls_back_to_upload(self) -> None:
+        uploaded: list[str] = []
+
+        async def upload_local_file(acc, local_meta):
+            uploaded.append(local_meta["filename"])
+            return {"remote_ref": {"file_id": "remote-img", "filename": local_meta["filename"]}}
+
+        app, _ = self._build_app(uploader=SimpleNamespace(upload_local_file=upload_local_file))
+        attachment = NormalizedAttachment(
+            file_id="local-2",
+            filename="gone.png",
+            content_type="image/png",
+            source="inline-image",
+            local_path="/nonexistent/gone.png",
+            sha256="abc",
+            purpose="user-upload",
+        )
+
+        result = await prepare_context_attachments(
+            app=app,
+            payload=self._payload(),
+            surface="openai",
+            auth_token="tok",
+            client_profile=OPENCLAW_OPENAI_PROFILE,
+            session_key="openai:missing",
+            existing_attachments=[attachment],
+        )
+
+        self.assertEqual(uploaded, ["gone.png"])
+        self.assertEqual(result["upstream_files"][0]["file_id"], "remote-img")
 
 
 if __name__ == "__main__":

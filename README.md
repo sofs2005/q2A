@@ -25,6 +25,7 @@ qwen2API 用于将通义千问（chat.qwen.ai）网页版能力转换为 OpenAI�
 - [接口支持](#接口支持)
 - [模型映射](#模型映射)
 - [图片生成](#图片生成)
+- [多模态输入（图片 / 音频 / 视频）](#多模态输入图片--音频--视频)
 - [快速开始](#快速开始)
   - [方式一：Docker 直接运行预构建镜像（推荐）](#方式一docker-直接运行预构建镜像推荐)
   - [方式二：本地源码运行](#方式二本地源码运行)
@@ -125,6 +126,7 @@ flowchart LR
 - 默认请求链路走直连 HTTP；注册、激活、刷新 Token 时按需启用浏览器自动化。
 - 多账号并发池、动态冷却、故障重试。
 - 基于千问网页真实工具链路的图片生成。
+- 多模态输入：图片 / 音频 / 视频附件（data URI 内联，不走 OSS 上传）。
 - WebUI 管理台。
 - 健康检查与就绪检查接口。
 
@@ -224,6 +226,116 @@ curl http://127.0.0.1:7860/v1/images/generations \
 - “draw an image of ……”
 
 当识别为图片生成请求时，系统会自动切换到图片生成管道。
+
+---
+
+## 多模态输入（图片 / 音频 / 视频）
+
+三种 surface 都支持把图片、音频、视频作为**输入**（不是生成）。网关会把附件统一
+归一化成本地文件，再以 `data:<mime>;base64,...` 内联进上游
+`chat/completions` 的 `messages[0].files[i].url`——实测模型能真正「看到 / 听到」内容，
+且不需要任何上传、解析或人机验证。
+
+⚠️ 内联容量受上游 `files[].url` 的 `max_length=8192`（字符）限制，**只装得下约 6KB 二进制**：
+图片会自动压缩成缩略图，音频只够 ≤1.5s 的短片段，视频基本不可行，详见
+[内联容量：只装得下 ~6KB](#内联容量只装得下-6kb)。
+
+### 怎么用
+
+OpenAI Chat（`POST /v1/chat/completions`）：
+
+```jsonc
+{
+  "model": "qwen3.8-omni-flash",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "这张图里是什么？"},
+      // 图片：data URI（推荐）。http(s) URL 需要显式开启 INLINE_ATTACHMENT_REMOTE_FETCH
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0..."}},
+      // 音频：base64 + format（wav / mp3 / m4a / aac / amr …）
+      {"type": "input_audio", "input_audio": {"data": "UklGR...", "format": "wav"}},
+      // 视频：data URI（http(s) URL 同上，需显式开启远程抓取）
+      {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA..."}}
+    ]
+  }]
+}
+```
+
+Responses API（`POST /v1/responses`）：`input_image`（`image_url` 或 `file_id`）、
+`input_audio`、`input_video` / `video_url`、`input_file`。
+
+Anthropic Messages（`POST /v1/messages`）：
+`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}`、
+`{"type":"image","source":{"type":"url","url":"https://..."}}`，
+`document` 块同理（`base64` / `url` / `text` 三种 source）。
+
+### 支持矩阵
+
+| 模型 | text | image | video | audio |
+|---|:--:|:--:|:--:|:--:|
+| `qwen3.8-omni-flash` / `qwen3.5-omni-plus` | ✅ | ✅ | ✅ | ✅ |
+| `qwen3.8-max` / `qwen3.7-plus` / `qwen3.6-plus` / `qwen3.5-plus` | ✅ | ✅ | ✅ | ❌ |
+| `qwen3.7-max` | ✅ | ❌ | ❌ | ❌ |
+
+模型不支持所请求的模态时，默认直接返回 **400**（`code=unsupported_modality`），
+错误信息里会给出建议模型；把 `MULTIMODAL_STRICT` 设为 `false` 则改为「丢弃该附件 + 日志告警」。
+
+### 相关环境变量
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `INLINE_ATTACHMENT_ENABLED` | `true` | 图片 / 音频 / 视频是否走 data URI 内联（关闭后回退 OSS 上传）。 |
+| `INLINE_ATTACHMENT_MAX_BYTES` | `10485760` | 原始字节护栏（10MB），只用于防止超大 base64 打满内存；能否内联由 url 字符数决定。 |
+| `INLINE_ATTACHMENT_MAX_URL_CHARS` | `8192` | 上游 `files[].url` 字符上限（实测 `max_length=8192`）。实现里留 92 字符边距，实际生效 8100。 |
+| `INLINE_ATTACHMENT_REMOTE_FETCH` | `false` | 是否允许下载远程 http(s) 附件（**默认关闭**，见下方 SSRF 说明）。 |
+| `MULTIMODAL_STRICT` | `true` | 模型不支持该模态时是否直接 400；`false` 时只丢弃并告警。 |
+| `MODEL_MODALITIES_OVERRIDE` | 空 | 模态矩阵覆盖（JSON），如 `{"qwen3.8-max":["text","image","video","audio"]}`。 |
+
+### 内联容量：只装得下 ~6KB
+
+上游 `messages[0].files[i].url` 是 Pydantic `max_length=8192` 的**字符串**字段
+（实测 url_len=8182 通过、8198 被拒 `url too long`），`data:<mime>;base64,` 前缀也计入长度。
+base64 膨胀 1.33 倍，因此内联实际只能承载约 **6KB 二进制**：
+
+| 类型 | 结论 |
+|---|---|
+| 图片 | 超限时用 Pillow 自动降采样 + 重编码（长边 768→512→384→256→192→128，质量 85→60→40），取第一个塞进上限的结果。典型真实照片会被压成 **~5KB / 192px 长边**的缩略图：场景仍可辨认，细节与文字丢失。 |
+| 音频 | 只有 **≤1.5s @32kbps** 的短音频能内联；超限返回 **400** `attachment_too_large`，文案会给出可缩短的目标时长。 |
+| 视频 | 内联基本不可行（6KB 放不下任何可用视频），超限返回 **400** `attachment_too_large`。 |
+| 文档 | 需要上传 + 解析（data URI 时模型只能看到 base64 原文）。 |
+
+图片压缩后仍超限、或音视频超限，一律 **400**（`{"error":{"code":"attachment_too_large","message":"..."}}`），
+**不会**把超长 url 发给上游 —— 上游遇到 `url too long` 会以 **HTTP 200 + content** 的形式返回校验错误，
+若不拦就会把错误当模型回答吐给调用方。
+
+若上游仍然拒绝了带附件的请求（`RequestValidationError` / `invalid_input` / `url too long`），
+网关会把它映射成 **400** `{"error":{"code":"upstream_attachment_rejected",...}}`，而不是 200 正文。
+纯文本请求的既有行为不受影响。
+
+### 远程 URL 附件的 SSRF 防护
+
+`INLINE_ATTACHMENT_REMOTE_FETCH` **默认 `false`**：开启后网关会替调用方发起出网请求，
+调用方可以填任意 `image_url.url`，等于把网关变成 SSRF 跳板（探测内网、读云元数据凭证）。
+
+即使显式开启，也会：
+
+- 只接受 `http` / `https`；
+- 解析目标主机（`socket.getaddrinfo`）并拒绝 loopback / private / link-local / reserved /
+  multicast / unspecified 地址（含 `127.0.0.0/8`、`10/8`、`172.16/12`、`192.168/16`、
+  `169.254/16`、`::1`、`fc00::/7`、`fe80::/10`、IPv4-mapped IPv6）；
+- 关闭 httpx 自动重定向，**每一跳**都重新校验主机与解析结果（防重定向绕过 / DNS rebinding）；
+- 20s 超时、字节上限、最多 3 跳重定向。
+
+### 已知限制
+
+- **文档仍走 OSS 上传 + 解析**（`pdf` / `docx` / `txt` 等）：上游只对文档做 `parse`，
+  data URI 方式模型只能看到 base64 原文。上传接口目前被阿里云 WAF 拼图验证码拦住，
+  命中时只打一行 WARNING（预期路径），并自动降级为「内联文本摘要 + 提示附件名」，
+  不会把请求打成 500；若该附件同时内联放不下，则明确返回 400 而不是静默丢附件。
+- 图片 / 音频 / 视频**不会**调用 `/files/parse`（上游只解析文档），也不会消耗上传配额。
+- 音频只对 omni 系列模型有意义；视频与图片对 plus / max 系列都可用。
+- 上游配额：图片 5 个 / 20MB，音频 1 个 / 2000MB，视频 1 个 / 2000MB，文档 5 个 / 20MB。
 
 ---
 
@@ -427,6 +539,10 @@ python start.py
 | `IMAGE_GENERATION_MODEL` | `qwen3.8-max` | 生图请求 chat 级 `model`。 |
 | `IMAGE_GENERATION_META_MODEL` | `qwen-image-3.0-pro` | 生图请求 `extra.meta.model`，即真正出图的模型。留空则不发送该键，出图模型交由 `IMAGE_GENERATION_MODEL` 路由。 |
 | `GENERATED_IMAGE_TTL_SECONDS` | `3600` | 生图本地缓存 TTL（秒）。 |
+
+> 多模态附件相关变量（`INLINE_ATTACHMENT_ENABLED` / `INLINE_ATTACHMENT_MAX_BYTES` /
+> `INLINE_ATTACHMENT_MAX_URL_CHARS` / `INLINE_ATTACHMENT_REMOTE_FETCH` / `MULTIMODAL_STRICT` /
+> `MODEL_MODALITIES_OVERRIDE`）见[多模态输入](#多模态输入图片--音频--视频)。
 
 ### 数据路径参数
 

@@ -5,6 +5,7 @@ pydantic-settings
 python-dotenv
 python-multipart
 tiktoken
+pillow
 curl_cffi
 oss2
 playwright

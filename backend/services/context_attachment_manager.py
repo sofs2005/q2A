@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import uuid
@@ -7,11 +8,20 @@ from pathlib import Path
 from typing import Any
 
 from backend.core.upstream_file_cache import UpstreamFileCacheEntry
+from backend.services.attachment_errors import InlineMediaTooLargeError
 from backend.services.client_profiles import user_role_system_text
+from backend.services.inline_media_ref import (
+    KIND_AUDIO,
+    KIND_IMAGE,
+    KIND_VIDEO,
+    build_inline_ref,
+    classify_media,
+)
 from backend.services.token_calc import count_tokens
 from backend.services.standard_request_builder import _excluded_command_like_tool_names
 from backend.services.upstream_file_uploader import (
     FileUploadRateLimitedError,
+    UpstreamWafChallengeError,
     safe_signed_url_cache_expires_at,
 )
 from backend.toolcore.context_offload import SYSTEM_CONTEXT_FILE_PREFIX, SYSTEM_CONTEXT_PROMPT_NOTE
@@ -95,6 +105,92 @@ def _text_from_content(content: Any) -> str:
             if isinstance(part, dict) and part.get("type") in {"text", "input_text", "output_text"}
         )
     return str(content or "")
+
+
+# 图片 / 音频 / 视频走「本地字节 → data URI 内联 ref」：不调上传、不调 parse、
+# 不换号、不绑账号（实测上游 `files[i].url` 直接吃 data URI）。
+_INLINE_MEDIA_KINDS = frozenset({KIND_IMAGE, KIND_AUDIO, KIND_VIDEO})
+_DEFAULT_INLINE_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _is_inline_media_attachment(attachment: Any) -> bool:
+    """该附件是否可以直接内联（图片 / 音频 / 视频，且本地有字节）。"""
+    if getattr(attachment, "remote_ref", None):
+        return False
+    if not getattr(attachment, "local_path", ""):
+        return False
+    kind = classify_media(
+        str(getattr(attachment, "filename", "") or ""),
+        str(getattr(attachment, "content_type", "") or ""),
+    )
+    return kind in _INLINE_MEDIA_KINDS
+
+
+async def _inline_ref_for_attachment(
+    attachment: Any,
+    *,
+    settings_obj: Any,
+) -> tuple[dict[str, Any] | None, InlineMediaTooLargeError | None]:
+    """读本地字节并构造内联 ref。
+
+    返回 `(ref, too_large_error)`：
+
+    - 成功：`(ref, None)`
+    - 读不到 / 开关关闭 / 超过字节护栏：`(None, None)`，调用方回退上传
+    - url 字符数超限且压不进上限：`(None, InlineMediaTooLargeError)`，
+      调用方回退上传；若上传也不可用（WAF / 无账号）则把它抛出去换 4xx，
+      绝不静默丢附件。
+    """
+    if not bool(getattr(settings_obj, "INLINE_ATTACHMENT_ENABLED", True)):
+        return None, None
+    max_bytes = int(getattr(settings_obj, "INLINE_ATTACHMENT_MAX_BYTES", _DEFAULT_INLINE_ATTACHMENT_MAX_BYTES) or 0)
+    max_url_chars = getattr(settings_obj, "INLINE_ATTACHMENT_MAX_URL_CHARS", None)
+    path = str(getattr(attachment, "local_path", "") or "")
+    if not path:
+        return None, None
+    try:
+        raw = await asyncio.to_thread(Path(path).read_bytes)
+    except OSError as exc:
+        log.warning(
+            "[ContextAttachment] inline media read failed filename=%s error=%s",
+            getattr(attachment, "filename", ""),
+            exc,
+        )
+        return None, None
+    if not raw:
+        log.warning("[ContextAttachment] inline media is empty filename=%s", getattr(attachment, "filename", ""))
+        return None, None
+    if max_bytes > 0 and len(raw) > max_bytes:
+        log.warning(
+            "[ContextAttachment] inline media exceeds limit filename=%s size=%s limit=%s; falling back to upstream upload",
+            getattr(attachment, "filename", ""),
+            len(raw),
+            max_bytes,
+        )
+        return None, None
+    filename = str(getattr(attachment, "filename", "") or "")
+    content_type = str(getattr(attachment, "content_type", "") or "")
+    try:
+        # 图片压缩是 CPU 活（Pillow 解码 + 多轮重编码），放到线程里跑。
+        ref = await asyncio.to_thread(
+            build_inline_ref,
+            filename,
+            content_type,
+            raw,
+            max_url_chars=(int(max_url_chars) if max_url_chars else None),
+        )
+    except InlineMediaTooLargeError as exc:
+        log.warning(
+            "[ContextAttachment] inline media too large filename=%s url_chars=%s limit=%s size=%s kind=%s; "
+            "falling back to upstream upload",
+            filename,
+            exc.url_chars,
+            exc.limit,
+            exc.size,
+            exc.kind,
+        )
+        return None, exc
+    return ref, None
 
 
 def build_request_session_key(surface: str, request_id: str) -> str:
@@ -231,6 +327,64 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
             "attachment_fallback": False,
         }
 
+    # 图片 / 音频 / 视频不需要上游上传与解析，直接内联；文档仍走原 OSS 上传链路。
+    inline_media_attachments: list[Any] = []
+    upload_attachments: list[Any] = []
+    for attachment in manual_attachments:
+        if _is_inline_media_attachment(attachment):
+            inline_media_attachments.append(attachment)
+        else:
+            upload_attachments.append(attachment)
+
+    # 内联媒体不依赖上游账号：先处理，失败（读取失败 / 超限 / 开关关闭）才回退上传。
+    upstream_files = list(payload.get("upstream_files", []) or [])
+    fallback_uploads: list[Any] = []
+    inline_too_large_errors: list[InlineMediaTooLargeError] = []
+    inline_ok = 0
+    for attachment in inline_media_attachments:
+        inline_ref, too_large = await _inline_ref_for_attachment(
+            attachment,
+            settings_obj=context_offloader.settings,
+        )
+        if inline_ref is None:
+            log.warning(
+                "[ContextAttachment] inline media unavailable session_key=%s surface=%s filename=%s content_type=%s too_large=%s",
+                session_key,
+                surface,
+                getattr(attachment, "filename", ""),
+                getattr(attachment, "content_type", ""),
+                too_large is not None,
+            )
+            if too_large is not None:
+                inline_too_large_errors.append(too_large)
+            fallback_uploads.append(attachment)
+            continue
+        upstream_files.append(inline_ref)
+        inline_ok += 1
+        # 已内联进 payload，本地副本不再需要
+        await file_store.delete_path(attachment.local_path)
+
+    # 纯内联媒体：不挑号、不绑号、不上传、不解析。
+    if not upload_attachments and not fallback_uploads and not use_generated_context_files and not payload.get("upstream_files"):
+        log.info(
+            "[ContextAttachment] inline media only session_key=%s surface=%s inline=%s total=%s",
+            session_key,
+            surface,
+            inline_ok,
+            len(inline_media_attachments),
+        )
+        return {
+            "payload": payload,
+            "session_key": session_key,
+            "context_mode": "inline",
+            "upstream_files": upstream_files,
+            "bound_account": None,
+            "bound_account_email": None,
+            "generated_local_files": [],
+            "context_attachment_tokens": 0,
+            "attachment_fallback": bool(inline_media_attachments) and inline_ok == 0,
+        }
+
     requires_sticky_account = bool(manual_attachments or payload.get("upstream_files"))
     record = await affinity.get(session_key) if requires_sticky_account else None
     preferred_email = record.account_email if record else None
@@ -253,6 +407,9 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
             [getattr(att, "filename", "") for att in manual_attachments],
             [getattr(item, "ext", "") for item in getattr(plan, "generated_files", [])],
         )
+        if inline_too_large_errors:
+            # 内联放不下 + 没有账号可上传 → 明确 4xx，绝不静默丢附件。
+            raise inline_too_large_errors[0]
         return _fallback_context_attachment_result(
             payload=payload,
             session_key=session_key,
@@ -266,7 +423,6 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
         )
     await affinity.bind_account(session_key, surface, acc.email, context_offloader.settings.CONTEXT_ATTACHMENT_TTL_SECONDS)
 
-    upstream_files = list(payload.get("upstream_files", []) or [])
     local_file_records: list[dict[str, Any]] = []
     context_attachment_tokens = 0
     attachment_ttl = context_offloader.settings.CONTEXT_ATTACHMENT_TTL_SECONDS
@@ -339,7 +495,8 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                 current_acc = await _switch_account_on_retry(current_acc, upload_exc)
 
     try:
-        for attachment in manual_attachments:
+        # 内联失败（读取失败 / 超限）的媒体在这里补走一次上传链路。
+        for attachment in list(upload_attachments) + list(fallback_uploads):
             if getattr(attachment, "remote_ref", None):
                 upstream_files.append(attachment.remote_ref)
                 continue
@@ -402,16 +559,30 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                 await file_store.delete_path(local_meta["path"])
                 local_file_records.append(local_meta)
     except Exception as exc:
-        log.exception(
-            "[ContextAttachment] upload failed session_key=%s surface=%s account=%s manual_attachments=%s generated_files=%s error=%s",
-            session_key,
-            surface,
-            getattr(acc, "email", None),
-            [getattr(att, "filename", "") for att in manual_attachments],
-            [getattr(item, "ext", "") for item in getattr(plan, "generated_files", [])],
-            exc,
-        )
+        # 上游上传被 WAF 人机验证拦住是**预期路径**（getstsToken 现在必被拦），
+        # 只打一行 warning、不打整栈 ERROR；其它异常保留 exception 便于排查。
+        if isinstance(exc, UpstreamWafChallengeError):
+            log.warning(
+                "[ContextAttachment] upstream upload blocked by WAF session_key=%s surface=%s account=%s error=%s",
+                session_key,
+                surface,
+                getattr(acc, "email", None),
+                str(exc)[:200],
+            )
+        else:
+            log.exception(
+                "[ContextAttachment] upload failed session_key=%s surface=%s account=%s manual_attachments=%s generated_files=%s error=%s",
+                session_key,
+                surface,
+                getattr(acc, "email", None),
+                [getattr(att, "filename", "") for att in manual_attachments],
+                [getattr(item, "ext", "") for item in getattr(plan, "generated_files", [])],
+                exc,
+            )
         account_pool.release(acc)
+        if inline_too_large_errors:
+            # 内联放不下 + 上传回退不可用 → 明确 4xx，绝不静默丢附件。
+            raise inline_too_large_errors[0] from exc
         return _fallback_context_attachment_result(
             payload=payload,
             session_key=session_key,

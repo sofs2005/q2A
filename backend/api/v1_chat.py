@@ -11,6 +11,10 @@ from backend.adapter.standard_request import StandardRequest, detect_openai_clie
 from backend.core.config import settings
 from backend.core.request_logging import new_request_id, request_context, update_request_context
 from backend.services.attachment_preprocessor import preprocess_attachments
+from backend.services.attachment_errors import (
+    InlineMediaTooLargeError,
+    UpstreamAttachmentRejectedError,
+)
 from backend.services.context_attachment_manager import build_request_session_key, prepare_context_attachments
 from backend.services.auth_quota import resolve_auth_context
 from backend.services.command_environment import detect_command_environment, format_command_environment_hint
@@ -1307,6 +1311,30 @@ async def chat_completions(request: Request):
                                     await queue.put(chunk)
                         except HTTPException as he:
                             await queue.put(f"data: {json.dumps({'error': he.detail})}\n\n")
+                        except (InlineMediaTooLargeError, UpstreamAttachmentRejectedError) as attachment_exc:
+                            # 流已开始（响应头已发出），无法再改状态码；但必须发一条
+                            # 带 code 的 error 帧，而不是把上游校验错误当正文吐给用户。
+                            attachment_code = str(getattr(attachment_exc, "code", "") or "attachment_error")
+                            log.warning(
+                                "[OAI] stream_attachment_error req_id=%s completion_id=%s code=%s error=%s",
+                                req_id,
+                                completion_id,
+                                attachment_code,
+                                attachment_exc,
+                            )
+                            await queue.put(
+                                "data: "
+                                + json.dumps(
+                                    {
+                                        "error": {
+                                            "code": attachment_code,
+                                            "message": str(attachment_exc),
+                                            "type": "invalid_request_error",
+                                        }
+                                    }
+                                )
+                                + "\n\n"
+                            )
                         except Exception as e:
                             log.exception(
                                 "[OAI] stream_error req_id=%s completion_id=%s prompt_hash=%s error=%s",
@@ -1417,6 +1445,12 @@ async def chat_completions(request: Request):
                 if singleflight_owner and singleflight_key is not None:
                     await _openai_json_singleflight.complete(singleflight_key, payload)
                 return JSONResponse(payload)
+        except (InlineMediaTooLargeError, UpstreamAttachmentRejectedError) as attachment_exc:
+            # 附件类错误保留 4xx 语义（由 main.py 注册的异常处理器渲染 body），
+            # 绝不能包成 500 —— 否则调用方只会以为是网关故障，而不是"附件没送到"。
+            if singleflight_owner and singleflight_key is not None:
+                await _openai_json_singleflight.fail(singleflight_key, attachment_exc)
+            raise
         except Exception as e:
             if singleflight_owner and singleflight_key is not None:
                 await _openai_json_singleflight.fail(singleflight_key, e)

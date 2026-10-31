@@ -4,8 +4,9 @@ import logging
 import signal
 import sys
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import os
 import sys
 
@@ -27,6 +28,15 @@ from backend.services.file_store import LocalFileStore
 from backend.toolcore.context_offload import ContextOffloader
 from backend.services.response_store import InMemoryResponseStore
 from backend.services.upstream_file_uploader import UpstreamFileUploader
+from backend.services.model_modalities import ModalityNotSupportedError
+from backend.services.attachment_errors import (
+    InlineMediaTooLargeError,
+    UpstreamAttachmentRejectedError,
+)
+from backend.api.attachment_error_handlers import (
+    inline_media_too_large_handler,
+    upstream_attachment_rejected_handler,
+)
 import backend.api.models as models
 from backend.api import admin, v1_chat, responses_api, probes, anthropic, gemini, embeddings, images, videos, files_api
 from backend.services.garbage_collector import garbage_collect_chats
@@ -177,6 +187,28 @@ async def lifespan(app: FastAPI):
         await close_all_sessions()
 
 app = FastAPI(title="qwen2API Enterprise Gateway", version=VERSION_LABEL, lifespan=lifespan)
+
+
+@app.exception_handler(ModalityNotSupportedError)
+async def modality_not_supported_handler(request: Request, exc: ModalityNotSupportedError) -> JSONResponse:
+    """多模态门控失败：按 400 返回，让调用方知道该换成支持该模态的模型。"""
+    log.warning("[Modality] rejected request path=%s error=%s", request.url.path, exc)
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": {
+                "message": str(exc),
+                "type": "invalid_request_error",
+                "code": "unsupported_modality",
+            }
+        },
+    )
+
+
+# 附件链路的异常处理器实现放在 backend/api/attachment_error_handlers.py
+# （只依赖 fastapi.responses，便于独立测试），这里负责把它们挂到 app 上。
+app.add_exception_handler(InlineMediaTooLargeError, inline_media_too_large_handler)
+app.add_exception_handler(UpstreamAttachmentRejectedError, upstream_attachment_rejected_handler)
 
 app.add_middleware(
     CORSMiddleware,

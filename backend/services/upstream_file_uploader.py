@@ -18,6 +18,15 @@ _DEFAULT_UPLOAD_RATE_LIMIT_RETRY_SECONDS = 3600.0
 _SIGNED_URL_EXPIRY_SAFETY_SECONDS = 30.0
 _OSS_DATE_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$")
 
+# 阿里云 WAF 人机验证（滑块 / 拼图）页面特征。上传接口被拦时上游返回 HTML
+# 而非 JSON，必须识别出来给明确错误，不能让 json.loads 抛 JSONDecodeError。
+_WAF_CHALLENGE_MARKERS = (
+    "aliyun_waf",
+    "aliyuncaptcha",
+    "<!doctype html",
+    "sceneid=",
+)
+
 
 class FileUploadRateLimitedError(Exception):
     """上游文件上传命中每日配额（getstsToken 返回 code=RateLimited）。
@@ -28,6 +37,42 @@ class FileUploadRateLimitedError(Exception):
     def __init__(self, retry_after_seconds: float, message: str = "") -> None:
         self.retry_after_seconds = max(0.0, float(retry_after_seconds or 0))
         super().__init__(message or f"file upload rate limited; retry after {self.retry_after_seconds:.0f}s")
+
+
+class UpstreamWafChallengeError(Exception):
+    """上游返回阿里云 WAF 人机验证页面（滑块 / 拼图），而非 JSON。
+
+    实测 `/api/v2/files/getstsToken` 现在 100% 撞 WAF 拼图验证码，网页端也要人工
+    拖拼图。抛这个异常让上层（context_attachment_manager）优雅降级为内联文本回退，
+    而不是抛 JSONDecodeError 把整条请求打成 500。
+    """
+
+    def __init__(self, message: str = "") -> None:
+        super().__init__(
+            message
+            or "waf_challenge: upstream returned an Aliyun WAF challenge page instead of JSON"
+        )
+
+
+def looks_like_waf_challenge(body: str) -> bool:
+    """判断响应体是否阿里云 WAF 验证页面。"""
+    lowered = str(body or "").lower()
+    return any(marker in lowered for marker in _WAF_CHALLENGE_MARKERS)
+
+
+def _parse_json_body(resp: dict[str, Any], *, endpoint: str) -> dict[str, Any]:
+    """安全解析上游响应体：WAF 页面 → UpstreamWafChallengeError，非 JSON → RuntimeError。"""
+    body = str((resp or {}).get("body") or "")
+    if looks_like_waf_challenge(body):
+        raise UpstreamWafChallengeError(
+            f"waf_challenge: {endpoint} returned an Aliyun WAF challenge page (slider/puzzle captcha); "
+            "upstream file upload is blocked by anti-bot verification"
+        )
+    try:
+        data = json.loads(body or "{}")
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"{endpoint} returned non-JSON body: {body[:200]}") from exc
+    return data if isinstance(data, dict) else {}
 
 
 def _upload_filetype_from_content_type(content_type: str) -> str:
@@ -56,6 +101,10 @@ def _remote_ref_type_from_content_type(content_type: str) -> str:
     lowered = (content_type or "").lower()
     if lowered.startswith("image/"):
         return "image"
+    if lowered.startswith("audio/"):
+        return "audio"
+    if lowered.startswith("video/"):
+        return "video"
     return "file"
 
 
@@ -177,8 +226,13 @@ class UpstreamFileUploader:
             account=acc,
         )
         if sts_resp.get("status") != 200:
+            if looks_like_waf_challenge(str(sts_resp.get("body") or "")):
+                raise UpstreamWafChallengeError(
+                    "waf_challenge: /api/v2/files/getstsToken returned an Aliyun WAF challenge page; "
+                    "upstream file upload is blocked by anti-bot verification"
+                )
             raise RuntimeError(f"getstsToken failed: {sts_resp.get('status')} {sts_resp.get('body', '')[:200]}")
-        sts_data = json.loads(sts_resp.get("body", "{}"))
+        sts_data = _parse_json_body(sts_resp, endpoint="/api/v2/files/getstsToken")
         sts = (sts_data.get("data") or {}) if isinstance(sts_data, dict) else {}
         if str(sts.get("code") or "") == "RateLimited":
             try:
@@ -226,8 +280,11 @@ class UpstreamFileUploader:
             raise RuntimeError(f"OSS put_object failed: status={getattr(put_result, 'status', None)}")
 
         remote_type = _remote_ref_type_from_content_type(content_type)
+        file_class = _remote_file_class_from_content_type(content_type)
         parse_status = "success"
-        if remote_type != "image":
+        # 上游只对文档解析（`parsedFileTypes=[FILE]`）：图片 / 音频 / 视频直传即可，
+        # 绝不能调 /files/parse（会报错或被当作文档处理）。
+        if file_class == "document":
             parse_resp = await self.client._request_json(
                 "POST",
                 "/api/v2/files/parse",
@@ -237,7 +294,13 @@ class UpstreamFileUploader:
                 account=acc,
             )
             if parse_resp.get("status") != 200:
+                if looks_like_waf_challenge(str(parse_resp.get("body") or "")):
+                    raise UpstreamWafChallengeError(
+                        "waf_challenge: /api/v2/files/parse returned an Aliyun WAF challenge page"
+                    )
                 raise RuntimeError(f"files/parse failed: {parse_resp.get('status')} {parse_resp.get('body', '')[:200]}")
+            # 200 也可能返回 WAF 页面（阿里云验证码有时以 200 落地），统一走安全解析。
+            _parse_json_body(parse_resp, endpoint="/api/v2/files/parse")
 
             deadline = time.time() + self.settings.CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS
             parse_status = "pending"
@@ -251,8 +314,12 @@ class UpstreamFileUploader:
                     account=acc,
                 )
                 if status_resp.get("status") != 200:
+                    if looks_like_waf_challenge(str(status_resp.get("body") or "")):
+                        raise UpstreamWafChallengeError(
+                            "waf_challenge: /api/v2/files/parse/status returned an Aliyun WAF challenge page"
+                        )
                     raise RuntimeError(f"files/parse/status failed: {status_resp.get('status')} {status_resp.get('body', '')[:200]}")
-                status_data = json.loads(status_resp.get("body", "{}"))
+                status_data = _parse_json_body(status_resp, endpoint="/api/v2/files/parse/status")
                 rows = status_data.get("data") or []
                 row = rows[0] if isinstance(rows, list) and rows else {}
                 parse_status = row.get("status", "pending")
@@ -305,7 +372,7 @@ class UpstreamFileUploader:
             "itemId": str(uuid.uuid4()),
             "file_type": content_type,
             "showType": remote_type,
-            "file_class": _remote_file_class_from_content_type(content_type),
+            "file_class": file_class,
             "uploadTaskId": str(uuid.uuid4()),
         }
         return {

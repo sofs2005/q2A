@@ -139,6 +139,10 @@ def _extract_text(content, user_tool_mode: bool = False, client_profile: str = O
                 other_parts.append(f"[Attachment file_id={part.get('file_id', '')} filename={part.get('filename', '')}]")
             elif part_type == "input_image":
                 other_parts.append(f"[Attachment image file_id={part.get('file_id', '')} mime={part.get('mime_type', '')}]")
+            elif part_type == "input_audio":
+                other_parts.append(f"[Attachment audio file_id={part.get('file_id', '')} mime={part.get('mime_type', '')}]")
+            elif part_type == "input_video":
+                other_parts.append(f"[Attachment video file_id={part.get('file_id', '')} mime={part.get('mime_type', '')}]")
 
         parts.extend(text_blocks)
         parts.extend(other_parts)

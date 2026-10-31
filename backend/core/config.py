@@ -145,6 +145,23 @@ class Settings(BaseSettings):
     # 路由，出图模型不可控，故给一个明确的默认值。
     IMAGE_GENERATION_META_MODEL: str = os.getenv("IMAGE_GENERATION_META_MODEL", "qwen-image-3.0-pro").strip()
     CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS: int = int(os.getenv("CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS", 60))
+    # 多模态附件：图片 / 音频 / 视频默认走 data URI 内联（实测上游 files[i].url 直接吃
+    # data URI，且 /api/v2/files/getstsToken 已被阿里云 WAF 拼图验证码拦住）。
+    INLINE_ATTACHMENT_ENABLED: bool = os.getenv("INLINE_ATTACHMENT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    # 单个内联附件原始字节上限（护栏）。真正的门控是 url 字符数
+    # （INLINE_ATTACHMENT_MAX_URL_CHARS），因为上游限制的是 base64 后的 url 长度。
+    INLINE_ATTACHMENT_MAX_BYTES: int = int(os.getenv("INLINE_ATTACHMENT_MAX_BYTES", 10485760))
+    # 上游 messages[0].files[i].url 是 max_length=8192 的字符串（实测 8182 通过 /
+    # 8198 被拒 "url too long"）。内联只够装约 6KB 二进制，实现里另留 92 字符边距。
+    INLINE_ATTACHMENT_MAX_URL_CHARS: int = int(os.getenv("INLINE_ATTACHMENT_MAX_URL_CHARS", 8192))
+    # 是否允许下载远程 http(s) URL 附件（默认关闭）。开启后网关会替调用方发起
+    # 出网请求，存在 SSRF 风险（内网探测 / 云元数据凭证泄露），故默认 false；
+    # 开启时也会做私网地址校验 + 每跳重定向复检。
+    INLINE_ATTACHMENT_REMOTE_FETCH: bool = os.getenv("INLINE_ATTACHMENT_REMOTE_FETCH", "false").lower() in {"1", "true", "yes", "on"}
+    # 模态门控：true=模型不支持该模态时直接 400；false=只丢弃该附件并 warn。
+    MULTIMODAL_STRICT: bool = os.getenv("MULTIMODAL_STRICT", "true").lower() in {"1", "true", "yes", "on"}
+    # 模型模态覆盖表（JSON，如 {"qwen3.8-max":["text","image","video","audio"]}）。
+    MODEL_MODALITIES_OVERRIDE: str = os.getenv("MODEL_MODALITIES_OVERRIDE", "")
     CONTEXT_GENERATED_DIR: str = os.getenv("CONTEXT_GENERATED_DIR", str(DATA_DIR / "context_files"))
     CONTEXT_CACHE_FILE: str = os.getenv("CONTEXT_CACHE_FILE", str(DATA_DIR / "context_cache.json"))
     UPLOADED_FILES_FILE: str = os.getenv("UPLOADED_FILES_FILE", str(DATA_DIR / "uploaded_files.json"))

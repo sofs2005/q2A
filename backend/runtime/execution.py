@@ -14,6 +14,7 @@ from backend.core.request_logging import update_request_context
 from backend.runtime.command_error_adaptation import classify_command_error, build_command_error_retry_prompt, looks_like_command_error
 from backend.runtime.stream_metrics import StreamMetrics
 from backend.services import tool_parser
+from backend.services.attachment_errors import attachment_rejection_from_upstream_error
 from backend.services.token_calc import (
     completion_text_for_usage,
     count_tokens,
@@ -775,6 +776,23 @@ async def collect_completion_run(
             if evt_type == "error":
                 upstream_error_code = str(evt.get("code") or "unknown")
                 upstream_error_details = str(evt.get("details") or evt.get("content") or "upstream error")
+                # 带附件的请求若被上游以「参数校验失败」拒绝（如 url too long），
+                # 必须抛 4xx，绝不能降级成 200 + "[upstream_error] ..." 正文 ——
+                # 上游把 RequestValidationError 塞在 content 里以 200 返回，若不识别，
+                # 调用方会以为附件已经送达。纯文本请求保持既有行为不变。
+                rejection = attachment_rejection_from_upstream_error(
+                    code=upstream_error_code,
+                    details=upstream_error_details,
+                    has_files=bool(getattr(request, "upstream_files", None)),
+                )
+                if rejection is not None:
+                    log.warning(
+                        "[Collect] upstream rejected attachments chat_id=%s code=%s details=%s",
+                        chat_id,
+                        upstream_error_code,
+                        upstream_error_details[:200],
+                    )
+                    raise rejection
                 log.warning(
                     "[Collect] upstream SSE error chat_id=%s code=%s details=%s",
                     chat_id,
