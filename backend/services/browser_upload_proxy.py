@@ -297,7 +297,7 @@ def resolve_browser_mode(settings_obj: Any) -> str:
     Returns:
         `remote` / `local` / `off` 之一。
     """
-    upload_mode = str(getattr(settings_obj, "UPLOAD_VIA_BROWSER", "auto") or "auto").strip().lower()
+    upload_mode = str(getattr(settings_obj, "UPLOAD_VIA_BROWSER", "never") or "never").strip().lower()
     if upload_mode == "never":
         return BROWSER_MODE_OFF
     mode = normalize_browser_mode(getattr(settings_obj, "UPLOAD_BROWSER_MODE", BROWSER_MODE_AUTO))
@@ -851,11 +851,13 @@ class _NullSettings:
 
     UPLOAD_CDP_ENDPOINT = ""
     UPLOAD_BROWSER_MODE = BROWSER_MODE_AUTO
-    UPLOAD_VIA_BROWSER = "auto"
+    # 配置不可用时的安全默认：整条链路关闭（不启浏览器）。
+    UPLOAD_VIA_BROWSER = "never"
     UPLOAD_CAPTCHA_MAX_ROUNDS = 3
     UPLOAD_CAPTCHA_TIMEOUT_SECONDS = 30
     UPLOAD_DRAG_MAPPING = "auto"
     UPLOAD_BROWSER_TIMEOUT_SECONDS = 120
+    UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS = 45
     UPLOAD_DRAG_CALIBRATION_FILE = "data/drag_calibration.json"
     UPSTREAM_PROXY = ""
 
@@ -927,8 +929,8 @@ class BrowserUploadProxy:
 
     @property
     def upload_mode(self) -> str:
-        mode = str(self._cfg("UPLOAD_VIA_BROWSER", "auto") or "auto").strip().lower()
-        return mode if mode in {"auto", "always", "never"} else "auto"
+        mode = str(self._cfg("UPLOAD_VIA_BROWSER", "never") or "never").strip().lower()
+        return mode if mode in {"auto", "always", "never"} else "never"
 
     @property
     def configured_browser_mode(self) -> str:
@@ -964,6 +966,20 @@ class BrowserUploadProxy:
             return max(1.0, float(self._cfg("UPLOAD_BROWSER_TIMEOUT_SECONDS", 120)))
         except (TypeError, ValueError):
             return 120.0
+
+    @property
+    def hard_timeout_seconds(self) -> float:
+        """整段浏览器上传的硬超时（秒）；调用方（`context_attachment_manager`）用它
+        包一层 `asyncio.wait_for`，保证浏览器卡死时能按「不可用」降级。
+
+        与 :attr:`browser_timeout_seconds` 的区别：后者是**单次页面操作**（`goto` /
+        等元素）的超时，整条链路是「连接 + 种登录态 + 若干轮验证码 + 取 STS」，
+        累加起来远超它，所以必须另有一个请求级护栏，且更短（默认 45s）。
+        """
+        try:
+            return max(1.0, float(self._cfg("UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS", 45)))
+        except (TypeError, ValueError):
+            return 45.0
 
     @property
     def enabled(self) -> bool:
@@ -1002,6 +1018,21 @@ class BrowserUploadProxy:
         key = str(email or "")
         self._failure_streak[key] = 0
         self._cooldown_until.pop(key, None)
+
+    def note_hard_timeout(self, email: str) -> None:
+        """记录一次「硬超时」：直接打开该账号的熔断（冷却 10 分钟）。
+
+        硬超时意味着浏览器链路本身坏了（启动卡死 / 页面卡死 / 验证码无限循环），
+        不是「这次拼图没解对」。继续为同一个账号付第二次硬超时没有意义，因此这里
+        一次性记满 `max_captcha_rounds` 次失败，让下一个请求直接走降级路径。
+        """
+        key = str(email or "")
+        self._register_failure(key, count=self.max_captcha_rounds)
+        log.warning(
+            "[BrowserUpload] hard timeout; circuit breaker opened account=%s cooldown=%ss",
+            key or "-",
+            int(self.cooldown_remaining(key)),
+        )
 
     def recent_captcha_pass(self, *, window_seconds: float = CAPTCHA_RECENT_WINDOW_SECONDS) -> bool:
         """最近是否成功过验证码（运维探针用）。"""

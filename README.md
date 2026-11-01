@@ -330,6 +330,10 @@ base64 膨胀 1.33 倍，因此内联实际只能承载约 **6KB 二进制**：
 
 ### 浏览器上传代理（突破 6KB 内联上限）
 
+> ⚠️ **默认关闭**（`UPLOAD_VIA_BROWSER=never`）。该通道通过率尚未验证，而失败代价是
+> 「起 Chromium + 种登录态 + 解拼图」把请求拖慢几十秒到几分钟、并消耗账号风控分。
+> 需要它的部署请显式设 `UPLOAD_VIA_BROWSER=auto`。
+
 内联只装得下约 6KB，超过就得走上游 OSS 上传，而 `POST /api/v2/files/getstsToken`
 被阿里云 WAF 的**拼图验证码**拦着，纯 HTTP 客户端过不去。浏览器上传代理的做法是：
 **用一台真实浏览器只做「过验证码 + 换 STS 凭证」这件事**，拿到凭证后 OSS PUT 与 ref
@@ -341,13 +345,21 @@ base64 膨胀 1.33 倍，因此内联实际只能承载约 **6KB 二进制**：
                                └ 失败/未配置 ──▶ 400 attachment_too_large
 ```
 
+**作用域（重要）**：浏览器上传**只用于调用方真实提供的附件**
+（`NormalizedAttachment`，`source` 为 `inline-*` / `remote-url` / `manual-upload`）。
+网关内部生成的 context 文件（`plan.generated_files`，即上下文卸载产物）**永远不走**
+浏览器上传——它们每个带 `tools` / 大上下文的请求都会产生，且本来就有兜底（HTTP OSS
+上传，撞 WAF 降级为内联文本）。让它们走浏览器，等于给普通请求挂一次「开浏览器解拼图」，
+请求会被直接拖死（曾把 3s 的带 tools 请求拖成 120s 超时）。
+
 - 两种连接模式，按配置自动选择：
   - **remote**：连一个可通过 CDP 连接的浏览器端点，例如远程 browserless / 带 `--remote-debugging-port` 的 Chrome：
     ```bash
     UPLOAD_CDP_ENDPOINT=http://10.6.6.4:3000
-    UPLOAD_VIA_BROWSER=auto          # auto | always | never
+    UPLOAD_VIA_BROWSER=auto          # auto | always | never（默认 never）
     UPLOAD_CAPTCHA_MAX_ROUNDS=3      # 验证码可能要过两轮
     UPLOAD_DRAG_MAPPING=auto         # auto | linear | quadratic
+    UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS=45   # 整段浏览器上传的硬超时
     ```
   - **local**：`UPLOAD_CDP_ENDPOINT` **留空**即在本进程内启动一个 Playwright Chromium，
     不需要任何外部机器（镜像已带 playwright + chromium）：
@@ -369,6 +381,9 @@ base64 膨胀 1.33 倍，因此内联实际只能承载约 **6KB 二进制**：
   结果缓存在 `data/drag_calibration.json`（不同浏览器/缩放只需标定一次）。缓存里记录了标定时的
   `mode`，remote ↔ local 切换后会重新标定（两种模式映射曲线不同）。
 - 账号级熔断：连续失败达上限后该账号 10 分钟内不再尝试浏览器上传，避免把风控分打高。
+- **硬超时**：`UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS`（默认 45s）包住整段「读字节 + 换 STS +
+  OSS PUT」，超时按「浏览器不可用」处理并降级到 HTTP 上传 / 内联，同时立即熔断该账号
+  10 分钟——浏览器卡死时绝不让请求等满两分钟。
 - 排查：`GET /admin/upload/probe` 返回 `mode`（`remote` / `local` / `off`）、连接状态与浏览器版本。
 - ⚠️ 该通道依赖真实浏览器环境与干净的出口 IP；同一 IP 短时间内反复触发验证码会被风控
   回 `F015`（频率类），此时需要冷却或更换出口。

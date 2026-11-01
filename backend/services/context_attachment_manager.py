@@ -33,6 +33,11 @@ log = logging.getLogger("qwen2api.context_attachment_manager")
 # 无法解析签名过期时间时，对带 x-oss-signature 的 URL 使用保守复用窗口（官方常见 300s - 30s）。
 _DEFAULT_SIGNED_URL_CACHE_TTL_SECONDS = 270.0
 
+# 浏览器上传路径的硬超时兜底值（秒）。比 `UPLOAD_BROWSER_TIMEOUT_SECONDS`（120s，单次
+# 页面操作超时）短得多：浏览器一旦卡在启动 / 登录态注入 / 验证码上，整条请求就被拖死，
+# 宁可降级走 HTTP 上传（或内联）也不要等满两分钟。
+_DEFAULT_BROWSER_HARD_TIMEOUT_SECONDS = 45.0
+
 
 def _remote_url_from_meta(remote_meta: dict[str, Any] | None) -> str:
     if not isinstance(remote_meta, dict):
@@ -104,6 +109,9 @@ def _browser_upload_enabled(settings_obj: Any, browser_proxy: Any) -> bool:
     解析出的模式不是 `off`（`UPLOAD_VIA_BROWSER=never`，或 `UPLOAD_BROWSER_MODE=remote`
     但没配 `UPLOAD_CDP_ENDPOINT`）。`local` 模式不需要 endpoint，因此 endpoint 为空
     也可能启用（用进程内置 Chromium）。
+
+    注意 `UPLOAD_VIA_BROWSER` 的默认值现在是 `never`：该通道通过率尚未验证，而失败
+    代价是「把请求拖慢几十秒到几分钟」，必须由部署显式打开。
     """
     if browser_proxy is None:
         return False
@@ -111,6 +119,22 @@ def _browser_upload_enabled(settings_obj: Any, browser_proxy: Any) -> bool:
     from backend.services.browser_upload_proxy import BROWSER_MODE_OFF, resolve_browser_mode
 
     return resolve_browser_mode(settings_obj) != BROWSER_MODE_OFF
+
+
+def _browser_hard_timeout_seconds(settings_obj: Any) -> float:
+    """浏览器上传路径的独立硬超时（秒）。
+
+    读 `UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS`，缺失 / 非法 / 非正值都退回
+    :data:`_DEFAULT_BROWSER_HARD_TIMEOUT_SECONDS`（45s）。这个超时**独立于**
+    `UPLOAD_BROWSER_TIMEOUT_SECONDS`：后者是单次页面操作（如 `goto`）的超时，
+    整条链路加起来可能远超它，不能拿来做请求级护栏。
+    """
+    raw = getattr(settings_obj, "UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS", _DEFAULT_BROWSER_HARD_TIMEOUT_SECONDS)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_BROWSER_HARD_TIMEOUT_SECONDS
+    return value if value > 0 else _DEFAULT_BROWSER_HARD_TIMEOUT_SECONDS
 
 
 def _text_from_content(content: Any) -> str:
@@ -491,14 +515,21 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
         )
         return next_acc
 
-    async def _try_browser_upload(current_acc, local_meta) -> dict[str, Any] | None:
+    async def _try_browser_upload(current_acc, local_meta, *, allow: bool) -> dict[str, Any] | None:
         """浏览器上传：过验证码拿 STS → 复用 `put_bytes()` PUT 到 OSS。
+
+        Args:
+            current_acc: 当前绑定的上游账号（浏览器要用它的 token / cookies 种登录态）。
+            local_meta: 本地文件元数据（`path` / `filename` / `content_type` / ...）。
+            allow: 是否允许走浏览器上传。**只有调用方真实提供的附件才能为 True**；
+                内部生成的 context 文件必须为 False（原因见
+                :func:`_upload_with_failover` 的说明）。
 
         Returns:
             与 `uploader.upload_local_file()` 同结构的结果字典；
-            浏览器侧任何异常 / 未启用都返回 None（调用方继续走原 HTTP 上传链路）。
+            未启用 / 超时 / 任何浏览器侧异常都返回 None（调用方继续走原 HTTP 上传链路）。
         """
-        if not browser_upload_enabled:
+        if not allow or not browser_upload_enabled:
             return None
         # 延迟导入：playwright 是可选依赖，且多数单测不打桩浏览器代理。
         from backend.services.browser_upload_proxy import (
@@ -509,14 +540,44 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
 
         filename = str(local_meta.get("filename") or "")
         content_type = str(local_meta.get("content_type") or "")
-        try:
+        hard_timeout = _browser_hard_timeout_seconds(context_offloader.settings)
+        uploaded_size = 0
+
+        async def _browser_sts_and_put() -> dict[str, Any] | None:
+            """真正会「慢」的那一段：读字节 → 浏览器换 STS → OSS PUT。"""
+            nonlocal uploaded_size
             raw = await asyncio.to_thread(Path(local_meta["path"]).read_bytes)
             if not raw:
                 return None
+            uploaded_size = len(raw)
             sts = await browser_proxy.fetch_sts(current_acc, filename, content_type, len(raw))
             if not sts:
                 return None
-            remote = await uploader.put_bytes(current_acc, sts, raw, filename, content_type)
+            return await uploader.put_bytes(current_acc, sts, raw, filename, content_type)
+
+        try:
+            # 硬超时护栏：`wait_for` 会取消整段浏览器流程（含 `_session_lock` 的持有），
+            # 保证浏览器卡死时请求仍能按降级路径返回，而不是等满
+            # `UPLOAD_BROWSER_TIMEOUT_SECONDS`（120s）× 若干轮。
+            remote = await asyncio.wait_for(_browser_sts_and_put(), timeout=hard_timeout)
+        except asyncio.TimeoutError:
+            # 超时等价于「浏览器链路不可用」：按 BrowserUploadUnavailable 语义降级，
+            # 同时立刻打开该账号的熔断，避免下一个请求继续为同一条坏链路付硬超时。
+            log.warning(
+                "[ContextAttachment] browser upload hard timeout session_key=%s surface=%s account=%s filename=%s timeout=%ss",
+                session_key,
+                surface,
+                getattr(current_acc, "email", None),
+                filename,
+                hard_timeout,
+            )
+            note_timeout = getattr(browser_proxy, "note_hard_timeout", None)
+            if callable(note_timeout):
+                try:
+                    note_timeout(str(getattr(current_acc, "email", "") or ""))
+                except Exception:  # pragma: no cover - 熔断记账失败不影响降级
+                    log.debug("[ContextAttachment] note_hard_timeout failed", exc_info=True)
+            return None
         except BrowserUploadRateLimited as exc:
             # 上游每日上传配额用尽：翻译成既有异常，复用「标记超限号 → 换号」逻辑。
             raise FileUploadRateLimitedError(
@@ -553,23 +614,38 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                 str(exc)[:200],
             )
             return None
+        if remote is None:
+            return None
         log.info(
             "[ContextAttachment] browser upload ok session_key=%s surface=%s account=%s filename=%s size=%s",
             session_key,
             surface,
             getattr(current_acc, "email", None),
             filename,
-            len(raw),
+            uploaded_size,
         )
         return remote
 
-    async def _upload_with_failover(current_acc, local_meta, ext):
+    async def _upload_with_failover(current_acc, local_meta, ext, *, allow_browser: bool):
         """上传单文件并处理换号回退，返回 (remote, acc, uploaded)。
 
         - 命中缓存：直接返回 (remote, acc, False)
-        - 浏览器上传可用：先试浏览器（过验证码换 STS），失败再走 HTTP 上传
+        - `allow_browser=True` 且浏览器上传可用：先试浏览器（过验证码换 STS），失败再走 HTTP 上传
         - RateLimited（每日上传配额）：标记超限号→落盘→排除→换号循环，无号可用则抛出（外层回退内联）
         - 网络类错误：换号重试一次，仍失败则抛出
+
+        **为什么 `allow_browser` 必须按来源区分（不要"顺手"统一打开）：**
+
+        浏览器上传的代价是「起一个 Chromium + 注入登录态 + 解拼图」，单次几百毫秒到
+        几十秒，还会消耗账号的风控分。它只该服务于**调用方真实提供的附件**——那种场景
+        下没有替代路径，慢一点也比丢附件好。
+
+        而 `plan.generated_files`（上下文卸载生成的 context 文件）是**网关自己造的**：
+        它每个「带 tools / 大上下文」的请求都会产生，且**永远有替代路径**（HTTP OSS
+        上传，撞 WAF 就按既有逻辑降级为内联文本）。一旦让内部生成文件也走浏览器上传，
+        就等于「每个普通请求都去开一次浏览器解一次拼图」：请求被拖死、风控分被打高，
+        且收益为零（内联文本本来就是可接受的降级）。2026-11 的生产事故就是这么来的：
+        一个 3s 的带 tools 请求被拖成 120s 超时。
         """
         network_retry_used = False
         while True:
@@ -578,7 +654,7 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                 return cache_entry.remote_file_meta, current_acc, False
             try:
                 # 先试浏览器（过验证码换 STS），失败/未启用再走原 HTTP 上传。
-                browser_remote = await _try_browser_upload(current_acc, local_meta)
+                browser_remote = await _try_browser_upload(current_acc, local_meta, allow=allow_browser)
                 if browser_remote is not None:
                     return browser_remote, current_acc, True
                 remote = await uploader.upload_local_file(current_acc, local_meta)
@@ -608,7 +684,10 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                 "created_at": __import__("time").time(),
             }
             ext = Path(attachment.filename).suffix.lstrip(".").lower()
-            remote, acc, uploaded = await _upload_with_failover(acc, local_meta, ext)
+            # 调用方真实提供的附件（inline-* / remote-url / manual-upload）：允许浏览器上传。
+            remote, acc, uploaded = await _upload_with_failover(
+                acc, local_meta, ext, allow_browser=True
+            )
             if uploaded:
                 cache_expires = _resolve_attachment_cache_expires_at(
                     remote,
@@ -633,7 +712,13 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
             for generated in plan.generated_files:
                 filename = _generated_context_filename(generated.ext)
                 local_meta = await file_store.save_text(filename, generated.text, generated.content_type, purpose="context")
-                remote, acc, uploaded = await _upload_with_failover(acc, local_meta, generated.ext)
+                # 内部生成的 context 文件**绝不走浏览器上传**（allow_browser=False）：
+                # 每个带 tools / 大上下文的请求都会生成这类文件，让它走浏览器等于给
+                # 普通请求挂上一次「起 Chromium + 解拼图」，会把请求拖死并烧风控分；
+                # 而这条链路本来就有兜底（HTTP OSS 上传，撞 WAF 降级为内联文本）。
+                remote, acc, uploaded = await _upload_with_failover(
+                    acc, local_meta, generated.ext, allow_browser=False
+                )
                 if uploaded:
                     cache_expires = _resolve_attachment_cache_expires_at(
                         remote,

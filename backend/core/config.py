@@ -168,14 +168,21 @@ class Settings(BaseSettings):
     # 留空 = 用本进程内置的 Playwright Chromium（local 模式）；两者都不想要就设
     # UPLOAD_VIA_BROWSER=never（内联装不下的附件直接 400 attachment_too_large）。
     UPLOAD_CDP_ENDPOINT: str = os.getenv("UPLOAD_CDP_ENDPOINT", "").strip()
-    # auto  = endpoint 非空走远程 CDP，为空则在进程内启动 Chromium（默认）
+    # auto  = endpoint 非空走远程 CDP，为空则在进程内启动 Chromium
     # local = 强制用内置 Chromium（忽略 endpoint）
     # remote= 强制用远程 CDP（endpoint 为空则整条链路关闭）
     UPLOAD_BROWSER_MODE: str = os.getenv("UPLOAD_BROWSER_MODE", "auto").strip().lower() or "auto"
-    # auto  = 仅当内联装不下且 endpoint 已配置时用浏览器上传（默认）
+    # 浏览器上传总开关。**默认 never（关闭）**：
+    #   1. 该通道的通过率尚未验证（local 模式是容器里的 Linux + SwiftShader 指纹，
+    #      过拼图概率低），开了也可能是白等；
+    #   2. 失败代价极高——单次要「起 Chromium + 注入登录态 + 解拼图」，几百毫秒到
+    #      几十秒，还会烧账号风控分；一次拖死就是请求级超时（实测 3s → 120s）；
+    #   3. 只有调用方真实附件这一条路径需要它，且内联 / HTTP 上传本来就有兜底。
+    # 要用的部署显式设 UPLOAD_VIA_BROWSER=auto|always 打开。
+    # auto  = 允许浏览器上传（仅用于调用方真实附件，具体走 remote / local 见上一项）
     # always= 与 auto 行为一致（上传路径优先尝试浏览器），保留语义便于运维切换
-    # never = 完全不用浏览器上传
-    UPLOAD_VIA_BROWSER: str = os.getenv("UPLOAD_VIA_BROWSER", "auto").strip().lower() or "auto"
+    # never = 完全不用浏览器上传（默认）
+    UPLOAD_VIA_BROWSER: str = os.getenv("UPLOAD_VIA_BROWSER", "never").strip().lower() or "never"
     # 一次上传最多解几轮拼图验证码（实测 1~2 轮，留 3 轮余量）
     UPLOAD_CAPTCHA_MAX_ROUNDS: int = int(os.getenv("UPLOAD_CAPTCHA_MAX_ROUNDS", 3))
     # 等验证码滑块出现的超时（秒）
@@ -184,6 +191,10 @@ class Settings(BaseSettings):
     UPLOAD_DRAG_MAPPING: str = os.getenv("UPLOAD_DRAG_MAPPING", "auto").strip().lower() or "auto"
     # 单次浏览器上传（连接 + 验证码 + 取 STS）的总超时（秒）
     UPLOAD_BROWSER_TIMEOUT_SECONDS: int = int(os.getenv("UPLOAD_BROWSER_TIMEOUT_SECONDS", 120))
+    # 浏览器上传路径的**独立硬超时**（秒，默认 45）。整段「读字节 + 换 STS + OSS PUT」
+    # 都受它约束，超时按 BrowserUploadUnavailable 处理并降级到 HTTP 上传 / 内联。
+    # 必须显著小于上游请求超时：浏览器卡住时宁可降级，也不能把请求拖到客户端超时。
+    UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS: float = float(os.getenv("UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS", 45))
     # 拖动比例标定缓存文件（auto 模式读写）
     UPLOAD_DRAG_CALIBRATION_FILE: str = os.getenv(
         "UPLOAD_DRAG_CALIBRATION_FILE", str(DATA_DIR / "drag_calibration.json")

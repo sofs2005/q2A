@@ -1,4 +1,10 @@
+import asyncio
+import json
+import os
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1018,6 +1024,320 @@ class InlineMediaAttachmentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(uploaded, ["gone.png"])
         self.assertEqual(result["upstream_files"][0]["file_id"], "remote-img")
+
+
+class _FakeBrowserProxy:
+    """浏览器上传代理替身：记录调用，可注入慢调用 / 异常（不启动真浏览器）。"""
+
+    def __init__(self, *, sts=None, delay: float = 0.0, error: Exception | None = None) -> None:
+        self.sts = dict(sts or {"file_id": "sts-1", "file_path": "ctx/file.txt"})
+        self.delay = float(delay)
+        self.error = error
+        self.fetch_calls: list[tuple[str, str, str, int]] = []
+        self.hard_timeout_notes: list[str] = []
+
+    async def fetch_sts(self, account, filename, content_type, size):
+        self.fetch_calls.append((getattr(account, "email", ""), filename, content_type, int(size)))
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return dict(self.sts)
+
+    def note_hard_timeout(self, email: str) -> None:
+        self.hard_timeout_notes.append(str(email or ""))
+
+
+class BrowserUploadScopeTests(unittest.IsolatedAsyncioTestCase):
+    """浏览器上传的作用域 + 硬超时。
+
+    核心约束（2026-11 生产事故回归）：浏览器上传只服务**调用方真实附件**；
+    上下文卸载生成的 `plan.generated_files` 永远走 HTTP 上传，不许起浏览器。
+    """
+
+    def _build_app(
+        self,
+        *,
+        uploader,
+        browser_proxy,
+        settings_overrides: dict | None = None,
+    ):
+        settings_kwargs = {
+            "CONTEXT_INLINE_MAX_CHARS": 80,
+            "CONTEXT_FORCE_FILE_MAX_CHARS": 160,
+            "CONTEXT_ATTACHMENT_TTL_SECONDS": 600,
+            "INLINE_ATTACHMENT_ENABLED": True,
+            "INLINE_ATTACHMENT_MAX_BYTES": 10 * 1024 * 1024,
+            # 显式打开浏览器上传：这些用例验证的是「作用域」，不是「默认值」。
+            "UPLOAD_VIA_BROWSER": "auto",
+            "UPLOAD_CDP_ENDPOINT": "http://10.6.6.4:3000",
+            "UPLOAD_BROWSER_MODE": "auto",
+            "UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS": 45,
+        }
+        settings_kwargs.update(settings_overrides or {})
+        saved_texts: list[str] = []
+
+        async def save_text(filename, text, content_type, purpose):
+            saved_texts.append(text)
+            return {
+                "id": filename,
+                "path": f"/tmp/{filename}",
+                "filename": filename,
+                "content_type": content_type,
+                "sha256": "sha-ctx",
+                "created_at": 1,
+            }
+
+        app = SimpleNamespace(state=SimpleNamespace(
+            context_offloader=ContextOffloader(SimpleNamespace(**settings_kwargs)),
+            account_pool=SimpleNamespace(
+                acquire_wait=AsyncMock(return_value=SimpleNamespace(email="bot@example.com")),
+                acquire_wait_preferred=AsyncMock(return_value=SimpleNamespace(email="bot@example.com")),
+                release=lambda _acc: None,
+                mark_file_upload_limited=lambda *a, **k: None,
+                file_upload_blocked_emails=lambda: set(),
+                save=AsyncMock(),
+            ),
+            file_store=SimpleNamespace(save_text=save_text, delete_path=AsyncMock()),
+            session_affinity=SimpleNamespace(
+                get=AsyncMock(return_value=None),
+                bind_account=AsyncMock(),
+                add_uploaded_file=AsyncMock(),
+            ),
+            upstream_file_cache=SimpleNamespace(get=AsyncMock(return_value=None), set=AsyncMock()),
+            upstream_file_uploader=uploader,
+            browser_upload_proxy=browser_proxy,
+        ))
+        return app, saved_texts
+
+    def _generated_context_payload(self) -> dict:
+        """会触发上下文卸载（`plan.generated_files` 非空）的带 tools 请求。"""
+        return {
+            "model": "qwen3.8-max",
+            "system": "Always answer as a pirate captain.",
+            "messages": [
+                {"role": "assistant", "content": "prior result " * 10},
+                {"role": "user", "content": "Please analyze this current input.\n" + "runtime line\n" * 20},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "description": "Read file contents",
+                        "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}},
+                    },
+                }
+            ],
+        }
+
+    def _document_attachment(self) -> tuple[NormalizedAttachment, str]:
+        handle = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+        handle.write(b"user supplied document bytes")
+        handle.close()
+        attachment = NormalizedAttachment(
+            file_id="local-doc",
+            filename="notes.txt",
+            content_type="text/plain",
+            source="manual-upload",
+            local_path=handle.name,
+            sha256="sha-doc",
+            purpose="user-upload",
+        )
+        return attachment, handle.name
+
+    async def test_generated_context_files_never_use_browser_upload(self) -> None:
+        uploaded: list[str] = []
+
+        async def upload_local_file(_acc, local_meta):
+            uploaded.append(local_meta["filename"])
+            return {"remote_ref": {"file_id": "file-ctx", "filename": local_meta["filename"]}}
+
+        uploader = SimpleNamespace(
+            upload_local_file=upload_local_file,
+            put_bytes=AsyncMock(return_value={"remote_ref": {"file_id": "browser-ctx"}}),
+        )
+        browser_proxy = _FakeBrowserProxy()
+        app, saved_texts = self._build_app(uploader=uploader, browser_proxy=browser_proxy)
+
+        result = await prepare_context_attachments(
+            app=app,
+            payload=self._generated_context_payload(),
+            surface="openai",
+            auth_token="tok",
+            client_profile=OPENCLAW_OPENAI_PROFILE,
+            session_key="openai:generated",
+        )
+
+        self.assertEqual(result["context_mode"], "file")
+        # 生成文件数量取决于 offload plan（历史 / tools 各一份），这里只关心「走了哪条上传链路」。
+        self.assertGreaterEqual(len(saved_texts), 1)
+        self.assertEqual(len(uploaded), len(saved_texts))
+        # 生成文件绝不能碰浏览器：既不取 STS，也不 PUT。
+        self.assertEqual(browser_proxy.fetch_calls, [])
+        uploader.put_bytes.assert_not_awaited()
+        self.assertEqual(browser_proxy.hard_timeout_notes, [])
+        self.assertEqual(len(result["upstream_files"]), len(saved_texts))
+
+    async def test_user_attachment_uses_browser_upload_when_enabled(self) -> None:
+        uploader = SimpleNamespace(
+            upload_local_file=AsyncMock(return_value={"remote_ref": {"file_id": "http-doc"}}),
+            put_bytes=AsyncMock(return_value={"remote_ref": {"file_id": "browser-doc", "filename": "notes.txt"}}),
+        )
+        browser_proxy = _FakeBrowserProxy()
+        app, _ = self._build_app(uploader=uploader, browser_proxy=browser_proxy)
+        attachment, local_path = self._document_attachment()
+        try:
+            result = await prepare_context_attachments(
+                app=app,
+                payload={"model": "qwen3.8-max", "messages": [{"role": "user", "content": "read this"}]},
+                surface="openai",
+                auth_token="tok",
+                client_profile=OPENCLAW_OPENAI_PROFILE,
+                session_key="openai:user-attachment",
+                existing_attachments=[attachment],
+            )
+        finally:
+            Path(local_path).unlink(missing_ok=True)
+
+        self.assertEqual(len(browser_proxy.fetch_calls), 1)
+        self.assertEqual(browser_proxy.fetch_calls[0][1], "notes.txt")
+        uploader.put_bytes.assert_awaited()
+        uploader.upload_local_file.assert_not_awaited()
+        self.assertEqual(result["upstream_files"][0]["file_id"], "browser-doc")
+
+    async def test_hard_timeout_degrades_without_raising(self) -> None:
+        """慢调用（0.5s）> 硬超时（0.05s）：降级到 HTTP 上传，绝不抛到上层。"""
+        uploader = SimpleNamespace(
+            upload_local_file=AsyncMock(return_value={"remote_ref": {"file_id": "http-doc"}}),
+            put_bytes=AsyncMock(return_value={"remote_ref": {"file_id": "browser-doc"}}),
+        )
+        browser_proxy = _FakeBrowserProxy(delay=0.5)
+        app, _ = self._build_app(
+            uploader=uploader,
+            browser_proxy=browser_proxy,
+            settings_overrides={"UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS": 0.05},
+        )
+        attachment, local_path = self._document_attachment()
+        started = time.monotonic()
+        try:
+            result = await prepare_context_attachments(
+                app=app,
+                payload={"model": "qwen3.8-max", "messages": [{"role": "user", "content": "read this"}]},
+                surface="openai",
+                auth_token="tok",
+                client_profile=OPENCLAW_OPENAI_PROFILE,
+                session_key="openai:hard-timeout",
+                existing_attachments=[attachment],
+            )
+        finally:
+            Path(local_path).unlink(missing_ok=True)
+        elapsed = time.monotonic() - started
+
+        # 超时真的生效：整体耗时被硬超时卡住，而不是等满 0.5s 的慢调用。
+        self.assertLess(elapsed, 0.45)
+        self.assertEqual(len(browser_proxy.fetch_calls), 1)
+        uploader.put_bytes.assert_not_awaited()
+        uploader.upload_local_file.assert_awaited()
+        # 超时按 BrowserUploadUnavailable 语义降级 + 立刻熔断该账号。
+        self.assertEqual(browser_proxy.hard_timeout_notes, ["bot@example.com"])
+        self.assertEqual(result["upstream_files"][0]["file_id"], "http-doc")
+        self.assertFalse(result["attachment_fallback"])
+
+    async def test_unavailable_degrades_without_raising(self) -> None:
+        from backend.services.browser_upload_proxy import BrowserUploadUnavailable
+
+        uploader = SimpleNamespace(
+            upload_local_file=AsyncMock(return_value={"remote_ref": {"file_id": "http-doc"}}),
+            put_bytes=AsyncMock(),
+        )
+        browser_proxy = _FakeBrowserProxy(error=BrowserUploadUnavailable("no browser endpoint"))
+        app, _ = self._build_app(uploader=uploader, browser_proxy=browser_proxy)
+        attachment, local_path = self._document_attachment()
+        try:
+            result = await prepare_context_attachments(
+                app=app,
+                payload={"model": "qwen3.8-max", "messages": [{"role": "user", "content": "read this"}]},
+                surface="openai",
+                auth_token="tok",
+                client_profile=OPENCLAW_OPENAI_PROFILE,
+                session_key="openai:unavailable",
+                existing_attachments=[attachment],
+            )
+        finally:
+            Path(local_path).unlink(missing_ok=True)
+
+        uploader.put_bytes.assert_not_awaited()
+        uploader.upload_local_file.assert_awaited()
+        self.assertEqual(result["upstream_files"][0]["file_id"], "http-doc")
+
+
+class UploadViaBrowserDefaultTests(unittest.TestCase):
+    """`UPLOAD_VIA_BROWSER` 默认必须是 `never`（默认不启浏览器）。"""
+
+    def test_config_default_is_never(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        script = (
+            "import json;"
+            "from backend.core.config import Settings;"
+            "from backend.services.browser_upload_proxy import BrowserUploadProxy, resolve_browser_mode;"
+            "s = Settings(_env_file=None);"
+            "print(json.dumps({"
+            "'config': s.UPLOAD_VIA_BROWSER,"
+            "'mode': resolve_browser_mode(s),"
+            "'hard_timeout': s.UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS,"
+            "'enabled': BrowserUploadProxy(s, calibration_path='/tmp/_cal_default_test.json').enabled,"
+            "}))"
+        )
+        # 清掉可能影响默认值的外部环境变量，并在临时目录里跑（避免读到仓库根的 .env）。
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"UPLOAD_VIA_BROWSER", "UPLOAD_CDP_ENDPOINT", "UPLOAD_BROWSER_MODE"}
+        }
+        env["PYTHONPATH"] = str(repo_root)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=tmp_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(payload["config"], "never")
+        self.assertEqual(payload["mode"], "off")
+        self.assertFalse(payload["enabled"])
+        self.assertEqual(payload["hard_timeout"], 45)
+
+    def test_missing_setting_falls_back_to_never(self) -> None:
+        from backend.services.browser_upload_proxy import BROWSER_MODE_OFF, resolve_browser_mode
+        from backend.services.context_attachment_manager import _browser_upload_enabled
+
+        # 配置对象里没有 UPLOAD_VIA_BROWSER 这个属性时，也必须按「关闭」处理。
+        bare = SimpleNamespace(UPLOAD_CDP_ENDPOINT="http://10.6.6.4:3000")
+        self.assertEqual(resolve_browser_mode(bare), BROWSER_MODE_OFF)
+        self.assertFalse(_browser_upload_enabled(bare, object()))
+
+    def test_hard_timeout_defaults_to_45(self) -> None:
+        from backend.services.context_attachment_manager import _browser_hard_timeout_seconds
+
+        self.assertEqual(_browser_hard_timeout_seconds(SimpleNamespace()), 45.0)
+        self.assertEqual(
+            _browser_hard_timeout_seconds(SimpleNamespace(UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS=8)),
+            8.0,
+        )
+        # 非法 / 非正值退回默认，绝不让「0 秒超时」把所有上传瞬间打死。
+        self.assertEqual(
+            _browser_hard_timeout_seconds(SimpleNamespace(UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS="oops")),
+            45.0,
+        )
+        self.assertEqual(
+            _browser_hard_timeout_seconds(SimpleNamespace(UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS=0)),
+            45.0,
+        )
 
 
 if __name__ == "__main__":
