@@ -162,6 +162,27 @@ class Settings(BaseSettings):
     MULTIMODAL_STRICT: bool = os.getenv("MULTIMODAL_STRICT", "true").lower() in {"1", "true", "yes", "on"}
     # 模型模态覆盖表（JSON，如 {"qwen3.8-max":["text","image","video","audio"]}）。
     MODEL_MODALITIES_OVERRIDE: str = os.getenv("MODEL_MODALITIES_OVERRIDE", "")
+
+    # ---- 浏览器上传代理（过阿里云拼图验证码换 getstsToken 的 STS）----
+    # 远程 CDP 端点（browserless / 远程 Chrome），如 http://10.6.6.4:3000。
+    # 留空 = 关闭浏览器上传（内联装不下的附件直接 400 attachment_too_large）。
+    UPLOAD_CDP_ENDPOINT: str = os.getenv("UPLOAD_CDP_ENDPOINT", "").strip()
+    # auto  = 仅当内联装不下且 endpoint 已配置时用浏览器上传（默认）
+    # always= 与 auto 行为一致（上传路径优先尝试浏览器），保留语义便于运维切换
+    # never = 完全不用浏览器上传
+    UPLOAD_VIA_BROWSER: str = os.getenv("UPLOAD_VIA_BROWSER", "auto").strip().lower() or "auto"
+    # 一次上传最多解几轮拼图验证码（实测 1~2 轮，留 3 轮余量）
+    UPLOAD_CAPTCHA_MAX_ROUNDS: int = int(os.getenv("UPLOAD_CAPTCHA_MAX_ROUNDS", 3))
+    # 等验证码滑块出现的超时（秒）
+    UPLOAD_CAPTCHA_TIMEOUT_SECONDS: int = int(os.getenv("UPLOAD_CAPTCHA_TIMEOUT_SECONDS", 30))
+    # 鼠标位移 ↔ 拼图位移的映射：auto（默认，优先读标定缓存）/ linear / quadratic
+    UPLOAD_DRAG_MAPPING: str = os.getenv("UPLOAD_DRAG_MAPPING", "auto").strip().lower() or "auto"
+    # 单次浏览器上传（连接 + 验证码 + 取 STS）的总超时（秒）
+    UPLOAD_BROWSER_TIMEOUT_SECONDS: int = int(os.getenv("UPLOAD_BROWSER_TIMEOUT_SECONDS", 120))
+    # 拖动比例标定缓存文件（auto 模式读写）
+    UPLOAD_DRAG_CALIBRATION_FILE: str = os.getenv(
+        "UPLOAD_DRAG_CALIBRATION_FILE", str(DATA_DIR / "drag_calibration.json")
+    )
     CONTEXT_GENERATED_DIR: str = os.getenv("CONTEXT_GENERATED_DIR", str(DATA_DIR / "context_files"))
     CONTEXT_CACHE_FILE: str = os.getenv("CONTEXT_CACHE_FILE", str(DATA_DIR / "context_cache.json"))
     UPLOADED_FILES_FILE: str = os.getenv("UPLOADED_FILES_FILE", str(DATA_DIR / "uploaded_files.json"))

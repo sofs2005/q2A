@@ -28,6 +28,7 @@ from backend.services.file_store import LocalFileStore
 from backend.toolcore.context_offload import ContextOffloader
 from backend.services.response_store import InMemoryResponseStore
 from backend.services.upstream_file_uploader import UpstreamFileUploader
+from backend.services.browser_upload_proxy import BrowserUploadProxy
 from backend.services.model_modalities import ModalityNotSupportedError
 from backend.services.attachment_errors import (
     InlineMediaTooLargeError,
@@ -123,6 +124,8 @@ async def lifespan(app: FastAPI):
         app.state.upstream_file_cache = UpstreamFileCache(app.state.context_cache_db)
         app.state.context_offloader = ContextOffloader(settings)
         app.state.upstream_file_uploader = UpstreamFileUploader(app.state.qwen_client, settings)
+        # 浏览器上传代理：惰性连接（首次真正上传时才连 CDP），endpoint 为空时全程禁用。
+        app.state.browser_upload_proxy = BrowserUploadProxy(settings)
         app.state.session_locks = SessionLockRegistry()
         app.state.response_store = InMemoryResponseStore()
 
@@ -184,6 +187,12 @@ async def lifespan(app: FastAPI):
         chat_pool = getattr(getattr(app.state, "qwen_client", None), "chat_id_pool", None)
         if chat_pool is not None:
             await chat_pool.cleanup(delete_all=True)
+        browser_proxy = getattr(app.state, "browser_upload_proxy", None)
+        if browser_proxy is not None:
+            try:
+                await browser_proxy.close()
+            except Exception:
+                pass
         await close_all_sessions()
 
 app = FastAPI(title="qwen2API Enterprise Gateway", version=VERSION_LABEL, lifespan=lifespan)

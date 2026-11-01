@@ -5,12 +5,21 @@ import json
 import mimetypes
 import re
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import oss2
+
+from backend.services.sts_ref_builder import (
+    build_remote_ref,
+    guess_content_type,
+    normalize_sign_region,
+    remote_file_class_from_content_type,
+    remote_ref_type_from_content_type,
+    sts_file_url,
+    upload_filetype_from_content_type,
+)
 
 
 _DEFAULT_UPLOAD_RATE_LIMIT_RETRY_SECONDS = 3600.0
@@ -76,43 +85,23 @@ def _parse_json_body(resp: dict[str, Any], *, endpoint: str) -> dict[str, Any]:
 
 
 def _upload_filetype_from_content_type(content_type: str) -> str:
-    lowered = (content_type or "").lower()
-    if lowered.startswith("image/"):
-        return "image"
-    if lowered.startswith("audio/"):
-        return "audio"
-    if lowered.startswith("video/"):
-        return "video"
-    return "file"
+    """`getstsToken` 的 `filetype` 入参（实现见 sts_ref_builder，这里保留旧名）。"""
+    return upload_filetype_from_content_type(content_type)
 
 
 def _remote_file_class_from_content_type(content_type: str) -> str:
-    lowered = (content_type or "").lower()
-    if lowered.startswith("image/"):
-        return "vision"
-    if lowered.startswith("audio/"):
-        return "audio"
-    if lowered.startswith("video/"):
-        return "video"
-    return "document"
+    """`file_class` 字段取值（实现见 sts_ref_builder，这里保留旧名）。"""
+    return remote_file_class_from_content_type(content_type)
 
 
 def _remote_ref_type_from_content_type(content_type: str) -> str:
-    lowered = (content_type or "").lower()
-    if lowered.startswith("image/"):
-        return "image"
-    if lowered.startswith("audio/"):
-        return "audio"
-    if lowered.startswith("video/"):
-        return "video"
-    return "file"
+    """`type` / `showType` 字段取值（实现见 sts_ref_builder，这里保留旧名）。"""
+    return remote_ref_type_from_content_type(content_type)
 
 
 def _normalize_sign_region(region: str) -> str:
-    region = (region or "").strip()
-    if region.startswith("oss-"):
-        return region[len("oss-"):]
-    return region
+    """OSS 签名 region 归一化（实现见 sts_ref_builder，这里保留旧名）。"""
+    return normalize_sign_region(region)
 
 
 def signed_url_expires_at(url: str, *, now: float | None = None) -> float | None:
@@ -207,6 +196,11 @@ class UpstreamFileUploader:
         )
 
     async def upload_local_file(self, acc, local_file_meta: dict[str, Any]) -> dict[str, Any]:
+        """纯 HTTP 上传链路：`getstsToken`（可能撞 WAF）→ :meth:`put_bytes`。
+
+        注意：`getstsToken` 现在基本都会被阿里云拼图验证码拦住，此时抛
+        :class:`UpstreamWafChallengeError`，由上层降级（内联 / 浏览器上传）。
+        """
         filename = local_file_meta["filename"]
         file_path = local_file_meta["path"]
         content_type = local_file_meta.get("content_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
@@ -244,17 +238,48 @@ class UpstreamFileUploader:
                 retry_after_seconds=retry_after,
                 message=str(sts.get("details") or "file upload rate limited"),
             )
-        file_id = sts.get("file_id")
-        file_path_remote = sts.get("file_path", "")
-        bucketname = sts.get("bucketname", "")
-        endpoint = sts.get("endpoint", "")
-        file_url = sts.get("file_url", "")
-        region = _normalize_sign_region(sts.get("region", ""))
-        access_key_id = sts.get("access_key_id", "")
-        access_key_secret = sts.get("access_key_secret", "")
-        security_token = sts.get("security_token", "")
+        return await self.put_bytes(acc, sts, raw, filename, content_type)
+
+    async def put_bytes(
+        self,
+        acc,
+        sts: dict[str, Any],
+        raw: bytes,
+        filename: str,
+        content_type: str | None = None,
+    ) -> dict[str, Any]:
+        """把字节 PUT 到 STS 指定的 OSS 位置，并构造上游 `files[]` ref。
+
+        从 :meth:`upload_local_file` 拆出来的可复用部分：**只做 PUT + 文档 parse +
+        ref 构造**，不再自己调 `getstsToken`。浏览器上传代理
+        （`browser_upload_proxy`）过完验证码拿到 STS 后直接复用这段逻辑，
+        保证两条链路产出的 ref 完全一致。
+
+        Args:
+            acc: 账号对象（文档 parse 需要 `acc.token`）。
+            sts: `getstsToken` 的 `data`（含 file_id / file_path / bucketname /
+                endpoint / region / 临时密钥 / file_url）。
+            raw: 原始字节。
+            filename: 文件名。
+            content_type: mime；为空时按文件名猜。
+
+        Returns:
+            与 :meth:`upload_local_file` 相同结构的上传结果字典
+            （`remote_file_id` / `remote_object_key` / `parse_status` /
+            `url_expires_at` / `remote_ref` 等）。
+        """
+        payload = dict(sts or {})
+        mime = guess_content_type(filename, str(content_type or ""))
+        file_id = str(payload.get("file_id") or "").strip()
+        file_path_remote = str(payload.get("file_path") or "").strip()
+        bucketname = str(payload.get("bucketname") or "").strip()
+        endpoint = str(payload.get("endpoint") or "").strip()
+        region = _normalize_sign_region(str(payload.get("region") or ""))
+        access_key_id = payload.get("access_key_id", "")
+        access_key_secret = payload.get("access_key_secret", "")
+        security_token = payload.get("security_token", "")
         if not file_id or not file_path_remote or not bucketname or not endpoint:
-            raise RuntimeError(f"getstsToken missing file data: {sts_data}")
+            raise RuntimeError(f"getstsToken missing file data: {payload}")
 
         auth = oss2.StsAuth(access_key_id, access_key_secret, security_token, auth_version='v4')
         upload_endpoint = endpoint
@@ -263,7 +288,7 @@ class UpstreamFileUploader:
             put_result = bucket.put_object(
                 file_path_remote,
                 raw,
-                headers={"Content-Type": content_type},
+                headers={"Content-Type": mime},
             )
         except Exception as exc:
             fallback_endpoint = _build_regional_endpoint(bucketname, endpoint, region)
@@ -273,14 +298,13 @@ class UpstreamFileUploader:
             put_result = bucket.put_object(
                 file_path_remote,
                 raw,
-                headers={"Content-Type": content_type},
+                headers={"Content-Type": mime},
             )
             upload_endpoint = fallback_endpoint
         if getattr(put_result, 'status', None) not in (200, 201):
             raise RuntimeError(f"OSS put_object failed: status={getattr(put_result, 'status', None)}")
 
-        remote_type = _remote_ref_type_from_content_type(content_type)
-        file_class = _remote_file_class_from_content_type(content_type)
+        file_class = _remote_file_class_from_content_type(mime)
         parse_status = "success"
         # 上游只对文档解析（`parsedFileTypes=[FILE]`）：图片 / 音频 / 视频直传即可，
         # 绝不能调 /files/parse（会报错或被当作文档处理）。
@@ -332,54 +356,24 @@ class UpstreamFileUploader:
             if parse_status != "success":
                 raise RuntimeError(f"file parse timeout: {file_id}")
 
-        user_id = file_path_remote.split('/', 1)[0] if '/' in file_path_remote else ""
         now = time.time()
-        now_ms = int(now * 1000)
-        put_url = str(file_url or f"https://{upload_endpoint}/{file_path_remote.lstrip('/')}")
+        put_url = sts_file_url(payload, endpoint=upload_endpoint)
         url_expires_at = signed_url_expires_at(put_url, now=now)
-        # remote_ref 字段对齐官网 chat completions 抓包（含浏览器 File 对象镜像字段）
-        remote_ref = {
-            "type": remote_type,
-            "file": {
-                "created_at": now_ms,
-                "data": {},
-                "filename": filename,
-                "hash": None,
-                "id": file_id,
-                "user_id": user_id,
-                "meta": {
-                    "name": filename,
-                    "size": len(raw),
-                    "content_type": content_type,
-                    "parse_meta": {"parse_status": parse_status},
-                },
-                "update_at": now_ms,
-                "lastModified": now_ms,
-                "name": filename,
-                "webkitRelativePath": "",
-                "size": len(raw),
-                "type": content_type,
-            },
-            "id": file_id,
-            "url": put_url,
-            "name": filename,
-            "collection_name": "",
-            "progress": 0,
-            "status": "uploaded",
-            "greenNet": "greening" if str(remote_type) == "video" else "success",
-            "size": len(raw),
-            "error": "",
-            "itemId": str(uuid.uuid4()),
-            "file_type": content_type,
-            "showType": remote_type,
-            "file_class": file_class,
-            "uploadTaskId": str(uuid.uuid4()),
-        }
+        # remote_ref 字段对齐官网抓包（16 个顶层 + 13 个 file 字段），见 sts_ref_builder。
+        remote_ref = build_remote_ref(
+            sts=payload,
+            filename=filename,
+            content_type=mime,
+            size=len(raw),
+            parse_status=parse_status,
+            now=now,
+            endpoint=upload_endpoint,
+        )
         return {
             "remote_file_id": file_id,
             "remote_object_key": file_path_remote,
             "filename": filename,
-            "content_type": content_type,
+            "content_type": mime,
             "parse_status": parse_status,
             "url_expires_at": url_expires_at,
             "remote_ref": remote_ref,

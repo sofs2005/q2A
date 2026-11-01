@@ -550,6 +550,7 @@ async def get_keys():
     from backend.core.config import API_KEYS
     return {"keys": list(API_KEYS)}
 
+
 @router.post("/keys", dependencies=[Depends(verify_admin)])
 async def create_key():
     from backend.core.config import API_KEYS, save_api_keys

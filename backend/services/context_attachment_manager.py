@@ -97,6 +97,21 @@ def _upload_account_excludes(account_pool) -> set:
     return set()
 
 
+def _browser_upload_enabled(settings_obj: Any, browser_proxy: Any) -> bool:
+    """浏览器上传链路是否可用。
+
+    三个条件同时满足才启用：代理实例存在（`app.state.browser_upload_proxy`）、
+    `UPLOAD_VIA_BROWSER != never`、`UPLOAD_CDP_ENDPOINT` 已配置。
+    """
+    if browser_proxy is None:
+        return False
+    mode = str(getattr(settings_obj, "UPLOAD_VIA_BROWSER", "auto") or "auto").strip().lower()
+    if mode == "never":
+        return False
+    endpoint = str(getattr(settings_obj, "UPLOAD_CDP_ENDPOINT", "") or "").strip()
+    return bool(endpoint)
+
+
 def _text_from_content(content: Any) -> str:
     if isinstance(content, list):
         return "\n".join(
@@ -307,6 +322,10 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
     affinity = app.state.session_affinity
     cache = app.state.upstream_file_cache
     uploader = app.state.upstream_file_uploader
+    # 浏览器上传代理（可选）：内联装不下时，用远程 CDP 浏览器过阿里云拼图验证码换
+    # getstsToken 的 STS，再复用 uploader.put_bytes() 把字节 PUT 到 OSS。
+    browser_proxy = getattr(app.state, "browser_upload_proxy", None)
+    browser_upload_enabled = _browser_upload_enabled(context_offloader.settings, browser_proxy)
 
     tools = _context_tools_for_payload(payload, surface)
     messages = payload.get("messages", []) or []
@@ -471,10 +490,83 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
         )
         return next_acc
 
+    async def _try_browser_upload(current_acc, local_meta) -> dict[str, Any] | None:
+        """浏览器上传：过验证码拿 STS → 复用 `put_bytes()` PUT 到 OSS。
+
+        Returns:
+            与 `uploader.upload_local_file()` 同结构的结果字典；
+            浏览器侧任何异常 / 未启用都返回 None（调用方继续走原 HTTP 上传链路）。
+        """
+        if not browser_upload_enabled:
+            return None
+        # 延迟导入：playwright 是可选依赖，且多数单测不打桩浏览器代理。
+        from backend.services.browser_upload_proxy import (
+            BrowserUploadError,
+            BrowserUploadRateLimited,
+            BrowserUploadUnavailable,
+        )
+
+        filename = str(local_meta.get("filename") or "")
+        content_type = str(local_meta.get("content_type") or "")
+        try:
+            raw = await asyncio.to_thread(Path(local_meta["path"]).read_bytes)
+            if not raw:
+                return None
+            sts = await browser_proxy.fetch_sts(current_acc, filename, content_type, len(raw))
+            if not sts:
+                return None
+            remote = await uploader.put_bytes(current_acc, sts, raw, filename, content_type)
+        except BrowserUploadRateLimited as exc:
+            # 上游每日上传配额用尽：翻译成既有异常，复用「标记超限号 → 换号」逻辑。
+            raise FileUploadRateLimitedError(
+                retry_after_seconds=exc.retry_after_seconds,
+                message=str(exc),
+            ) from exc
+        except BrowserUploadUnavailable as exc:
+            log.warning(
+                "[ContextAttachment] browser upload unavailable session_key=%s surface=%s account=%s filename=%s error=%s",
+                session_key,
+                surface,
+                getattr(current_acc, "email", None),
+                filename,
+                str(exc)[:200],
+            )
+            return None
+        except BrowserUploadError as exc:
+            log.warning(
+                "[ContextAttachment] browser upload failed session_key=%s surface=%s account=%s filename=%s error=%s",
+                session_key,
+                surface,
+                getattr(current_acc, "email", None),
+                filename,
+                str(exc)[:200],
+            )
+            return None
+        except Exception as exc:
+            log.warning(
+                "[ContextAttachment] browser upload error session_key=%s surface=%s account=%s filename=%s error=%s",
+                session_key,
+                surface,
+                getattr(current_acc, "email", None),
+                filename,
+                str(exc)[:200],
+            )
+            return None
+        log.info(
+            "[ContextAttachment] browser upload ok session_key=%s surface=%s account=%s filename=%s size=%s",
+            session_key,
+            surface,
+            getattr(current_acc, "email", None),
+            filename,
+            len(raw),
+        )
+        return remote
+
     async def _upload_with_failover(current_acc, local_meta, ext):
         """上传单文件并处理换号回退，返回 (remote, acc, uploaded)。
 
         - 命中缓存：直接返回 (remote, acc, False)
+        - 浏览器上传可用：先试浏览器（过验证码换 STS），失败再走 HTTP 上传
         - RateLimited（每日上传配额）：标记超限号→落盘→排除→换号循环，无号可用则抛出（外层回退内联）
         - 网络类错误：换号重试一次，仍失败则抛出
         """
@@ -484,6 +576,10 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
             if cache_entry is not None:
                 return cache_entry.remote_file_meta, current_acc, False
             try:
+                # 先试浏览器（过验证码换 STS），失败/未启用再走原 HTTP 上传。
+                browser_remote = await _try_browser_upload(current_acc, local_meta)
+                if browser_remote is not None:
+                    return browser_remote, current_acc, True
                 remote = await uploader.upload_local_file(current_acc, local_meta)
                 return remote, current_acc, True
             except FileUploadRateLimitedError as rate_exc:
