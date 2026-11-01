@@ -42,10 +42,10 @@ class SPAStaticFilesTests(unittest.TestCase):
         self.assertEqual(response.text, "<div id=\"root\"></div>")
 
     def test_media_page_routes_fall_back_to_index_html(self) -> None:
-        """UI 页面路由 /images、/videos 必须可直接打开和刷新。"""
+        """UI 页面路由 /images、/videos、/media 必须可直接打开和刷新。"""
         client = self._create_client()
 
-        for path in ("/images", "/images/", "/videos", "/videos/"):
+        for path in ("/images", "/images/", "/videos", "/videos/", "/media", "/media/"):
             with self.subTest(path=path):
                 response = client.get(path)
 
@@ -57,7 +57,13 @@ class SPAStaticFilesTests(unittest.TestCase):
         """页面路由放行不能把未注册的媒体 API 子路径变成 HTML。"""
         client = self._create_client()
 
-        for path in ("/images/missing", "/videos/missing", "/images/content", "/videos/generations/extra"):
+        for path in (
+            "/images/missing",
+            "/videos/missing",
+            "/images/content",
+            "/videos/generations/extra",
+            "/media/missing",
+        ):
             with self.subTest(path=path):
                 response = client.get(path)
 

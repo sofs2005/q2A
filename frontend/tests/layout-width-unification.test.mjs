@@ -16,6 +16,7 @@ const PAGES = [
   "pages/ImagePage.tsx",
   "pages/TestPage.tsx",
   "pages/VideoPage.tsx",
+  "pages/MediaLibraryPage.tsx",
   "pages/NotFoundPage.tsx",
 ]
 

@@ -24,13 +24,13 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from backend.core.config import resolve_model, settings
+from backend.services.image_thumbnail import ensure_thumbnail, thumb_path_for
+from backend.services.media_purposes import GENERATED_IMAGE_PURPOSE
 from backend.services.qwen_client import QwenClient
 from backend.upstream.payload_builder import normalize_t2i_size
 
 log = logging.getLogger("qwen2api.images")
 router = APIRouter()
-
-GENERATED_IMAGE_PURPOSE = "generated_image"
 
 
 def _default_image_model() -> str:
@@ -174,6 +174,7 @@ async def _rehost_urls(
     limit: int,
     *,
     seen_hashes: set[str] | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     file_store = getattr(request.app.state, "file_store", None)
     if file_store is None or not hasattr(client, "download_url"):
@@ -200,6 +201,7 @@ async def _rehost_urls(
                 content_type or "image/png",
                 raw,
                 GENERATED_IMAGE_PURPOSE,
+                extra=extra,
             )
             hosted.append(
                 {
@@ -300,7 +302,12 @@ async def _generate_once(
 
 @router.get("/v1/images/content/{file_id}")
 @router.get("/images/content/{file_id}")
-async def get_image_content(request: Request, file_id: str):
+async def get_image_content(request: Request, file_id: str, w: int | None = None):
+    """生图内容。带 `w` 时返回该宽度的缩略图（媒体库网格用，原图常见 5~10MB）。
+
+    缩略图只是加速手段：Pillow 缺失、渲染失败或宽度越界时静默退回原图，
+    接口行为与不带 `w` 时完全一致。
+    """
     file_store = getattr(request.app.state, "file_store", None)
     if file_store is None:
         raise HTTPException(status_code=404, detail="Image store unavailable")
@@ -313,6 +320,23 @@ async def get_image_content(request: Request, file_id: str):
     path = meta.get("path")
     if not path or not Path(path).is_file():
         raise HTTPException(status_code=404, detail="Image file missing")
+
+    if w is not None and str(meta.get("content_type") or "").startswith("image/"):
+        target = thumb_path_for(file_store.root_dir, file_id, int(w))
+        thumb = await ensure_thumbnail(
+            path,
+            target,
+            int(w),
+            source_mtime=float(meta.get("created_at") or 0) or None,
+        )
+        if thumb is not None:
+            # 缩略图由内容派生，同一个 id+宽度永远同一张图，可以放心长缓存
+            return FileResponse(
+                thumb,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+
     media_type = meta.get("content_type") or "application/octet-stream"
     return FileResponse(path, media_type=media_type, filename=meta.get("filename") or Path(path).name)
 
@@ -376,7 +400,13 @@ async def create_image(request: Request):
                 acc = session.get("acc")
                 need = n - len(data)
                 hosted = await _rehost_urls(
-                    request, client, acc, image_urls, need, seen_hashes=seen_hashes
+                    request,
+                    client,
+                    acc,
+                    image_urls,
+                    need,
+                    seen_hashes=seen_hashes,
+                    extra={"prompt": prompt, "size": t2i_size, "model": model},
                 )
                 for item in hosted:
                     if not item.get("revised_prompt"):

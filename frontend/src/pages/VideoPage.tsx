@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { Film, RefreshCw, Download, Wand2, ExternalLink } from "lucide-react"
+import { Film, RefreshCw, Download, Wand2, ExternalLink, Maximize2 } from "lucide-react"
 import { Button } from "../components/ui/button"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
@@ -8,6 +8,7 @@ import { Card, CardContent } from "../components/ui/card"
 import { Notice, SegmentedGroup, Textarea } from "../components/ui/field"
 import { StatusBadge } from "../components/ui/badge"
 import { PageShell } from "../components/ui/page-shell"
+import { Lightbox } from "../components/ui/lightbox"
 
 const ASPECT_RATIOS = [
   { label: "16:9", value: "16:9" },
@@ -62,6 +63,8 @@ export default function VideoPage() {
   const [loading, setLoading] = useState(false)
   const [videos, setVideos] = useState<GeneratedVideo[]>([])
   const [error, setError] = useState<string | null>(null)
+  // null 表示未打开大图查看；数值是 videos 里的下标
+  const [previewIndex, setPreviewIndex] = useState<number | null>(null)
 
   const handleGenerate = async () => {
     if (!prompt.trim() || loading) return
@@ -136,7 +139,14 @@ export default function VideoPage() {
     <PageShell
       actions={
         videos.length > 0 ? (
-          <Button variant="outline" onClick={() => setVideos([])} disabled={loading}>
+          <Button
+            variant="outline"
+            onClick={() => {
+              setVideos([])
+              setPreviewIndex(null)
+            }}
+            disabled={loading}
+          >
             清空结果
           </Button>
         ) : null
@@ -229,6 +239,15 @@ export default function VideoPage() {
                 <Card key={`${vid.url}-${idx}`} className="overflow-hidden">
                   <div className="relative bg-black">
                     <video src={vid.url} controls playsInline className="h-auto w-full" />
+                    {/* 视频自带控件，用悬浮按钮而不是包裹点击区，免得抢走播放与进度条的手势 */}
+                    <button
+                      type="button"
+                      onClick={() => setPreviewIndex(idx)}
+                      aria-label="放大查看视频"
+                      className="absolute right-2 top-2 rounded-md bg-black/60 p-1.5 text-white transition-colors hover:bg-black/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60"
+                    >
+                      <Maximize2 className="h-4 w-4" />
+                    </button>
                   </div>
                   <CardContent className="space-y-3 py-3">
                     <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
@@ -237,6 +256,9 @@ export default function VideoPage() {
                       <span className="min-w-0 truncate">{vid.revised_prompt.slice(0, 80)}</span>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
+                      <Button size="sm" variant="outline" onClick={() => setPreviewIndex(idx)} className="gap-1.5">
+                        <Maximize2 className="h-3.5 w-3.5" /> 放大
+                      </Button>
                       <Button size="sm" variant="outline" onClick={() => handleDownload(vid.url, idx)} className="gap-1.5">
                         <Download className="h-3.5 w-3.5" /> 下载
                       </Button>
@@ -266,6 +288,18 @@ export default function VideoPage() {
           )}
         </div>
       </div>
+
+      <Lightbox
+        media={videos.map((vid, idx) => ({
+          url: vid.url,
+          kind: "video" as const,
+          caption: vid.revised_prompt,
+          downloadName: `qwen_video_${idx}.mp4`,
+        }))}
+        index={previewIndex}
+        onIndexChange={setPreviewIndex}
+        onClose={() => setPreviewIndex(null)}
+      />
     </PageShell>
   )
 }

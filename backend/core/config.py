@@ -136,8 +136,12 @@ class Settings(BaseSettings):
     CONTEXT_INLINE_MAX_CHARS: int = int(os.getenv("CONTEXT_INLINE_MAX_CHARS", 4000))
     CONTEXT_FORCE_FILE_MAX_CHARS: int = int(os.getenv("CONTEXT_FORCE_FILE_MAX_CHARS", 10000))
     CONTEXT_ATTACHMENT_TTL_SECONDS: int = int(os.getenv("CONTEXT_ATTACHMENT_TTL_SECONDS", 1800))
-    # 生图回源本地缓存 TTL（秒），到期由 context_cleanup_loop 按 purpose=generated_image 清理
+    # 生图回源本地缓存 TTL（秒）。已弃用：生成物清理改由 GENERATED_MEDIA_TTL_SECONDS 统一控制
     GENERATED_IMAGE_TTL_SECONDS: int = int(os.getenv("GENERATED_IMAGE_TTL_SECONDS", 3600))
+    # 生成物（图片/视频）保留秒数；0 = 永久保留（媒体库语义）
+    GENERATED_MEDIA_TTL_SECONDS: int = int(os.getenv("GENERATED_MEDIA_TTL_SECONDS", 0))
+    # 视频回源下载体积上限，超限退回 CDN 直链，避免打爆内存
+    GENERATED_VIDEO_MAX_BYTES: int = int(os.getenv("GENERATED_VIDEO_MAX_BYTES", 268435456))
     # /v1/images/generations 默认上游模型；升级时只改 env，无需改代码
     IMAGE_GENERATION_MODEL: str = os.getenv("IMAGE_GENERATION_MODEL", DEFAULT_QWEN_MAX_MODEL).strip() or DEFAULT_QWEN_MAX_MODEL
     # t2i 请求 messages[].extra.meta.model 的取值，即真正出图的模型。

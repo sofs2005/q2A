@@ -175,7 +175,8 @@ qwen2API 提供与 OpenAI Images 接口兼容的图片生成能力。
   - 图片 URL 兜底顺序：SSE 事件 → `GET /api/v2/library/list` → 当前 chat 详情
 - `extra.meta.model`：由 `IMAGE_GENERATION_META_MODEL` 控制，留空则不发送该键（出图模型由上面的 chat 级 `model` 决定）
 - 返回：本地托管图片 URL（避免 `cdn.qwenlm.ai` 签名链在浏览器 403）
-- 生图本地缓存 TTL：`GENERATED_IMAGE_TTL_SECONDS`（默认 3600）
+- 缩略图：`GET /v1/images/content/{id}?w=480` 返回该宽度的 JPEG（按 id+宽度落盘缓存，`Cache-Control: 86400`）。原图常见 5~10MB，媒体库网格用缩略图；Pillow 缺失或渲染失败时**静默退回原图**，不带 `w` 的行为完全不变
+- 生图本地缓存 TTL：`GENERATED_MEDIA_TTL_SECONDS`（默认 `0` = 永久保留，供媒体库长期展示；设为正数则到期清理）
 
 ### 请求示例
 
@@ -227,6 +228,49 @@ curl http://127.0.0.1:7860/v1/images/generations \
 - “draw an image of ……”
 
 当识别为图片生成请求时，系统会自动切换到图片生成管道。
+
+---
+
+## 视频生成
+
+qwen2API 同时提供 OpenAI Videos 风格的视频生成能力（底层走千问网页的 `t2v` 通道）。
+
+- 接口：`POST /v1/videos/generations`（同义路径 `/videos/generations`）
+- 异步任务：聊天流只产出 `task_id`，服务端轮询 `GET /api/v1/tasks/status/{task_id}` 直到完成，最长约 7 分钟
+- **视频回源落盘**：上游 CDN 直链带签名会过期，因此拿到 URL 后会回源下载并转存到本地，对外返回同源 `/v1/videos/content/{id}`（`n>1` 时多条结果复用同一个落盘文件）
+  - 回源失败（下载异常 / 空响应 / 超出 `GENERATED_VIDEO_MAX_BYTES`）时**不会让生成失败**，自动退回原始 CDN 直链
+  - 内容接口使用 `Content-Disposition: inline` 且不传 filename，浏览器 `<video>` 可直接内联播放；支持 HTTP Range（拖动进度条）
+- 生成物保留时长：`GENERATED_MEDIA_TTL_SECONDS`（默认 `0` = 永久保留）
+
+### 媒体库接口（后台）
+
+图片与视频生成物统一进「媒体库」，需管理凭证（`Authorization: Bearer <ADMIN_KEY 或任一 API Key>`）。
+控制台侧对应页面是 **`/media`**（侧栏「生成工作台 → 媒体库」）：按类型筛选、按提示词搜索、
+网格预览（图片走 `?w=` 缩略图）、点开全屏查看、单条或批量删除。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/admin/media` | 列表。查询参数：`kind`（`all`/`image`/`video`）、`q`（对 prompt / 文件名 / 比例做大小写不敏感搜索）、`limit`（1..100，默认 24）、`offset`。返回 `items`/`total`/`offset`/`limit`/`has_more`/`stats`（`image`/`video`/`bytes` 基于 kind 过滤前的全量） |
+| `DELETE` | `/api/admin/media/{file_id}` | 删除单个生成物（元数据 + 磁盘文件）；不存在或非生成物返回 404 |
+| `POST` | `/api/admin/media/delete` | 批量删除，body `{"ids": [...]}`，返回 `deleted` 数量与 `ids`/`missing` 两组 id |
+
+列表项形如：
+
+```json
+{
+  "id": "3f2a...",
+  "kind": "video",
+  "url": "/v1/videos/content/3f2a...",
+  "filename": "clip.mp4",
+  "content_type": "video/mp4",
+  "size": 1048576,
+  "created_at": 1712345678.5,
+  "prompt": "海浪拍打礁石",
+  "ratio": "16:9",
+  "duration": 5,
+  "model": "qwen3.6-plus"
+}
+```
 
 ---
 
@@ -599,7 +643,9 @@ python start.py
 | `QWEN_UPSTREAM_USAGE_INCLUDES_ATTACHMENT_TOKENS` | `false` | 上游 `input_tokens` 是否已包含附件文本。默认 `false` 表示保守地在本地估算上继续叠加 `context_attachment_tokens`。 |
 | `IMAGE_GENERATION_MODEL` | `qwen3.8-max` | 生图请求 chat 级 `model`。 |
 | `IMAGE_GENERATION_META_MODEL` | `qwen-image-3.0-pro` | 生图请求 `extra.meta.model`，即真正出图的模型。留空则不发送该键，出图模型交由 `IMAGE_GENERATION_MODEL` 路由。 |
-| `GENERATED_IMAGE_TTL_SECONDS` | `3600` | 生图本地缓存 TTL（秒）。 |
+| `GENERATED_IMAGE_TTL_SECONDS` | `3600` | 生图本地缓存 TTL（秒）。已弃用：生成物清理改由 `GENERATED_MEDIA_TTL_SECONDS` 统一控制。 |
+| `GENERATED_MEDIA_TTL_SECONDS` | `0` | 生成物（图片/视频）保留秒数。`0` = 永久保留（媒体库语义），由后台清理任务按用途逐个清理。 |
+| `GENERATED_VIDEO_MAX_BYTES` | `268435456` | 视频回源下载体积上限（字节，默认 256MB）。超限不落盘、退回 CDN 直链，避免打爆内存。 |
 
 > 多模态附件相关变量（`INLINE_ATTACHMENT_ENABLED` / `INLINE_ATTACHMENT_MAX_BYTES` /
 > `INLINE_ATTACHMENT_MAX_URL_CHARS` / `INLINE_ATTACHMENT_REMOTE_FETCH` / `MULTIMODAL_STRICT` /

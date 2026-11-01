@@ -17,6 +17,7 @@ class SPAStaticFiles(StaticFiles):
         "embeddings",
         "healthz",
         "images",
+        "media",
         "messages",
         "models",
         "readyz",
@@ -30,6 +31,7 @@ class SPAStaticFiles(StaticFiles):
     # 否则直接访问 / 刷新页面会 404。子路径仍按 API 处理。
     SPA_PAGE_PATHS = {
         "images",
+        "media",
         "videos",
     }
 

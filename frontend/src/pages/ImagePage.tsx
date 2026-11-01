@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { Image as ImageIcon, RefreshCw, Download, Wand2, ExternalLink } from "lucide-react"
+import { Image as ImageIcon, RefreshCw, Download, Wand2, ExternalLink, Maximize2 } from "lucide-react"
 import { Button } from "../components/ui/button"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
@@ -8,6 +8,7 @@ import { Card, CardContent } from "../components/ui/card"
 import { Notice, SegmentedGroup, Textarea } from "../components/ui/field"
 import { StatusBadge } from "../components/ui/badge"
 import { PageShell } from "../components/ui/page-shell"
+import { Lightbox } from "../components/ui/lightbox"
 
 const ASPECT_RATIOS = [
   // auto 与官网默认一致：由上游按提示词自行决定比例，w/h 仅作占位
@@ -32,6 +33,8 @@ export default function ImagePage() {
   const [loading, setLoading] = useState(false)
   const [images, setImages] = useState<GeneratedImage[]>([])
   const [error, setError] = useState<string | null>(null)
+  // null 表示未打开大图查看；数值是 images 里的下标
+  const [previewIndex, setPreviewIndex] = useState<number | null>(null)
 
   const selectedRatio = ASPECT_RATIOS.find(r => r.value === ratio)!
   // "auto" 直接透传给上游（与官网默认一致）；其余转成 WxH，由后端映射回宽高比
@@ -100,7 +103,14 @@ export default function ImagePage() {
     <PageShell
       actions={
         images.length > 0 ? (
-          <Button variant="outline" onClick={() => setImages([])} disabled={loading}>
+          <Button
+            variant="outline"
+            onClick={() => {
+              setImages([])
+              setPreviewIndex(null)
+            }}
+            disabled={loading}
+          >
             清空结果
           </Button>
         ) : null
@@ -192,17 +202,32 @@ export default function ImagePage() {
               {images.map((img, idx) => (
                 <Card key={`${img.url}-${idx}`} className="overflow-hidden">
                   <div className="relative bg-muted/30">
-                    <img
-                      src={img.url}
-                      alt={img.revised_prompt}
-                      className="h-auto w-full object-contain"
-                      loading="lazy"
-                      onError={e => {
-                        const target = e.currentTarget
-                        target.style.display = "none"
-                        target.nextElementSibling?.classList.remove("hidden")
-                      }}
-                    />
+                    {/* 缩略图整体是按钮：鼠标、触屏、键盘都能进大图查看 */}
+                    <button
+                      type="button"
+                      onClick={() => setPreviewIndex(idx)}
+                      aria-label="放大查看图片"
+                      className="group relative block w-full cursor-zoom-in focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+                    >
+                      <img
+                        src={img.url}
+                        alt={img.revised_prompt}
+                        className="h-auto w-full object-contain"
+                        loading="lazy"
+                        onError={e => {
+                          const target = e.currentTarget
+                          // 图片外面多了一层 button，失败时先收起它，再露出同级的占位块
+                          const frame = target.parentElement
+                          target.style.display = "none"
+                          frame?.classList.add("hidden")
+                          frame?.nextElementSibling?.classList.remove("hidden")
+                        }}
+                      />
+                      {/* hover 提示：明确「可以点开看大图」，平时不遮挡画面 */}
+                      <span className="pointer-events-none absolute inset-0 flex items-center justify-center gap-2 bg-black/35 text-sm text-white opacity-0 transition-opacity group-hover:opacity-100">
+                        <Maximize2 className="h-5 w-5" aria-hidden="true" /> 点击放大
+                      </span>
+                    </button>
                     <div className="hidden items-center justify-center p-8 text-sm text-muted-foreground">
                       <ImageIcon className="mr-2 h-8 w-8" /> 图片加载失败
                     </div>
@@ -214,6 +239,9 @@ export default function ImagePage() {
                     </div>
                     {/* 操作常驻可见，触屏与键盘用户同样可达 */}
                     <div className="flex flex-wrap items-center gap-2">
+                      <Button size="sm" variant="outline" onClick={() => setPreviewIndex(idx)} className="gap-1.5">
+                        <Maximize2 className="h-3.5 w-3.5" /> 放大
+                      </Button>
                       <Button size="sm" variant="outline" onClick={() => handleDownload(img.url, idx)} className="gap-1.5">
                         <Download className="h-3.5 w-3.5" /> 下载
                       </Button>
@@ -243,6 +271,18 @@ export default function ImagePage() {
           )}
         </div>
       </div>
+
+      <Lightbox
+        media={images.map((img, idx) => ({
+          url: img.url,
+          kind: "image" as const,
+          caption: img.revised_prompt,
+          downloadName: `qwen_image_${idx}.png`,
+        }))}
+        index={previewIndex}
+        onIndexChange={setPreviewIndex}
+        onClose={() => setPreviewIndex(null)}
+      />
     </PageShell>
   )
 }

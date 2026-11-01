@@ -59,3 +59,100 @@ export interface VideoResponseItem {
   ratio?: string
   duration?: number
 }
+
+/** 媒体库条目（仅声明前端实际读取的字段）。 */
+export interface MediaItem {
+  id: string
+  kind: "image" | "video"
+  url: string
+  filename: string
+  content_type: string
+  size: number
+  created_at: number
+  prompt: string
+  ratio?: string | null
+  duration?: number | null
+  model?: string | null
+}
+
+/** 媒体库统计：数量与占用体积（后端全量统计，与当前分页无关）。 */
+export interface MediaStats {
+  image: number
+  video: number
+  bytes: number
+}
+
+export interface MediaListResponse {
+  items: MediaItem[]
+  total: number
+  offset: number
+  limit: number
+  has_more: boolean
+  stats: MediaStats
+}
+
+/**
+ * 把媒体列表响应收窄成安全结构。
+ *
+ * 后端字段缺失或类型不符时给默认值，页面就不必到处判空；
+ * 缺少 id/url 的条目无法展示也无法删除，直接丢弃。
+ */
+export function mediaListFrom(payload: unknown): MediaListResponse {
+  const root = asRecord(payload)
+  const stats = asRecord(root.stats)
+  const rawItems = Array.isArray(root.items) ? root.items : []
+  const items = rawItems
+    .map(mediaItemFrom)
+    .filter((item): item is MediaItem => item !== null)
+
+  return {
+    items,
+    total: numberOf(root.total, items.length),
+    offset: numberOf(root.offset, 0),
+    limit: numberOf(root.limit, items.length),
+    has_more: root.has_more === true,
+    stats: {
+      image: numberOf(stats.image, 0),
+      video: numberOf(stats.video, 0),
+      bytes: numberOf(stats.bytes, 0),
+    },
+  }
+}
+
+function mediaItemFrom(value: unknown): MediaItem | null {
+  const record = asRecord(value)
+  const id = stringOf(record.id)
+  const url = stringOf(record.url)
+  if (!id || !url) return null
+
+  return {
+    id,
+    // 未知类型按图片处理：至少能预览，不会渲染出空白卡片
+    kind: record.kind === "video" ? "video" : "image",
+    url,
+    filename: stringOf(record.filename),
+    content_type: stringOf(record.content_type),
+    size: numberOf(record.size, 0),
+    created_at: numberOf(record.created_at, 0),
+    prompt: stringOf(record.prompt),
+    ratio: optionalString(record.ratio),
+    duration: optionalNumber(record.duration),
+    model: optionalString(record.model),
+  }
+}
+
+function numberOf(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback
+}
+
+function stringOf(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback
+}
+
+function optionalString(value: unknown): string | null {
+  return typeof value === "string" ? value : null
+}
+
+function optionalNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null
+}

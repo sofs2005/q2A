@@ -195,7 +195,7 @@ class ImagesHttpTests(unittest.TestCase):
 
         save_ids = {"n": 0}
 
-        async def fake_save_bytes(filename, content_type, raw, purpose, owner_token=None):
+        async def fake_save_bytes(filename, content_type, raw, purpose, owner_token=None, extra=None):
             save_ids["n"] += 1
             fid = f"file{save_ids['n']}"
             return {
@@ -404,6 +404,42 @@ class ImagesHttpTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.content, png_bytes)
             self.assertIn("image/png", response.headers.get("content-type", ""))
+
+    def test_get_image_content_with_width_falls_back_to_original(self) -> None:
+        """`?w=` 只是加速手段：内容不是真图片时（或没装 Pillow）必须仍返回原图。
+
+        真正的缩放行为在 tests/test_image_thumbnail.py 里覆盖（需要可用的 Pillow）。
+        """
+        import asyncio
+        import tempfile
+
+        png_bytes = b"\x89PNG\r\n\x1a\ncontent"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LocalFileStore(tmp)
+
+            async def _seed():
+                return await store.save_bytes("cat.png", "image/png", png_bytes, "generated_image")
+
+            meta = asyncio.run(_seed())
+
+            app = FastAPI()
+            app.include_router(images.router)
+            app.state.file_store = store
+
+            client = TestClient(app)
+            for width in (480, 0, 99999):
+                with self.subTest(width=width):
+                    response = client.get(f"/v1/images/content/{meta['id']}?w={width}")
+                    self.assertEqual(response.status_code, 200)
+                    # 退化时是原图；装了 Pillow 且渲染成功时是 JPEG 缩略图
+                    content_type = response.headers.get("content-type", "")
+                    self.assertTrue(
+                        "image/jpeg" in content_type or "image/png" in content_type,
+                        content_type,
+                    )
+                    if "image/jpeg" not in content_type:
+                        self.assertEqual(response.content, png_bytes)
 
     def test_cleanup_expired_can_filter_by_purpose(self) -> None:
         import asyncio

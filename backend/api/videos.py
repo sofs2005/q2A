@@ -17,8 +17,13 @@ import time
 import json
 import asyncio
 import logging
+import mimetypes
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
 from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from backend.services.media_purposes import GENERATED_VIDEO_PURPOSE
 from backend.services.qwen_client import QwenClient
 
 log = logging.getLogger("qwen2api.videos")
@@ -150,6 +155,64 @@ def _parse_json(body: str):
         return None
 
 
+def _guess_video_filename(url: str, content_type: str) -> str:
+    """从 CDN URL 里取文件名；没有扩展名时按 content_type 猜，兜底 .mp4。"""
+    name = Path(urlparse(url).path).name or "generated"
+    if "." not in name:
+        ext = mimetypes.guess_extension(content_type or "") or ".mp4"
+        name = f"{name}{ext}"
+    return name.split("?")[0]
+
+
+async def _rehost_video(
+    file_store: Any,
+    client: QwenClient,
+    acc: Any,
+    video_url: str,
+    *,
+    prompt: str,
+    ratio: str,
+    duration: int,
+    model: str = "",
+) -> str:
+    """回源下载上游视频并落盘，返回同源 `/v1/videos/content/{id}`。
+
+    上游 CDN 直链带签名会过期，因此生成成功后尽量转存到本地。任何失败
+    （无 store / 无下载能力 / 体积超限 / 下载异常）都退回原始 URL ——
+    绝不能因为回源失败让生成失败。
+    """
+    from backend.core.config import settings
+
+    if file_store is None or not hasattr(client, "download_url"):
+        return video_url
+    try:
+        raw, content_type = await client.download_url(video_url, account=acc)
+        if not raw:
+            log.warning("[T2V] rehost skipped: empty body url=%s", video_url[:120])
+            return video_url
+        max_bytes = int(getattr(settings, "GENERATED_VIDEO_MAX_BYTES", 0) or 0)
+        if max_bytes > 0 and len(raw) > max_bytes:
+            log.warning(
+                "[T2V] rehost skipped: video too large size=%s max=%s url=%s",
+                len(raw), max_bytes, video_url[:120],
+            )
+            return video_url
+        content_type = content_type or "video/mp4"
+        name = _guess_video_filename(video_url, content_type)
+        meta = await file_store.save_bytes(
+            name,
+            content_type,
+            raw,
+            GENERATED_VIDEO_PURPOSE,
+            extra={"prompt": prompt, "ratio": ratio, "duration": duration, "model": model},
+        )
+        log.info("[T2V] rehosted url -> file_id=%s size=%s", meta.get("id"), meta.get("size"))
+        return f"/v1/videos/content/{meta['id']}"
+    except Exception as exc:
+        log.warning("[T2V] rehost failed url=%s error=%s", video_url[:120], exc)
+        return video_url
+
+
 # ---------------------------------------------------------------------------
 # 统一轮询：先拿 task_id/url，再轮询任务状态
 # ---------------------------------------------------------------------------
@@ -189,7 +252,7 @@ async def _poll_until_ready(client: QwenClient, acc, chat_id: str,
 
 async def _run_generation(
     client: QwenClient, model: str, prompt: str, n: int, duration: int,
-    ratio: str, media_options: dict,
+    ratio: str, media_options: dict, file_store: Any = None,
 ) -> dict:
     from backend.core.config import settings
 
@@ -234,6 +297,11 @@ async def _run_generation(
             raise HTTPException(status_code=500, detail="Video generation produced no video URL")
 
         log.info(f"[T2V] 视频 URL: {video_url}")
+        # 回源落盘只做一次：n 条结果复用同一个 URL（上游单任务只产 1 个视频）
+        video_url = await _rehost_video(
+            file_store, client, acc, video_url,
+            prompt=prompt, ratio=ratio, duration=duration, model=model,
+        )
         # Qwen 单任务生成单个视频；n>1 时返回同一 URL 以兼容契约
         data = [
             {
@@ -260,6 +328,31 @@ async def _run_generation(
             client.account_pool.release(acc)
         if acc is not None and chat_id and settings.UPSTREAM_AUTO_DELETE_ENABLED:
             asyncio.create_task(client.delete_chat(acc.token, chat_id, account=acc))
+
+
+@router.get("/v1/videos/content/{file_id}")
+@router.get("/videos/content/{file_id}")
+async def get_video_content(request: Request, file_id: str):
+    """回源转存后的视频内容（同源播放，避免 CDN 直链过期/403）。
+
+    不传 filename：避免 attachment 响应头让浏览器下载而不是内联播放。
+    Starlette 的 FileResponse 自带 Range 支持，浏览器 <video> 拖动进度可用。
+    """
+    file_store = getattr(request.app.state, "file_store", None)
+    if file_store is None:
+        raise HTTPException(status_code=404, detail="Video not found")
+    meta = await file_store.get(file_id)
+    if meta is None or meta.get("purpose") != GENERATED_VIDEO_PURPOSE:
+        # 仅暴露视频生成物，避免误读上下文附件/生图结果
+        raise HTTPException(status_code=404, detail="Video not found")
+    path = meta.get("path")
+    if not path or not Path(path).is_file():
+        raise HTTPException(status_code=404, detail="Video not found")
+    return FileResponse(
+        path,
+        media_type=meta.get("content_type") or "video/mp4",
+        content_disposition_type="inline",
+    )
 
 
 @router.post("/v1/videos/generations")
@@ -300,7 +393,10 @@ async def create_video(request: Request):
 
     async def event_stream():
         gen_task = asyncio.create_task(
-            _run_generation(client, model, prompt, n, duration, ratio, media_options)
+            _run_generation(
+                client, model, prompt, n, duration, ratio, media_options,
+                file_store=getattr(request.app.state, "file_store", None),
+            )
         )
         try:
             while True:

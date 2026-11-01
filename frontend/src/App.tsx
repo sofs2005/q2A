@@ -8,6 +8,7 @@ import TokensPage from "./pages/TokensPage"
 import SettingsPage from "./pages/SettingsPage"
 import ImagePage from "./pages/ImagePage"
 import VideoPage from "./pages/VideoPage"
+import MediaLibraryPage from "./pages/MediaLibraryPage"
 import NotFoundPage from "./pages/NotFoundPage"
 
 function App() {
@@ -23,6 +24,7 @@ function App() {
             <Route path="test" element={<TestPage />} />
             <Route path="images" element={<ImagePage />} />
             <Route path="videos" element={<VideoPage />} />
+            <Route path="media" element={<MediaLibraryPage />} />
             <Route path="settings" element={<SettingsPage />} />
             <Route path="*" element={<NotFoundPage />} />
           </Route>
