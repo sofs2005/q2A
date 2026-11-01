@@ -47,13 +47,15 @@ async def clear_captures(request: Request):
 
 @router.get("/admin/upload/probe", dependencies=[Depends(verify_admin)])
 async def probe_browser_upload(request: Request):
-    """只读探针：连一次 CDP，回报「浏览器上传」链路是否可用。
+    """只读探针：连一次浏览器，回报「浏览器上传」链路是否可用。
 
     排查「上传一直走内联 / 一直 400 attachment_too_large」时先看这里：
 
-    - `connected=false`：CDP 连不上（endpoint / 网络 / 容器名写错）；
+    - `mode`：`remote`（远程 CDP）/ `local`（进程内 Chromium）/ `off`（链路关闭）；
+    - `connected=false`：浏览器连不上（endpoint / 网络 / 容器名写错 / 本机缺 Chromium）；
     - `captcha_passed_recently=false`：最近 10 分钟没成功过拼图验证码；
-    - `calibration`：当前使用的拖动标定（`a` / `b` / 来源）。
+    - `calibration`：当前使用的拖动标定（`a` / `b` / 来源 / 标定时的 `mode`）；
+    - `local` 模式额外给 `platform` / `webgl`，用于判断容器里的指纹环境。
 
     探针**永不**返回 5xx：异常也折叠成 `connected=false` + `error`。
     """
@@ -61,6 +63,7 @@ async def probe_browser_upload(request: Request):
     if proxy is None:
         return {
             "connected": False,
+            "mode": "off",
             "browser_version": "",
             "captcha_passed_recently": False,
             "error": "browser_upload_proxy is not initialized",
@@ -71,6 +74,7 @@ async def probe_browser_upload(request: Request):
         logger.warning("browser upload probe failed: %s", exc)
         return {
             "connected": False,
+            "mode": "off",
             "browser_version": "",
             "captcha_passed_recently": False,
             "error": str(exc),

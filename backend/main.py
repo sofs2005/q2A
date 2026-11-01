@@ -124,7 +124,9 @@ async def lifespan(app: FastAPI):
         app.state.upstream_file_cache = UpstreamFileCache(app.state.context_cache_db)
         app.state.context_offloader = ContextOffloader(settings)
         app.state.upstream_file_uploader = UpstreamFileUploader(app.state.qwen_client, settings)
-        # 浏览器上传代理：惰性连接（首次真正上传时才连 CDP），endpoint 为空时全程禁用。
+        # 浏览器上传代理：惰性连接（首次真正上传时才连浏览器）。endpoint 非空走远程
+        # CDP，为空则在进程内启动 Playwright Chromium（local 模式）；两者都由
+        # UPLOAD_BROWSER_MODE / UPLOAD_VIA_BROWSER 决定。
         app.state.browser_upload_proxy = BrowserUploadProxy(settings)
         app.state.session_locks = SessionLockRegistry()
         app.state.response_store = InMemoryResponseStore()

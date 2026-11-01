@@ -165,8 +165,13 @@ class Settings(BaseSettings):
 
     # ---- 浏览器上传代理（过阿里云拼图验证码换 getstsToken 的 STS）----
     # 远程 CDP 端点（browserless / 远程 Chrome），如 http://10.6.6.4:3000。
-    # 留空 = 关闭浏览器上传（内联装不下的附件直接 400 attachment_too_large）。
+    # 留空 = 用本进程内置的 Playwright Chromium（local 模式）；两者都不想要就设
+    # UPLOAD_VIA_BROWSER=never（内联装不下的附件直接 400 attachment_too_large）。
     UPLOAD_CDP_ENDPOINT: str = os.getenv("UPLOAD_CDP_ENDPOINT", "").strip()
+    # auto  = endpoint 非空走远程 CDP，为空则在进程内启动 Chromium（默认）
+    # local = 强制用内置 Chromium（忽略 endpoint）
+    # remote= 强制用远程 CDP（endpoint 为空则整条链路关闭）
+    UPLOAD_BROWSER_MODE: str = os.getenv("UPLOAD_BROWSER_MODE", "auto").strip().lower() or "auto"
     # auto  = 仅当内联装不下且 endpoint 已配置时用浏览器上传（默认）
     # always= 与 auto 行为一致（上传路径优先尝试浏览器），保留语义便于运维切换
     # never = 完全不用浏览器上传

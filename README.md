@@ -341,17 +341,35 @@ base64 膨胀 1.33 倍，因此内联实际只能承载约 **6KB 二进制**：
                                └ 失败/未配置 ──▶ 400 attachment_too_large
 ```
 
-- 需要一个可通过 CDP 连接的浏览器端点，例如远程 browserless / 带 `--remote-debugging-port` 的 Chrome：
-  ```bash
-  UPLOAD_CDP_ENDPOINT=http://10.6.6.4:3000
-  UPLOAD_VIA_BROWSER=auto          # auto | always | never
-  UPLOAD_CAPTCHA_MAX_ROUNDS=3      # 验证码可能要过两轮
-  UPLOAD_DRAG_MAPPING=auto         # auto | linear | quadratic
-  ```
+- 两种连接模式，按配置自动选择：
+  - **remote**：连一个可通过 CDP 连接的浏览器端点，例如远程 browserless / 带 `--remote-debugging-port` 的 Chrome：
+    ```bash
+    UPLOAD_CDP_ENDPOINT=http://10.6.6.4:3000
+    UPLOAD_VIA_BROWSER=auto          # auto | always | never
+    UPLOAD_CAPTCHA_MAX_ROUNDS=3      # 验证码可能要过两轮
+    UPLOAD_DRAG_MAPPING=auto         # auto | linear | quadratic
+    ```
+  - **local**：`UPLOAD_CDP_ENDPOINT` **留空**即在本进程内启动一个 Playwright Chromium，
+    不需要任何外部机器（镜像已带 playwright + chromium）：
+    ```bash
+    UPLOAD_CDP_ENDPOINT=             # 留空 → local
+    UPLOAD_BROWSER_MODE=auto         # auto（默认）| local | remote
+    ```
+    launch 参数与 `captcha_solver` 一致（`--disable-blink-features=AutomationControlled`、
+    `--no-sandbox`、`--disable-dev-shm-usage` 等），配了 `UPSTREAM_PROXY` 时浏览器同样走该代理
+    （出口 IP 必须与 API 一致，阿里把 `acw_tc` / `x5sec` 绑到签发 IP）。
+- `UPLOAD_BROWSER_MODE`：`auto`（endpoint 非空走 remote，为空走 local）/ `local`（强制内置
+  浏览器，忽略 endpoint）/ `remote`（强制远程，endpoint 为空则整条链路关闭）。
+  `UPLOAD_VIA_BROWSER=never` 始终优先关闭链路。
+- ⚠️ **local 模式的指纹是容器里的 Linux + SwiftShader（软件渲染）**，与真实 Windows Chrome
+  差异明显，过拼图验证码的概率低于 remote 接真机/真 Windows 浏览器；只适合没有远程浏览器
+  可用时的兜底，或排查/联调用。`GET /admin/upload/probe` 的 `platform` / `webgl` 字段可以直接
+  看出当前指纹。
 - 拖动比例默认 **自动标定**：先拖 40px / 80px 两点，读拼图实际位移拟合曲线，再算真正要拖多远，
-  结果缓存在 `data/drag_calibration.json`（不同浏览器/缩放只需标定一次）。
+  结果缓存在 `data/drag_calibration.json`（不同浏览器/缩放只需标定一次）。缓存里记录了标定时的
+  `mode`，remote ↔ local 切换后会重新标定（两种模式映射曲线不同）。
 - 账号级熔断：连续失败达上限后该账号 10 分钟内不再尝试浏览器上传，避免把风控分打高。
-- 排查：`GET /admin/upload/probe` 返回 CDP 连接状态与浏览器版本。
+- 排查：`GET /admin/upload/probe` 返回 `mode`（`remote` / `local` / `off`）、连接状态与浏览器版本。
 - ⚠️ 该通道依赖真实浏览器环境与干净的出口 IP；同一 IP 短时间内反复触发验证码会被风控
   回 `F015`（频率类），此时需要冷却或更换出口。
 

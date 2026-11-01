@@ -21,13 +21,19 @@ from unittest.mock import patch
 
 from backend.services import browser_upload_proxy as bux
 from backend.services.browser_upload_proxy import (
+    BROWSER_MODE_LOCAL,
+    BROWSER_MODE_OFF,
+    BROWSER_MODE_REMOTE,
     BUILTIN_QUADRATIC_A,
     BUILTIN_QUADRATIC_B,
+    LOCAL_LAUNCH_ARGS,
     BrowserUploadError,
     BrowserUploadProxy,
     BrowserUploadUnavailable,
     DragCalibration,
     build_drag_trajectory,
+    build_local_context_kwargs,
+    build_local_launch_kwargs,
     build_request_headers,
     cookies_for_context,
     extract_verify_code,
@@ -35,9 +41,11 @@ from backend.services.browser_upload_proxy import (
     linear_mouse_dx,
     load_calibration,
     mouse_dx_for_piece,
+    normalize_browser_mode,
     normalize_drag_mapping,
     parse_cookie_header,
     quadratic_mouse_dx,
+    resolve_browser_mode,
     sanitize_fetch_headers,
     save_calibration,
     token_expire_ms,
@@ -93,12 +101,14 @@ def _account(email: str = "alice@example.com") -> types.SimpleNamespace:
 def _settings(**overrides) -> types.SimpleNamespace:
     base = {
         "UPLOAD_CDP_ENDPOINT": "http://10.6.6.4:3000",
+        "UPLOAD_BROWSER_MODE": "auto",
         "UPLOAD_VIA_BROWSER": "auto",
         "UPLOAD_CAPTCHA_MAX_ROUNDS": 3,
         "UPLOAD_CAPTCHA_TIMEOUT_SECONDS": 5,
         "UPLOAD_DRAG_MAPPING": "linear",
         "UPLOAD_BROWSER_TIMEOUT_SECONDS": 30,
         "UPLOAD_DRAG_CALIBRATION_FILE": "",
+        "UPSTREAM_PROXY": "",
         "QWEN_WEB_VERSION": "0.3.28",
         "QWEN_BX_VERSION": "2.5.37",
     }
@@ -231,6 +241,128 @@ class FakePage:
         if kind == "raw":
             return {"status": 200, "body": payload}
         return {"status": 200, "body": json.dumps(payload)}
+
+
+class FakeLocalPage:
+    """local 模式探针用的最小 Page：只支持 evaluate / is_closed / on。"""
+
+    def __init__(self, platform: str = "Linux x86_64", webgl: str = "Google SwiftShader") -> None:
+        self.platform = platform
+        self.webgl = webgl
+        self.evaluated: list[str] = []
+        self.handlers: list[tuple[str, object]] = []
+
+    async def evaluate(self, script: str, arg=None):
+        del arg
+        text = str(script)
+        self.evaluated.append(text)
+        if "navigator.platform" in text:
+            return self.platform
+        if "WEBGL_debug_renderer_info" in text:
+            return self.webgl
+        return None
+
+    def is_closed(self) -> bool:
+        return False
+
+    def on(self, event: str, handler) -> None:
+        self.handlers.append((event, handler))
+
+
+class FakeBrowserContext:
+    """`browser.new_context()` 的返回值：记录参数并按需造 page。"""
+
+    def __init__(self) -> None:
+        self.pages: list[FakeLocalPage] = []
+        self.init_scripts: list[str] = []
+        self.cookie_batches: list[list[dict]] = []
+        self.cdp_sessions: list[FakeCdpSession] = []
+
+    async def new_page(self) -> FakeLocalPage:
+        page = FakeLocalPage()
+        self.pages.append(page)
+        return page
+
+    async def new_cdp_session(self, page) -> FakeCdpSession:
+        del page
+        session = FakeCdpSession()
+        self.cdp_sessions.append(session)
+        return session
+
+    async def add_init_script(self, script: str) -> None:
+        self.init_scripts.append(script)
+
+    async def add_cookies(self, cookies) -> None:
+        self.cookie_batches.append(list(cookies))
+
+
+class FakeBrowser:
+    """playwright `Browser` 替身（local launch 与 remote connect 共用）。"""
+
+    def __init__(self, *, version: str = "140.0.7339.80", contexts=None) -> None:
+        self._version = version
+        self.contexts: list[FakeBrowserContext] = list(contexts or [])
+        self.new_context_calls: list[dict] = []
+        self.close_calls = 0
+        self._connected = True
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def version(self) -> str:
+        return self._version
+
+    async def new_context(self, **kwargs):
+        self.new_context_calls.append(dict(kwargs))
+        context = FakeBrowserContext()
+        self.contexts.append(context)
+        return context
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        self._connected = False
+
+
+class FakeChromium:
+    """`playwright.chromium`：记录 launch / connect_over_cdp 的调用。"""
+
+    def __init__(self) -> None:
+        self.launch_calls: list[dict] = []
+        self.connect_calls: list[str] = []
+        self.browsers: list[FakeBrowser] = []
+
+    async def launch(self, **kwargs) -> FakeBrowser:
+        self.launch_calls.append(dict(kwargs))
+        browser = FakeBrowser()
+        self.browsers.append(browser)
+        return browser
+
+    async def connect_over_cdp(self, endpoint: str) -> FakeBrowser:
+        self.connect_calls.append(endpoint)
+        browser = FakeBrowser()
+        self.browsers.append(browser)
+        return browser
+
+
+class FakePlaywright:
+    def __init__(self) -> None:
+        self.chromium = FakeChromium()
+        self.stop_calls = 0
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+
+
+class FakePlaywrightFactory:
+    """`async_playwright()` 的替身：`.start()` 返回同一个 FakePlaywright。"""
+
+    def __init__(self) -> None:
+        self.instance = FakePlaywright()
+        self.start_calls = 0
+
+    async def start(self) -> FakePlaywright:
+        self.start_calls += 1
+        return self.instance
 
 
 class ProxyTestBase(unittest.IsolatedAsyncioTestCase):
@@ -380,8 +512,19 @@ class FetchStsLoopTests(ProxyTestBase):
         self.assertEqual(proxy.failure_streak("alice@example.com"), 0)
         self.assertFalse(proxy.is_cooled_down("alice@example.com"))
 
-    async def test_disabled_when_endpoint_missing_returns_none(self) -> None:
+    async def test_endpoint_missing_falls_back_to_local_mode(self) -> None:
+        """endpoint 留空不再等于关闭：auto 模式改为走进程内 Chromium。"""
         proxy = self.build_proxy(_settings(UPLOAD_CDP_ENDPOINT=""))
+        self.assertEqual(proxy.mode, BROWSER_MODE_LOCAL)
+        self.assertTrue(proxy.enabled)
+        page, cdp = self.build_page(fetch_results=[("json", {"data": STS_DATA})])
+        with self.patch_page(proxy, page, cdp):
+            result = await proxy.fetch_sts(_account(), "a.mp4", "video/mp4", 10)
+        self.assertEqual(result["file_id"], STS_DATA["file_id"])
+
+    async def test_disabled_when_remote_mode_without_endpoint(self) -> None:
+        proxy = self.build_proxy(_settings(UPLOAD_CDP_ENDPOINT="", UPLOAD_BROWSER_MODE="remote"))
+        self.assertEqual(proxy.mode, BROWSER_MODE_OFF)
         self.assertIsNone(await proxy.fetch_sts(_account(), "a.mp4", "video/mp4", 10))
 
     async def test_disabled_when_mode_never_returns_none(self) -> None:
@@ -683,53 +826,373 @@ class HelperTests(unittest.TestCase):
         # 解不出来时退回 now + 默认 TTL
         self.assertEqual(token_expire_ms("garbage", now=1000.0, default_ttl_seconds=60.0), 1_060_000)
 
-    def test_probe_reports_missing_endpoint(self) -> None:
+    def test_probe_reports_off_mode_without_touching_browser(self) -> None:
         import asyncio
 
-        proxy = BrowserUploadProxy(_settings(UPLOAD_CDP_ENDPOINT=""), clock=lambda: 5.0)
+        proxy = BrowserUploadProxy(_settings(UPLOAD_VIA_BROWSER="never"), clock=lambda: 5.0)
         result = asyncio.run(proxy.probe())
         self.assertFalse(result["connected"])
+        self.assertEqual(result["mode"], BROWSER_MODE_OFF)
         self.assertEqual(result["browser_version"], "")
         self.assertIn("error", result)
+
+
+class BrowserModeTests(unittest.TestCase):
+    """模式判定矩阵：endpoint 有/无 × UPLOAD_VIA_BROWSER × UPLOAD_BROWSER_MODE。"""
+
+    CASES: tuple[tuple[str, str, str, str], ...] = (
+        # (endpoint, UPLOAD_VIA_BROWSER, UPLOAD_BROWSER_MODE, 期望模式)
+        ("http://10.6.6.4:3000", "auto", "auto", BROWSER_MODE_REMOTE),
+        ("", "auto", "auto", BROWSER_MODE_LOCAL),
+        ("   ", "auto", "auto", BROWSER_MODE_LOCAL),
+        ("http://10.6.6.4:3000", "always", "auto", BROWSER_MODE_REMOTE),
+        ("", "always", "auto", BROWSER_MODE_LOCAL),
+        ("http://10.6.6.4:3000", "never", "auto", BROWSER_MODE_OFF),
+        ("", "never", "auto", BROWSER_MODE_OFF),
+        # 显式 local：忽略 endpoint，但 never 仍然优先
+        ("http://10.6.6.4:3000", "auto", "local", BROWSER_MODE_LOCAL),
+        ("", "auto", "local", BROWSER_MODE_LOCAL),
+        ("http://10.6.6.4:3000", "never", "local", BROWSER_MODE_OFF),
+        # 显式 remote：没端点就关闭
+        ("http://10.6.6.4:3000", "auto", "remote", BROWSER_MODE_REMOTE),
+        ("", "auto", "remote", BROWSER_MODE_OFF),
+        ("", "never", "remote", BROWSER_MODE_OFF),
+        # 大小写 / 非法值 / 空值都归一化到 auto
+        ("http://10.6.6.4:3000", "auto", "LOCAL", BROWSER_MODE_LOCAL),
+        ("http://10.6.6.4:3000", "auto", "nonsense", BROWSER_MODE_REMOTE),
+        ("", "auto", "nonsense", BROWSER_MODE_LOCAL),
+        ("", "auto", "", BROWSER_MODE_LOCAL),
+    )
+
+    def test_mode_matrix(self) -> None:
+        for endpoint, upload_mode, browser_mode, expected in self.CASES:
+            with self.subTest(endpoint=endpoint, upload=upload_mode, mode=browser_mode):
+                settings = _settings(
+                    UPLOAD_CDP_ENDPOINT=endpoint,
+                    UPLOAD_VIA_BROWSER=upload_mode,
+                    UPLOAD_BROWSER_MODE=browser_mode,
+                )
+                self.assertEqual(resolve_browser_mode(settings), expected)
+                proxy = BrowserUploadProxy(settings, calibration_path=Path(tempfile.mkdtemp()) / "cal.json")
+                self.assertEqual(proxy.mode, expected)
+                self.assertEqual(proxy.enabled, expected != BROWSER_MODE_OFF)
+
+    def test_normalize_browser_mode(self) -> None:
+        self.assertEqual(normalize_browser_mode("LOCAL"), BROWSER_MODE_LOCAL)
+        self.assertEqual(normalize_browser_mode(" remote "), BROWSER_MODE_REMOTE)
+        # `auto` 是兜底值：off / 空 / None / 乱填都归一到 auto
+        self.assertEqual(normalize_browser_mode("auto"), "auto")
+        self.assertEqual(normalize_browser_mode("off"), "auto")
+        self.assertEqual(normalize_browser_mode(None), "auto")
+        self.assertEqual(normalize_browser_mode(""), "auto")
+
+    def test_upload_mode_never_beats_explicit_local(self) -> None:
+        settings = _settings(UPLOAD_VIA_BROWSER="never", UPLOAD_BROWSER_MODE="local", UPLOAD_CDP_ENDPOINT="")
+        self.assertEqual(resolve_browser_mode(settings), BROWSER_MODE_OFF)
+
+
+class LocalBrowserConnectionTests(ProxyTestBase):
+    """local 模式：launch 参数 / 代理 / 复用 / 回收（全程 fake，不起真浏览器）。"""
+
+    def build_local_proxy(self, **overrides):
+        settings = _settings(UPLOAD_CDP_ENDPOINT="", **overrides)
+        return self.build_proxy(settings)
+
+    async def _connect(self, proxy: BrowserUploadProxy, factory: FakePlaywrightFactory) -> None:
+        with patch.object(bux, "async_playwright", lambda: factory):
+            async with proxy._connect_lock:
+                await proxy._ensure_connected_locked()
+
+    async def test_local_mode_launches_chromium_with_stealth_args(self) -> None:
+        proxy = self.build_local_proxy()
+        factory = FakePlaywrightFactory()
+        await self._connect(proxy, factory)
+
+        self.assertEqual(proxy._mode_in_use, BROWSER_MODE_LOCAL)
+        self.assertEqual(len(factory.instance.chromium.launch_calls), 1)
+        launch_kwargs = factory.instance.chromium.launch_calls[0]
+        self.assertTrue(launch_kwargs["headless"])
+        self.assertIn("--disable-blink-features=AutomationControlled", launch_kwargs["args"])
+        self.assertIn("--no-sandbox", launch_kwargs["args"])
+        self.assertIn("--disable-dev-shm-usage", launch_kwargs["args"])
+        # 与 captcha_solver 的 launch 参数保持同一套
+        self.assertEqual(tuple(launch_kwargs["args"]), tuple(LOCAL_LAUNCH_ARGS))
+        # 没配 UPSTREAM_PROXY 时不挂代理
+        self.assertNotIn("proxy", launch_kwargs)
+        # 远程 CDP 一条都不走
+        self.assertEqual(factory.instance.chromium.connect_calls, [])
+
+        browser = proxy._browser
+        self.assertIsNotNone(browser)
+        context_kwargs = browser.new_context_calls[0]
+        self.assertEqual(context_kwargs["locale"], "zh-CN")
+        self.assertEqual(context_kwargs["timezone_id"], "Asia/Shanghai")
+        self.assertEqual(context_kwargs["viewport"], {"width": 1280, "height": 900})
+        # page / cdp session 都建好了
+        self.assertIsNotNone(proxy._page)
+        self.assertIsNotNone(proxy._cdp)
+
+    async def test_local_mode_passes_upstream_proxy_to_launch(self) -> None:
+        proxy = self.build_local_proxy(UPSTREAM_PROXY="http://user:pass@127.0.0.1:7890")
+        factory = FakePlaywrightFactory()
+        await self._connect(proxy, factory)
+
+        launch_kwargs = factory.instance.chromium.launch_calls[0]
+        self.assertEqual(launch_kwargs["proxy"], {"server": "http://user:pass@127.0.0.1:7890"})
+
+    async def test_local_mode_reuses_browser_instance(self) -> None:
+        proxy = self.build_local_proxy()
+        factory = FakePlaywrightFactory()
+        await self._connect(proxy, factory)
+        await self._connect(proxy, factory)
+
+        # page 仍可用 → 不重复 launch / start
+        self.assertEqual(len(factory.instance.chromium.launch_calls), 1)
+        self.assertEqual(factory.start_calls, 1)
+
+    async def test_remote_mode_uses_connect_over_cdp(self) -> None:
+        proxy = self.build_proxy(_settings(UPLOAD_CDP_ENDPOINT="http://10.6.6.4:3000"))
+        factory = FakePlaywrightFactory()
+        await self._connect(proxy, factory)
+
+        self.assertEqual(proxy._mode_in_use, BROWSER_MODE_REMOTE)
+        self.assertEqual(factory.instance.chromium.connect_calls, ["http://10.6.6.4:3000"])
+        self.assertEqual(factory.instance.chromium.launch_calls, [])
+
+    async def test_close_is_idempotent_and_reclaims_playwright(self) -> None:
+        proxy = self.build_local_proxy()
+        factory = FakePlaywrightFactory()
+        await self._connect(proxy, factory)
+        browser = proxy._browser
+
+        await proxy.close()
+        self.assertEqual(browser.close_calls, 1)
+        self.assertEqual(factory.instance.stop_calls, 1)
+        self.assertIsNone(proxy._browser)
+        self.assertIsNone(proxy._playwright)
+        self.assertIsNone(proxy._page)
+        self.assertIsNone(proxy._mode_in_use)
+
+        # 第二次 close 不重复回收、不抛异常
+        await proxy.close()
+        self.assertEqual(browser.close_calls, 1)
+        self.assertEqual(factory.instance.stop_calls, 1)
+
+    async def test_probe_local_reports_mode_version_platform_webgl(self) -> None:
+        proxy = self.build_local_proxy()
+        factory = FakePlaywrightFactory()
+        with patch.object(bux, "async_playwright", lambda: factory):
+            result = await proxy.probe()
+
+        self.assertTrue(result["connected"])
+        self.assertEqual(result["mode"], BROWSER_MODE_LOCAL)
+        self.assertEqual(result["browser_version"], "140.0.7339.80")
+        self.assertEqual(result["platform"], "Linux x86_64")
+        self.assertEqual(result["webgl"], "Google SwiftShader")
+
+    async def test_probe_remote_mode_has_no_platform_fields(self) -> None:
+        proxy = self.build_proxy(_settings(UPLOAD_CDP_ENDPOINT="http://10.6.6.4:3000"))
+        factory = FakePlaywrightFactory()
+        with patch.object(bux, "async_playwright", lambda: factory):
+            result = await proxy.probe()
+
+        self.assertTrue(result["connected"])
+        self.assertEqual(result["mode"], BROWSER_MODE_REMOTE)
+        self.assertNotIn("platform", result)
+        self.assertNotIn("webgl", result)
+
+    async def test_probe_reports_launch_failure_as_error(self) -> None:
+        proxy = self.build_local_proxy()
+
+        class BoomChromium(FakeChromium):
+            async def launch(self, **kwargs):
+                del kwargs
+                raise RuntimeError("Executable doesn't exist")
+
+        factory = FakePlaywrightFactory()
+        factory.instance.chromium = BoomChromium()
+        with patch.object(bux, "async_playwright", lambda: factory):
+            result = await proxy.probe()
+
+        self.assertFalse(result["connected"])
+        self.assertEqual(result["mode"], BROWSER_MODE_LOCAL)
+        self.assertIn("launch local chromium failed", result["error"])
+
+    def test_launch_kwargs_builder(self) -> None:
+        self.assertNotIn("proxy", build_local_launch_kwargs(""))
+        self.assertNotIn("proxy", build_local_launch_kwargs("   "))
+        self.assertEqual(
+            build_local_launch_kwargs("socks5://127.0.0.1:1080")["proxy"],
+            {"server": "socks5://127.0.0.1:1080"},
+        )
+        self.assertEqual(
+            build_local_context_kwargs()["viewport"],
+            {"width": 1280, "height": 900},
+        )
+
+
+class CalibrationModeTests(ProxyTestBase):
+    """标定缓存里的 `mode` 字段：模式不匹配要重新标定。"""
+
+    async def _calibrate(self, proxy: BrowserUploadProxy):
+        async def fake_probe(_page, _cdp, mouse_dx: float) -> float:
+            return BUILTIN_QUADRATIC_A * mouse_dx * mouse_dx + BUILTIN_QUADRATIC_B * mouse_dx
+
+        proxy._probe_hold_offset = fake_probe  # type: ignore[assignment]
+        page, cdp = self.build_page(fetch_results=[])
+        return await proxy.calibrate_drag(page, cdp)
+
+    async def test_calibration_cache_records_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "drag_calibration.json"
+            proxy = self.build_proxy(
+                _settings(UPLOAD_CDP_ENDPOINT="", UPLOAD_DRAG_MAPPING="auto"),
+                calibration_path=path,
+            )
+            calibration = await self._calibrate(proxy)
+            self.assertIsNotNone(calibration)
+            self.assertEqual(calibration.mode, BROWSER_MODE_LOCAL)
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["mode"], BROWSER_MODE_LOCAL)
+            reloaded = load_calibration(path)
+            self.assertIsNotNone(reloaded)
+            self.assertEqual(reloaded.mode, BROWSER_MODE_LOCAL)
+
+    async def test_mode_mismatch_triggers_recalibration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "drag_calibration.json"
+            # 缓存是 remote 模式标出来的
+            save_calibration(
+                path,
+                DragCalibration(
+                    a=BUILTIN_QUADRATIC_A,
+                    b=BUILTIN_QUADRATIC_B,
+                    measured_at=1.0,
+                    source="measured",
+                    mode=BROWSER_MODE_REMOTE,
+                ),
+            )
+            # 当前是 local 模式 → 不能复用
+            proxy = self.build_proxy(
+                _settings(UPLOAD_CDP_ENDPOINT="", UPLOAD_DRAG_MAPPING="auto"),
+                calibration_path=path,
+            )
+            self.assertIsNone(proxy.cached_calibration())
+
+            async def fake_probe(_page, _cdp, mouse_dx: float) -> float:
+                return BUILTIN_QUADRATIC_A * mouse_dx * mouse_dx + BUILTIN_QUADRATIC_B * mouse_dx
+
+            proxy._probe_hold_offset = fake_probe  # type: ignore[assignment]
+            page, cdp = self.build_page(fetch_results=[])
+            resolution = await proxy._resolve_mapping(page, cdp, mode="auto")
+            self.assertTrue(resolution.calibrated_now)
+            self.assertIsNotNone(resolution.calibration)
+            self.assertEqual(resolution.calibration.mode, BROWSER_MODE_LOCAL)
+            self.assertEqual(load_calibration(path).mode, BROWSER_MODE_LOCAL)
+
+    async def test_matching_mode_reuses_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "drag_calibration.json"
+            save_calibration(
+                path,
+                DragCalibration(a=0.001, b=0.5, measured_at=1.0, source="measured", mode=BROWSER_MODE_LOCAL),
+            )
+            proxy = self.build_proxy(
+                _settings(UPLOAD_CDP_ENDPOINT="", UPLOAD_DRAG_MAPPING="auto"),
+                calibration_path=path,
+            )
+            page, cdp = self.build_page(fetch_results=[])
+            resolution = await proxy._resolve_mapping(page, cdp, mode="auto")
+            self.assertFalse(resolution.calibrated_now)
+            self.assertAlmostEqual(resolution.mouse_dx(157.0), quadratic_mouse_dx(157.0, 0.001, 0.5), places=6)
+
+    async def test_legacy_cache_without_mode_is_treated_as_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "drag_calibration.json"
+            # 老缓存（没有 mode 字段）
+            save_calibration(path, DragCalibration(a=BUILTIN_QUADRATIC_A, b=BUILTIN_QUADRATIC_B, measured_at=1.0))
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["mode"], "")
+
+            remote_proxy = self.build_proxy(
+                _settings(UPLOAD_CDP_ENDPOINT="http://10.6.6.4:3000", UPLOAD_DRAG_MAPPING="auto"),
+                calibration_path=path,
+            )
+            self.assertIsNotNone(remote_proxy.cached_calibration())
+
+            local_proxy = self.build_proxy(
+                _settings(UPLOAD_CDP_ENDPOINT="", UPLOAD_DRAG_MAPPING="auto"),
+                calibration_path=path,
+            )
+            self.assertIsNone(local_proxy.cached_calibration())
 
 
 class ManagerWiringTests(unittest.TestCase):
     """附件链路的开关判定（`context_attachment_manager._browser_upload_enabled`）。"""
 
-    def test_requires_proxy_and_endpoint_and_not_never(self) -> None:
+    def test_requires_proxy_and_resolved_mode_not_off(self) -> None:
         from backend.services.context_attachment_manager import _browser_upload_enabled
 
         proxy = object()
         self.assertTrue(
             _browser_upload_enabled(
-                types.SimpleNamespace(UPLOAD_VIA_BROWSER="auto", UPLOAD_CDP_ENDPOINT="http://10.6.6.4:3000"),
+                types.SimpleNamespace(
+                    UPLOAD_VIA_BROWSER="auto", UPLOAD_CDP_ENDPOINT="http://10.6.6.4:3000"
+                ),
                 proxy,
             )
         )
         self.assertTrue(
             _browser_upload_enabled(
-                types.SimpleNamespace(UPLOAD_VIA_BROWSER="always", UPLOAD_CDP_ENDPOINT="http://10.6.6.4:3000"),
+                types.SimpleNamespace(
+                    UPLOAD_VIA_BROWSER="always", UPLOAD_CDP_ENDPOINT="http://10.6.6.4:3000"
+                ),
                 proxy,
             )
         )
         # 没有代理实例（旧 app.state）→ 关闭
         self.assertFalse(
             _browser_upload_enabled(
-                types.SimpleNamespace(UPLOAD_VIA_BROWSER="auto", UPLOAD_CDP_ENDPOINT="http://10.6.6.4:3000"),
+                types.SimpleNamespace(
+                    UPLOAD_VIA_BROWSER="auto", UPLOAD_CDP_ENDPOINT="http://10.6.6.4:3000"
+                ),
                 None,
             )
         )
-        # endpoint 没配 → 关闭
-        self.assertFalse(
+        # endpoint 没配 + auto → local 模式，仍然启用（进程内 Chromium）
+        self.assertTrue(
             _browser_upload_enabled(
                 types.SimpleNamespace(UPLOAD_VIA_BROWSER="auto", UPLOAD_CDP_ENDPOINT="   "),
                 proxy,
             )
         )
-        # 显式 never → 关闭
+        # 显式 remote 但没 endpoint → 关闭
         self.assertFalse(
             _browser_upload_enabled(
-                types.SimpleNamespace(UPLOAD_VIA_BROWSER="never", UPLOAD_CDP_ENDPOINT="http://10.6.6.4:3000"),
+                types.SimpleNamespace(
+                    UPLOAD_VIA_BROWSER="auto", UPLOAD_CDP_ENDPOINT="", UPLOAD_BROWSER_MODE="remote"
+                ),
+                proxy,
+            )
+        )
+        # 显式 local → 启用（忽略 endpoint）
+        self.assertTrue(
+            _browser_upload_enabled(
+                types.SimpleNamespace(
+                    UPLOAD_VIA_BROWSER="auto",
+                    UPLOAD_CDP_ENDPOINT="http://10.6.6.4:3000",
+                    UPLOAD_BROWSER_MODE="local",
+                ),
+                proxy,
+            )
+        )
+        # 显式 never → 关闭（即使 endpoint 已配置）
+        self.assertFalse(
+            _browser_upload_enabled(
+                types.SimpleNamespace(
+                    UPLOAD_VIA_BROWSER="never", UPLOAD_CDP_ENDPOINT="http://10.6.6.4:3000"
+                ),
                 proxy,
             )
         )

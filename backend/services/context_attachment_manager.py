@@ -100,16 +100,17 @@ def _upload_account_excludes(account_pool) -> set:
 def _browser_upload_enabled(settings_obj: Any, browser_proxy: Any) -> bool:
     """浏览器上传链路是否可用。
 
-    三个条件同时满足才启用：代理实例存在（`app.state.browser_upload_proxy`）、
-    `UPLOAD_VIA_BROWSER != never`、`UPLOAD_CDP_ENDPOINT` 已配置。
+    两个条件同时满足才启用：代理实例存在（`app.state.browser_upload_proxy`）、
+    解析出的模式不是 `off`（`UPLOAD_VIA_BROWSER=never`，或 `UPLOAD_BROWSER_MODE=remote`
+    但没配 `UPLOAD_CDP_ENDPOINT`）。`local` 模式不需要 endpoint，因此 endpoint 为空
+    也可能启用（用进程内置 Chromium）。
     """
     if browser_proxy is None:
         return False
-    mode = str(getattr(settings_obj, "UPLOAD_VIA_BROWSER", "auto") or "auto").strip().lower()
-    if mode == "never":
-        return False
-    endpoint = str(getattr(settings_obj, "UPLOAD_CDP_ENDPOINT", "") or "").strip()
-    return bool(endpoint)
+    # 延迟导入：playwright 是可选依赖，多数单测不打桩浏览器代理。
+    from backend.services.browser_upload_proxy import BROWSER_MODE_OFF, resolve_browser_mode
+
+    return resolve_browser_mode(settings_obj) != BROWSER_MODE_OFF
 
 
 def _text_from_content(content: Any) -> str:

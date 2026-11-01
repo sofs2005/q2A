@@ -16,10 +16,25 @@
 仍然走 Python 侧（`oss2` + :mod:`backend.services.sts_ref_builder`），不依赖网页端的
 内部状态，也不用往页面里塞消息。
 
+## 两种连接模式
+
+| 配置 | 模式 | 行为 |
+| --- | --- | --- |
+| `UPLOAD_CDP_ENDPOINT` 非空 | `remote` | `chromium.connect_over_cdp(endpoint)`，复用远程 context / page |
+| `UPLOAD_CDP_ENDPOINT` 为空 且 `UPLOAD_VIA_BROWSER != never` | `local` | 本进程 `chromium.launch(headless=True)`，自建 context / page |
+| `UPLOAD_VIA_BROWSER=never` | `off` | 整条链路关闭（走内联 / 400 降级） |
+| `UPLOAD_BROWSER_MODE=remote` 且 endpoint 为空 | `off` | 显式要求远程但没端点 → 关闭 |
+| `UPLOAD_BROWSER_MODE=local` | `local` | 忽略 endpoint，强制用内置浏览器 |
+
+`UPLOAD_BROWSER_MODE`（`auto|local|remote`，默认 `auto`）只覆盖「走哪条路」，
+`UPLOAD_VIA_BROWSER=never` 始终优先关闭整条链路。
+
 ## 关键实现
 
-1. **惰性连接**：`playwright.chromium.connect_over_cdp(settings.UPLOAD_CDP_ENDPOINT)`，
-   复用已有的 context / page（远程 browserless 或远程 Chrome）。
+1. **惰性连接**：`remote` 走 `playwright.chromium.connect_over_cdp(...)` 复用已有
+   context / page；`local` 用 `chromium.launch(headless=True, args=[...])` 在本进程起
+   一个 Chromium（launch 参数与 :mod:`backend.services.captcha_solver` 保持一致，
+   配了 `UPSTREAM_PROXY` 时同样挂代理，保证出口 IP 与 API 一致）。
 2. **登录态注入**：首次用某账号时用 `context.add_init_script` 写
    `localStorage.token` / `at_expire_time`，再把账号 cookies（含 `waf_cookies`）
    `context.add_cookies` 进去，然后 `goto` 首页并 `Escape` 关掉欢迎弹窗
@@ -79,6 +94,43 @@ except Exception:  # pragma: no cover
 
 QWEN_BASE_URL = "https://chat.qwen.ai"
 GETSTS_PATH = "/api/v2/files/getstsToken"
+
+# ---- 连接模式 ----------------------------------------------------------------
+
+#: 配置层可选值（`UPLOAD_BROWSER_MODE`）。
+BROWSER_MODE_AUTO = "auto"
+BROWSER_MODE_LOCAL = "local"
+BROWSER_MODE_REMOTE = "remote"
+BROWSER_MODE_MODES: tuple[str, ...] = (BROWSER_MODE_AUTO, BROWSER_MODE_LOCAL, BROWSER_MODE_REMOTE)
+
+#: 解析后的实际模式（`off` 只出现在解析结果里，不是合法配置值）。
+BROWSER_MODE_OFF = "off"
+
+#: local 模式的 viewport（比 captcha_solver 高一点：拼图弹层不会被裁）。
+LOCAL_VIEWPORT_WIDTH = 1280
+LOCAL_VIEWPORT_HEIGHT = 900
+LOCAL_LOCALE = "zh-CN"
+LOCAL_TIMEZONE = "Asia/Shanghai"
+
+#: local 模式的 launch 参数，逐条对齐 `captcha_solver._ensure_browser()`：
+#: 关掉 AutomationControlled 特征 + 容器里必须的 `--no-sandbox` / `--disable-dev-shm-usage`。
+LOCAL_LAUNCH_ARGS: tuple[str, ...] = (
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-web-security",
+    "--disable-features=IsolateOrigins",
+    "--disable-features=site-per-process",
+    "--disable-client-side-phishing-detection",
+    "--disable-hang-monitor",
+    "--disable-popup-blocking",
+    "--disable-prompt-on-repost",
+    "--disable-sync",
+    "--disable-translate",
+    "--metrics-recording-only",
+    "--no-first-run",
+    "--safebrowsing-disable-auto-update",
+)
 
 # ---- 拖动映射 ----------------------------------------------------------------
 
@@ -192,6 +244,93 @@ _PUZZLE_OFFSET_JS = """
 }
 """
 
+_PLATFORM_JS = """
+() => {
+  try { return String(navigator.platform || ''); } catch (e) { return ''; }
+}
+"""
+
+_WEBGL_JS = """
+() => {
+  try {
+    const canvas = document.createElement('canvas');
+    const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+    if (!gl) return '';
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    if (ext) return String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || '');
+    return String(gl.getParameter(gl.RENDERER) || '');
+  } catch (e) {
+    return '';
+  }
+}
+"""
+
+
+# ============================================================================
+# 连接模式判定
+# ============================================================================
+
+
+def normalize_browser_mode(value: Any) -> str:
+    """归一化 `UPLOAD_BROWSER_MODE`；非法 / 空值退回 `auto`。"""
+    text = str(value or "").strip().lower()
+    return text if text in BROWSER_MODE_MODES else BROWSER_MODE_AUTO
+
+
+def resolve_browser_mode(settings_obj: Any) -> str:
+    """把配置解析成实际模式：`remote` / `local` / `off`。
+
+    判定顺序（越靠前优先级越高）：
+
+    1. `UPLOAD_VIA_BROWSER=never` → `off`（运维总开关，永远优先）；
+    2. `UPLOAD_BROWSER_MODE=local` → `local`（忽略 endpoint，强制内置浏览器）；
+    3. `UPLOAD_BROWSER_MODE=remote` → 有 endpoint 就 `remote`，否则 `off`；
+    4. `UPLOAD_BROWSER_MODE=auto`（默认）→ 有 endpoint 就 `remote`，否则 `local`。
+
+    Args:
+        settings_obj: 配置对象（settings / 单测里的 SimpleNamespace）。
+
+    Returns:
+        `remote` / `local` / `off` 之一。
+    """
+    upload_mode = str(getattr(settings_obj, "UPLOAD_VIA_BROWSER", "auto") or "auto").strip().lower()
+    if upload_mode == "never":
+        return BROWSER_MODE_OFF
+    mode = normalize_browser_mode(getattr(settings_obj, "UPLOAD_BROWSER_MODE", BROWSER_MODE_AUTO))
+    endpoint = str(getattr(settings_obj, "UPLOAD_CDP_ENDPOINT", "") or "").strip()
+    if mode == BROWSER_MODE_LOCAL:
+        return BROWSER_MODE_LOCAL
+    if mode == BROWSER_MODE_REMOTE:
+        return BROWSER_MODE_REMOTE if endpoint else BROWSER_MODE_OFF
+    # auto：有远程端点用远程，没有就在本进程起一个浏览器。
+    return BROWSER_MODE_REMOTE if endpoint else BROWSER_MODE_LOCAL
+
+
+def build_local_launch_kwargs(proxy_url: str = "") -> dict[str, Any]:
+    """构造 local 模式 `chromium.launch()` 的参数（与 captcha_solver 一致）。
+
+    Args:
+        proxy_url: `UPSTREAM_PROXY` 的值；非空时挂到 `proxy.server`，保证浏览器与
+            API 走同一个出口 IP（阿里把 `acw_tc` / `x5sec` 绑定到签发 IP）。
+
+    Returns:
+        可直接 `**` 展开给 `chromium.launch()` 的字典。
+    """
+    kwargs: dict[str, Any] = {"headless": True, "args": list(LOCAL_LAUNCH_ARGS)}
+    server = str(proxy_url or "").strip()
+    if server:
+        kwargs["proxy"] = {"server": server}
+    return kwargs
+
+
+def build_local_context_kwargs() -> dict[str, Any]:
+    """构造 local 模式 `browser.new_context()` 的参数。"""
+    return {
+        "viewport": {"width": LOCAL_VIEWPORT_WIDTH, "height": LOCAL_VIEWPORT_HEIGHT},
+        "locale": LOCAL_LOCALE,
+        "timezone_id": LOCAL_TIMEZONE,
+    }
+
 
 class BrowserUploadUnavailable(Exception):
     """浏览器上传不可用（未配置 / CDP 连不上 / 账号冷却中）。
@@ -259,13 +398,20 @@ def quadratic_mouse_dx(
 
 @dataclass
 class DragCalibration:
-    """鼠标位移 ↔ 拼图位移的标定结果（`piece = a*mouse² + b*mouse`）。"""
+    """鼠标位移 ↔ 拼图位移的标定结果（`piece = a*mouse² + b*mouse`）。
+
+    `mode` 记录标定时的连接模式（`remote` / `local`）：两种模式的浏览器指纹不同
+    （远程通常是真实 Windows Chrome，容器里是 Linux/SwiftShader），映射曲线也不同，
+    因此缓存里带上模式，读的时候不匹配就重新标定。
+    """
 
     a: float = 0.0
     b: float = 1.0
     measured_at: float = 0.0
     samples: list[dict[str, float]] = field(default_factory=list)
     source: str = "measured"
+    #: 标定时的连接模式；空串表示「引入该字段之前的老缓存」（等价于 remote）。
+    mode: str = ""
 
     @property
     def is_linear(self) -> bool:
@@ -289,6 +435,7 @@ class DragCalibration:
             "measured_at": float(self.measured_at),
             "samples": [dict(item) for item in self.samples],
             "source": str(self.source),
+            "mode": str(self.mode or ""),
         }
 
     @classmethod
@@ -328,6 +475,7 @@ class DragCalibration:
             measured_at=measured_at,
             samples=samples,
             source=str(payload.get("source") or "cache"),
+            mode=str(payload.get("mode") or "").strip().lower(),
         )
 
 
@@ -335,6 +483,7 @@ def fit_calibration(
     samples: Iterable[tuple[float, float] | dict[str, float]],
     *,
     now: float | None = None,
+    mode: str = "",
 ) -> "DragCalibration | None":
     """用 `(mouse_dx, piece_dx)` 采样点拟合 `piece = a*mouse² + b*mouse`。
 
@@ -346,6 +495,7 @@ def fit_calibration(
     Args:
         samples: 采样点，元素可以是 `(mouse_dx, piece_dx)` 元组或同名字典。
         now: 注入的时间戳，便于测试。
+        mode: 标定时的连接模式（`remote` / `local`），随缓存一起落盘。
 
     Returns:
         :class:`DragCalibration` 或 None。
@@ -397,6 +547,7 @@ def fit_calibration(
         measured_at=float(now if now is not None else time.time()),
         samples=[{"mouse_dx": mouse, "piece_dx": piece} for mouse, piece in points],
         source="measured",
+        mode=str(mode or ""),
     )
 
 
@@ -695,12 +846,14 @@ class _NullSettings:
     """config 不可用时的空配置（单测 / 极端环境兜底）。"""
 
     UPLOAD_CDP_ENDPOINT = ""
+    UPLOAD_BROWSER_MODE = BROWSER_MODE_AUTO
     UPLOAD_VIA_BROWSER = "auto"
     UPLOAD_CAPTCHA_MAX_ROUNDS = 3
     UPLOAD_CAPTCHA_TIMEOUT_SECONDS = 30
     UPLOAD_DRAG_MAPPING = "auto"
     UPLOAD_BROWSER_TIMEOUT_SECONDS = 120
     UPLOAD_DRAG_CALIBRATION_FILE = "data/drag_calibration.json"
+    UPSTREAM_PROXY = ""
 
 
 def default_calibration_path() -> Path:
@@ -737,6 +890,8 @@ class BrowserUploadProxy:
         self._context: Any = None
         self._page: Any = None
         self._cdp: Any = None
+        #: 当前连接实际使用的模式（`remote` / `local`），未连接时为 None。
+        self._mode_in_use: str | None = None
 
         # 连接管理锁 + 会话串行锁（一个 page，必须串行用）。
         self._connect_lock = asyncio.Lock()
@@ -762,9 +917,24 @@ class BrowserUploadProxy:
         return str(self._cfg("UPLOAD_CDP_ENDPOINT", "") or "").strip()
 
     @property
+    def upstream_proxy(self) -> str:
+        """`UPSTREAM_PROXY`：local 模式启动 Chromium 时挂在 `proxy.server` 上。"""
+        return str(self._cfg("UPSTREAM_PROXY", "") or "").strip()
+
+    @property
     def upload_mode(self) -> str:
         mode = str(self._cfg("UPLOAD_VIA_BROWSER", "auto") or "auto").strip().lower()
         return mode if mode in {"auto", "always", "never"} else "auto"
+
+    @property
+    def configured_browser_mode(self) -> str:
+        """`UPLOAD_BROWSER_MODE` 的归一化值（`auto` / `local` / `remote`）。"""
+        return normalize_browser_mode(self._cfg("UPLOAD_BROWSER_MODE", BROWSER_MODE_AUTO))
+
+    @property
+    def mode(self) -> str:
+        """实际连接模式：`remote` / `local` / `off`（判定规则见 :func:`resolve_browser_mode`）。"""
+        return resolve_browser_mode(self.settings)
 
     @property
     def drag_mapping_mode(self) -> str:
@@ -793,8 +963,8 @@ class BrowserUploadProxy:
 
     @property
     def enabled(self) -> bool:
-        """是否可能启用：endpoint 已配置且模式不是 never。"""
-        return bool(self.endpoint) and self.upload_mode != "never"
+        """是否可能启用：解析出的模式不是 `off`（local 模式不需要 endpoint）。"""
+        return self.mode != BROWSER_MODE_OFF
 
     # -- 熔断 ---------------------------------------------------------------
 
@@ -951,11 +1121,30 @@ class BrowserUploadProxy:
         return True
 
     async def _ensure_connected_locked(self) -> None:
-        """（持锁）建立 / 复用 CDP 连接。"""
+        """（持锁）建立 / 复用连接：按 :attr:`mode` 分派到 remote / local。"""
         if self._page_is_usable():
             return
         if async_playwright is None:
             raise BrowserUploadUnavailable("playwright is not installed")
+        mode = self.mode
+        if mode == BROWSER_MODE_OFF:
+            raise BrowserUploadUnavailable(
+                "browser upload is disabled "
+                "(UPLOAD_VIA_BROWSER=never, or UPLOAD_BROWSER_MODE=remote without UPLOAD_CDP_ENDPOINT)"
+            )
+        # 配置热切换（remote <-> local）时先释放上一种模式的资源，避免混用。
+        if self._mode_in_use is not None and self._mode_in_use != mode:
+            log.info("[BrowserUpload] switching browser mode %s -> %s", self._mode_in_use, mode)
+            await self._release_locked()
+        if mode == BROWSER_MODE_REMOTE:
+            await self._connect_remote_locked()
+        else:
+            await self._connect_local_locked()
+        self._mode_in_use = mode
+        await self._install_response_hook(self._page)
+
+    async def _connect_remote_locked(self) -> None:
+        """（持锁）`chromium.connect_over_cdp(endpoint)` 并复用已有 context / page。"""
         endpoint = self.endpoint
         if not endpoint:
             raise BrowserUploadUnavailable("UPLOAD_CDP_ENDPOINT is not configured")
@@ -979,8 +1168,72 @@ class BrowserUploadProxy:
             self._cdp = await context.new_cdp_session(page)
         except Exception as exc:
             raise BrowserUploadUnavailable(f"prepare browser page failed: {exc}") from exc
-        await self._install_response_hook(self._page)
         log.info("[BrowserUpload] connected cdp endpoint=%s", endpoint)
+
+    async def _connect_local_locked(self) -> None:
+        """（持锁）在本进程启动 / 复用 Chromium，并自建 context / page。
+
+        - launch 参数与 :mod:`backend.services.captcha_solver` 保持一致；
+        - 配了 `UPSTREAM_PROXY` 时挂同一个代理（出口 IP 必须与 API 一致）；
+        - browser 实例惰性创建并复用，只有 `is_connected()` 为假才重新 launch。
+        """
+        if self._playwright is None:
+            try:
+                self._playwright = await async_playwright().start()
+            except Exception as exc:
+                raise BrowserUploadUnavailable(f"playwright start failed: {exc}") from exc
+
+        browser = self._browser
+        if not self._browser_alive(browser):
+            if browser is not None:
+                # 上一个 browser 已死：连同它的 context / page 一起丢掉。
+                await self._release_locked()
+                if self._playwright is None:
+                    try:
+                        self._playwright = await async_playwright().start()
+                    except Exception as exc:
+                        raise BrowserUploadUnavailable(f"playwright start failed: {exc}") from exc
+            launch_kwargs = build_local_launch_kwargs(self.upstream_proxy)
+            if launch_kwargs.get("proxy"):
+                log.info("[BrowserUpload] local chromium 走 UPSTREAM_PROXY 出口")
+            log.info("[BrowserUpload] launching local chromium (headless)")
+            try:
+                browser = await self._playwright.chromium.launch(**launch_kwargs)
+            except Exception as exc:
+                # launch 失败时把已启动的 playwright 一起收掉，避免残留 node 进程。
+                await self._release_locked()
+                raise BrowserUploadUnavailable(f"launch local chromium failed: {exc}") from exc
+            self._browser = browser
+            self._seeded_accounts.clear()
+
+        context = self._context
+        if context is None:
+            try:
+                context = await browser.new_context(**build_local_context_kwargs())
+            except Exception as exc:
+                raise BrowserUploadUnavailable(f"create local browser context failed: {exc}") from exc
+            self._context = context
+        try:
+            pages = list(getattr(context, "pages", []) or [])
+            page = pages[0] if pages else await context.new_page()
+            self._page = page
+            self._cdp = await context.new_cdp_session(page)
+        except Exception as exc:
+            raise BrowserUploadUnavailable(f"prepare local browser page failed: {exc}") from exc
+        log.info("[BrowserUpload] connected local browser")
+
+    @staticmethod
+    def _browser_alive(browser: Any) -> bool:
+        """browser 实例是否存在且仍然连着（fake 对象没有 `is_connected` 时按存在判断）。"""
+        if browser is None:
+            return False
+        checker = getattr(browser, "is_connected", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        return True
 
     async def _install_response_hook(self, page: Any) -> None:
         """监听 verify 响应，记录 `T001` / `F001` 之类的验证码结果码。"""
@@ -1214,19 +1467,40 @@ class BrowserUploadProxy:
         )
 
     def cached_calibration(self) -> DragCalibration | None:
-        """读一次 `data/drag_calibration.json` 并缓存到内存。"""
+        """读一次 `data/drag_calibration.json` 并缓存到内存（模式不匹配视为没有缓存）。"""
         if not self._calibration_loaded:
             self._calibration_loaded = True
-            self._calibration = load_calibration(self._calibration_path)
+            loaded = load_calibration(self._calibration_path)
+            if loaded is not None and not self._calibration_mode_matches(loaded):
+                log.info(
+                    "[BrowserUpload] drag calibration mode mismatch path=%s cached=%s current=%s -> recalibrate",
+                    self._calibration_path,
+                    loaded.mode or "(legacy)",
+                    self.mode,
+                )
+                loaded = None
+            self._calibration = loaded
             if self._calibration is not None:
                 log.info(
-                    "[BrowserUpload] drag calibration loaded path=%s a=%.6f b=%.6f source=%s",
+                    "[BrowserUpload] drag calibration loaded path=%s a=%.6f b=%.6f source=%s mode=%s",
                     self._calibration_path,
                     self._calibration.a,
                     self._calibration.b,
                     self._calibration.source,
+                    self._calibration.mode or "(legacy)",
                 )
         return self._calibration
+
+    def _calibration_mode_matches(self, calibration: DragCalibration) -> bool:
+        """缓存里的标定模式是否与当前模式一致。
+
+        没有 `mode` 字段的老缓存视为 `remote`（引入该字段之前只有 remote 一种模式），
+        这样升级后 local 模式不会误用远程标定。
+        """
+        cached = str(getattr(calibration, "mode", "") or "").strip().lower()
+        if not cached:
+            cached = BROWSER_MODE_REMOTE
+        return cached == self.mode
 
     async def calibrate_drag(self, page: Any, cdp: Any) -> DragCalibration | None:
         """两点标定：拖 40px / 80px，按住时读拼图位移，拟合二次曲线并落盘。
@@ -1245,7 +1519,7 @@ class BrowserUploadProxy:
                 return None
             samples.append((float(target), float(offset)))
             await self._sleep(self._rng.uniform(0.5, 0.9))
-        calibration = fit_calibration(samples, now=self._clock())
+        calibration = fit_calibration(samples, now=self._clock(), mode=self.mode)
         if calibration is None:
             log.warning("[BrowserUpload] drag calibration fit failed samples=%s", samples)
             return None
@@ -1256,9 +1530,10 @@ class BrowserUploadProxy:
         except OSError as exc:
             log.warning("[BrowserUpload] save drag calibration failed path=%s error=%s", self._calibration_path, exc)
         log.info(
-            "[BrowserUpload] drag calibration measured a=%.6f b=%.6f samples=%s path=%s",
+            "[BrowserUpload] drag calibration measured a=%.6f b=%.6f mode=%s samples=%s path=%s",
             calibration.a,
             calibration.b,
+            calibration.mode,
             samples,
             self._calibration_path,
         )
@@ -1454,10 +1729,29 @@ class BrowserUploadProxy:
         """最近一次上传的结构化统计（运维接口用）。"""
         return dict(self._last_stats)
 
+    async def _eval_text(self, page: Any, script: str) -> str:
+        """在页面里 eval 一段表达式并转成字符串（失败返回空串，探针不抛异常）。"""
+        if page is None:
+            return ""
+        try:
+            value = await page.evaluate(script)
+        except Exception:
+            return ""
+        return str(value or "").strip()
+
     async def probe(self) -> dict[str, Any]:
-        """运维探针：连一次 CDP，回报连接状态与浏览器版本。"""
+        """运维探针：按当前模式连一次浏览器，回报连接状态 / 版本 / 环境指纹。
+
+        Returns:
+            至少包含 `connected` / `mode` / `browser_version` / `endpoint` /
+            `drag_mapping` / `calibration` / `captcha_passed_recently`；
+            `local` 模式额外带 `platform` 与 `webgl`（排查容器里的 SwiftShader 指纹）；
+            失败时带 `error`（永不抛异常）。
+        """
+        mode = self.mode
         result: dict[str, Any] = {
             "connected": False,
+            "mode": mode,
             "browser_version": "",
             "captcha_passed_recently": self.recent_captcha_pass(),
             "endpoint": self.endpoint,
@@ -1471,47 +1765,58 @@ class BrowserUploadProxy:
                 "b": calibration.b,
                 "source": calibration.source,
                 "measured_at": calibration.measured_at,
+                "mode": calibration.mode,
             }
-        if not self.endpoint:
-            result["error"] = "UPLOAD_CDP_ENDPOINT is not configured"
+        if mode == BROWSER_MODE_OFF:
+            result["error"] = (
+                "browser upload is disabled "
+                "(UPLOAD_VIA_BROWSER=never, or UPLOAD_BROWSER_MODE=remote without UPLOAD_CDP_ENDPOINT)"
+            )
             return result
         try:
             async with self._connect_lock:
                 await self._ensure_connected_locked()
                 browser = self._browser
-            version = ""
-            getter = getattr(browser, "version", "")
-            version = str(getter() if callable(getter) else (getter or ""))
+                page = self._page
+            version = getattr(browser, "version", "")
+            result["browser_version"] = str(version() if callable(version) else (version or ""))
             result["connected"] = True
-            result["browser_version"] = version
+            if mode == BROWSER_MODE_LOCAL:
+                result["platform"] = await self._eval_text(page, _PLATFORM_JS)
+                result["webgl"] = await self._eval_text(page, _WEBGL_JS)
         except Exception as exc:
             result["error"] = str(exc)
         return result
 
+    async def _release_locked(self) -> None:
+        """（持锁）回收 cdp / browser / playwright，并清空连接态。"""
+        cdp, browser, playwright = self._cdp, self._browser, self._playwright
+        self._cdp = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._playwright = None
+        self._mode_in_use = None
+        self._seeded_accounts.clear()
+        if cdp is not None:
+            detach = getattr(cdp, "detach", None)
+            if callable(detach):
+                try:
+                    await detach()
+                except Exception:
+                    pass
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if playwright is not None:
+            try:
+                await playwright.stop()
+            except Exception:
+                pass
+
     async def close(self) -> None:
-        """释放 CDP 连接与 playwright（进程退出时调用）。"""
+        """释放连接与 playwright（进程退出时调用；幂等，可重复调用）。"""
         async with self._connect_lock:
-            cdp, browser, playwright = self._cdp, self._browser, self._playwright
-            self._cdp = None
-            self._browser = None
-            self._context = None
-            self._page = None
-            self._playwright = None
-            self._seeded_accounts.clear()
-            if cdp is not None:
-                detach = getattr(cdp, "detach", None)
-                if callable(detach):
-                    try:
-                        await detach()
-                    except Exception:
-                        pass
-            if browser is not None:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-            if playwright is not None:
-                try:
-                    await playwright.stop()
-                except Exception:
-                    pass
+            await self._release_locked()
