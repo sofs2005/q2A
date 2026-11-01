@@ -366,7 +366,7 @@ class UpstreamFileUploader:
             "collection_name": "",
             "progress": 0,
             "status": "uploaded",
-            "greenNet": "success",
+            "greenNet": "greening" if str(remote_type) == "video" else "success",
             "size": len(raw),
             "error": "",
             "itemId": str(uuid.uuid4()),

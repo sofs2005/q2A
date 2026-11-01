@@ -190,3 +190,58 @@ Chrome146/Windows、`--headless=new`，**连续 10+ 次全部被拒**（滑块�
 
 结论：**要真正支持任意大小文件，必须解决这个拼图验证码**（或找到免验证码的上传通道）。
 当前状态是「几何已解、反爬未过」。
+
+## 9. 端到端实测：真人过验证码上传 2MB 视频，拿到真实 ref（2026-11-01）
+
+用 VNC 里的人工拖动过了阿里云拼图，走完网页端完整上传，再让 `qwen3.8-omni-flash` 总结视频内容 —— **模型回答正确**（识别出画面里的人物动作、字幕、时长 01:08 等）。
+
+随后用 `GET /api/v2/chats/{id}` 把这条消息的 `files` 原样取回来，得到**真实 ref**：
+
+```json
+{
+  "id": "079054e8-4e5e-433d-a94a-9a41f146cba2",
+  "name": "test-2m.mp4",
+  "file_type": "video/mp4",
+  "type": "video",
+  "file_class": "video",
+  "size": 2058934,
+  "url": "https://cdn.qwenlm.ai/<user_id>/<file_id>_test-2m.mp4?key=<JWT>",   // 375 字符
+  "file": {
+    "created_at": 1793509335860, "data": {}, "filename": "test-2m.mp4", "hash": null,
+    "id": "079054e8-...", "user_id": "18639e0d-...",
+    "meta": {"name": "test-2m.mp4", "size": 2058934, "content_type": "video/mp4"},
+    "update_at": 1793509335860, "lastModified": 1793509207490,
+    "name": "test-2m.mp4", "webkitRelativePath": "", "size": 2058934, "type": "video/mp4"
+  },
+  "collection_name": "", "progress": 0, "status": "uploaded",
+  "greenNet": "greening",              // ← 视频是 greening，不是 success
+  "error": "", "itemId": "<uuid>", "showType": "video", "uploadTaskId": "<uuid>"
+}
+```
+
+消息体：`chat_type="t2t"`、`models=["qwen3.8-omni-flash"]`、
+`feature_config={thinking_enabled:true, output_schema:"phase", research_mode:"normal", auto_thinking:false, thinking_mode:"Thinking"}`。
+
+### 9.1 与我们的实现逐字段对比
+
+用 `build_inline_ref()` 造同类型 ref，对比结果：**顶层 16 个字段、file 子对象 13 个字段完全一致**，
+唯一差异是 `greenNet`（真实视频为 `greening`，我们原来写 `success`）——已修正。
+
+### 9.2 再次确认 8192 的适用范围
+
+真实 ref 的 `url` 只有 **375 字符**（CDN 短链），2MB 视频畅通无阻。
+**8192 只卡「data URI 内联」这条绕行方案**，与文件大小无关。
+
+### 9.3 验证码：人能过，自动化过不去
+
+阿里云 verify 接口返回码：成功 `T001`，失败 `F001`（偶发 `F015`，疑似频率/风控）。
+
+| 拖动来源 | 几何落点 | 事件节奏 | 指纹 | verify |
+|---|---|---|---|---|
+| 真人（VNC 手动） | — | 121 事件 / 3.13s / 间隔中位 8ms / 停顿 683ms | 真机 | **T001** |
+| 脚本（CDP 合成） | 误差 ≤1.5px | 226~309 事件 / ~3s / 间隔中位 13ms / 停顿 664ms | platform+WebGL+screen 已伪装 | **F001** |
+
+补充观察：
+- 轮次不固定：同一账号一次上传出现过「两轮」，也出现过「一轮」，由风控动态决定。
+- 失败集中在「拖动来源」而非「位置」——位置已用叠加图逐像素核对。
+- 剩余差异推测为 TLS/JA3 指纹、Canvas/Audio 指纹、字体列表等 JS 补不了的环境特征。

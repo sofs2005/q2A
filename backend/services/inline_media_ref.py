@@ -528,7 +528,8 @@ def build_inline_ref(
         "collection_name": "",
         "progress": 0,
         "status": "uploaded",
-        "greenNet": "success",
+        # 官网抓包：视频在绿网校验完成前是 "greening"，图片/音频/文档是 "success"
+        "greenNet": "greening" if kind == KIND_VIDEO else "success",
         "size": size,
         "error": "",
         "itemId": str(uuid.uuid4()),
