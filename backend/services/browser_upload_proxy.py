@@ -69,7 +69,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from backend.services.puzzle_solver import PuzzleSolveError, locate_gap
+from backend.services.puzzle_solver import (
+    PuzzleSolveError,
+    PuzzleSolverUnavailable,
+    locate_gap,
+)
 from backend.services.sts_ref_builder import upload_filetype_from_content_type
 
 
@@ -77,7 +81,7 @@ log = logging.getLogger("qwen2api.browser_upload_proxy")
 
 try:  # pragma: no cover - playwright 是可选依赖（生产镜像已装）
     from playwright.async_api import async_playwright
-except ImportError:  # pragma: no cover
+except Exception:  # pragma: no cover - 缺失 / 装坏（greenlet 不匹配等）都不能阻止启动
     async_playwright = None
 
 try:  # pragma: no cover - 指纹模块依赖 curl_cffi，缺失时退化为最小头
@@ -1388,6 +1392,10 @@ class BrowserUploadProxy:
         Returns:
             通过时返回 verify 结果码（拿不到真实响应码时用 `T001` 表示「滑块消失」），
             失败返回 None（调用方会重新发请求拿新拼图）。
+
+        Raises:
+            BrowserUploadUnavailable: 缺口求解器不可用（pillow 未安装），整条浏览器
+                上传降级，由上层回退内联 / 400。
         """
         timeout_ms = int(self.captcha_timeout_seconds * 1000)
         try:
@@ -1422,6 +1430,17 @@ class BrowserUploadProxy:
                 solution = await asyncio.to_thread(
                     locate_gap, back, shadow, display_width=display_width
                 )
+            except PuzzleSolverUnavailable as exc:
+                # pillow 没装（生产镜像尚未重建）：整条浏览器上传不可用，直接降级，
+                # 不消耗验证码轮次、不计入熔断。上层（context_attachment_manager）
+                # 捕获 BrowserUploadUnavailable 后回退内联 / 400，绝不能 500。
+                log.warning(
+                    "[BrowserUpload] puzzle solver unavailable, browser upload fallback disabled: %s",
+                    exc,
+                )
+                raise BrowserUploadUnavailable(
+                    f"browser upload fallback disabled: {exc}"
+                ) from exc
             except PuzzleSolveError as exc:
                 log.warning("[BrowserUpload] puzzle solve failed: %s", exc)
                 return None
@@ -1649,7 +1668,8 @@ class BrowserUploadProxy:
             `endpoint` / 临时密钥）；浏览器上传被关闭时返回 None。
 
         Raises:
-            BrowserUploadUnavailable: 未配置 / 连不上 / 账号冷却中。
+            BrowserUploadUnavailable: 未配置 / 连不上 / 账号冷却中 / 缺口求解器不可用
+                （pillow 未安装）。
             BrowserUploadError: 验证码连续失败或上游返回异常。
         """
         if not self.enabled:

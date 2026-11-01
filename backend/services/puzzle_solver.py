@@ -21,8 +21,19 @@
 4. `dx_file = x_best - piece_x0`（文件坐标）；显示层位移
    `dx_display = dx_file * (display_width / back_width)`。
 
-本模块只依赖 Pillow，不依赖 numpy（生产镜像只装了 Pillow），单张 296×200 的图
-滑窗约 25 万次加法，耗时 ~0.2s，对验证码场景完全够用。
+本模块只依赖 Pillow（**惰性导入**，见 :func:`_load_pillow`），不依赖 numpy，单张
+296×200 的图滑窗约 25 万次加法，耗时 ~0.2s，对验证码场景完全够用。
+
+## 为什么 Pillow 必须惰性导入
+
+生产镜像 `ghcr.io/sofs2005/q2a:dev` 目前不带 pillow（`requirements.txt` 里有，但镜像
+还没重建）。若在模块顶层 `from PIL import Image`，缺依赖会直接打死
+:mod:`backend.services.browser_upload_proxy`，进而打死网关进程 —— 「可选依赖缺失」
+变成「整个服务起不来」，这是不可接受的降级。
+
+因此约定：**导入本模块、启动服务、内联附件链路一律不受 Pillow 影响**；只有真正调用
+:func:`locate_gap` 时才抛 :class:`PuzzleSolverUnavailable`（`PuzzleSolveError` 的子类），
+由 `browser_upload_proxy` 识别为「浏览器上传不可用」并降级回内联 / 400。
 """
 
 from __future__ import annotations
@@ -30,8 +41,6 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass
 from typing import Any
-
-from PIL import Image
 
 
 #: 显示层 `#aliyunCaptcha-img` 的实测尺寸（300×200），back.png 是 296×200。
@@ -44,6 +53,30 @@ PIECE_ALPHA_THRESHOLD = 150
 #: 缺口打分里的饱和度惩罚系数（实测最优值）。
 SATURATION_PENALTY = 1.2
 
+#: Pillow 缺失时对外统一的一句话（写进异常 message 与 WARNING 日志）。
+PILLOW_MISSING_MESSAGE = "pillow not installed, browser upload fallback disabled"
+
+
+def _load_pillow() -> Any:
+    """惰性导入 Pillow 的 `Image` 模块；未安装（或装坏）时返回 None。
+
+    与 :func:`backend.services.inline_media_ref._load_pillow` 保持同一写法：
+    调用方拿到 None 必须自己降级，绝不能让 ImportError 冒到模块顶层。
+
+    Returns:
+        `PIL.Image` 模块对象，或 None（表示 Pillow 不可用）。
+    """
+    try:
+        from PIL import Image  # type: ignore import-not-found
+    except Exception:  # pragma: no cover - 生产镜像未装 pillow 时走这里
+        return None
+    return Image
+
+
+def pillow_available() -> bool:
+    """Pillow 是否可用（运维探针 / 单测用；不影响模块导入）。"""
+    return _load_pillow() is not None
+
 
 class PuzzleSolveError(Exception):
     """拼图素材无法解析 / 无法定位缺口。
@@ -51,6 +84,21 @@ class PuzzleSolveError(Exception):
     上层（browser_upload_proxy）捕获后退化为「本轮失败」，等下一轮新拼图，
     不能把整条上传链路打成异常。
     """
+
+
+class PuzzleSolverUnavailable(PuzzleSolveError):
+    """Pillow 未安装 —— 整个求解器不可用（不是某一张素材的问题）。
+
+    继承 :class:`PuzzleSolveError`，所以既有的 `except PuzzleSolveError` 调用方
+    自动拿到安全行为（本轮失败）；`browser_upload_proxy` 再单独识别它，直接降级为
+    「浏览器上传不可用」，不消耗验证码轮次、也不计入熔断。
+    """
+
+    #: 便于 `getattr(exc, "unavailable", False)` 风格的判断。
+    unavailable = True
+
+    def __init__(self, message: str = PILLOW_MISSING_MESSAGE) -> None:
+        super().__init__(str(message or "") or PILLOW_MISSING_MESSAGE)
 
 
 @dataclass(frozen=True)
@@ -105,11 +153,17 @@ class PuzzleSolution:
         }
 
 
-def _load_rgba(raw: bytes, *, label: str) -> Image.Image:
-    """把字节解码成 RGBA 图像；失败统一抛 :class:`PuzzleSolveError`。"""
+def _load_rgba(raw: bytes, *, label: str) -> Any:
+    """把字节解码成 RGBA 图像；失败统一抛 :class:`PuzzleSolveError`。
+
+    Pillow 缺失时抛 :class:`PuzzleSolverUnavailable`（Pillow 只在真正解码时才需要）。
+    """
     data = bytes(raw or b"")
     if not data:
         raise PuzzleSolveError(f"{label}.png is empty")
+    Image = _load_pillow()
+    if Image is None:
+        raise PuzzleSolverUnavailable()
     try:
         image = Image.open(io.BytesIO(data))
         image.load()
@@ -119,7 +173,7 @@ def _load_rgba(raw: bytes, *, label: str) -> Image.Image:
 
 
 def _piece_mask(
-    shadow: Image.Image,
+    shadow: Any,
     alpha_threshold: int = PIECE_ALPHA_THRESHOLD,
 ) -> tuple[dict[int, list[int]], int, int, int, int]:
     """从 shadow.png 提取拼图掩码。
@@ -154,7 +208,7 @@ def _piece_mask(
     return rows, x0, y0, (x1 - x0 + 1), (y1 - y0 + 1)
 
 
-def _score_band(back: Image.Image, y0: int, y1: int) -> list[list[float]]:
+def _score_band(back: Any, y0: int, y1: int) -> list[list[float]]:
     """计算 back.png 在 `[y0, y1]` y 带内的缺口得分矩阵（相对 y0 下标）。"""
     width, height = back.size
     band_top = max(0, min(y0, height - 1))
@@ -197,8 +251,13 @@ def locate_gap(
         :class:`PuzzleSolution`。
 
     Raises:
+        PuzzleSolverUnavailable: Pillow 未安装（浏览器上传降级为不可用）。
         PuzzleSolveError: 素材为空 / 解码失败 / 找不到拼图块 / 拼图比背景还宽。
     """
+    # Pillow 缺失是最常见的部署态（镜像没重建），必须在任何解码前给出明确异常，
+    # 否则会先被「素材为空 / 解码失败」这类噪声错误掩盖。
+    if _load_pillow() is None:
+        raise PuzzleSolverUnavailable()
     back = _load_rgba(back_png, label="back")
     shadow = _load_rgba(shadow_png, label="shadow")
 
@@ -259,5 +318,10 @@ def locate_piece_dx(
     *,
     display_width: float = DEFAULT_DISPLAY_WIDTH,
 ) -> float:
-    """便捷函数：只返回显示层需要移动的拼图位移（px）。"""
+    """便捷函数：只返回显示层需要移动的拼图位移（px）。
+
+    Raises:
+        PuzzleSolverUnavailable: Pillow 未安装。
+        PuzzleSolveError: 素材无法解析 / 定位失败。
+    """
     return locate_gap(back_png, shadow_png, display_width=display_width).dx_display

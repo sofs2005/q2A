@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from backend.services import browser_upload_proxy as bux
+from backend.services import puzzle_solver
 from backend.services.browser_upload_proxy import (
     BROWSER_MODE_LOCAL,
     BROWSER_MODE_OFF,
@@ -573,6 +574,33 @@ class FetchStsLoopTests(ProxyTestBase):
         proxy = self.build_proxy()
         self.assertIsNone(await proxy.solve_puzzle(page, cdp))
         self.assertEqual(page.waits[0][0], bux.SLIDER_SELECTOR)
+
+    async def test_pillow_missing_degrades_to_browser_upload_unavailable(self) -> None:
+        """pillow 未安装：`enabled` 仍为 True，真调用时降级成 BrowserUploadUnavailable。
+
+        线上事故回归：生产镜像没装 pillow，不能让整个服务起不来，也不能把验证码链路
+        打成 500 —— 必须是「浏览器上传不可用 → 回退内联 / 400」。
+        """
+        page, cdp = self.build_page(fetch_results=[("waf", WAF_HTML)])
+        proxy = self.build_proxy()
+        self.assertTrue(proxy.enabled)
+
+        with patch.object(puzzle_solver, "_load_pillow", lambda: None):
+            with self.patch_page(proxy, page, cdp):
+                with self.assertRaises(BrowserUploadUnavailable) as ctx:
+                    await proxy.fetch_sts(_account(), "test-2m.mp4", "video/mp4", VIDEO_SIZE)
+
+        message = str(ctx.exception)
+        self.assertIn("pillow", message.lower())
+        self.assertIn("fallback disabled", message)
+        # 降级不是验证码失败：不消耗轮次、不打开熔断，下一次还能再试
+        self.assertEqual(proxy.failure_streak("alice@example.com"), 0)
+        self.assertFalse(proxy.is_cooled_down("alice@example.com"))
+        # 只发过一次 getstsToken（拿到 WAF 后立刻降级，没有反复重试打风控）
+        self.assertEqual(len(page.fetch_calls), 1)
+        # 上层（context_attachment_manager._try_browser_upload）正是捕获这个类型
+        self.assertIsInstance(ctx.exception, BrowserUploadUnavailable)
+        self.assertTrue(proxy.enabled)
 
 
 class DragMappingTests(ProxyTestBase):
