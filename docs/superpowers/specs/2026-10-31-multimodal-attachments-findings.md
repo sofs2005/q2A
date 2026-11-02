@@ -245,3 +245,37 @@ Chrome146/Windows、`--headless=new`，**连续 10+ 次全部被拒**（滑块�
 - 轮次不固定：同一账号一次上传出现过「两轮」，也出现过「一轮」，由风控动态决定。
 - 失败集中在「拖动来源」而非「位置」——位置已用叠加图逐像素核对。
 - 剩余差异推测为 TLS/JA3 指纹、Canvas/Audio 指纹、字体列表等 JS 补不了的环境特征。
+
+## 10. 为什么取 STS 不能用页面内 fetch（2026-11-02，真实浏览器实测）
+
+生产日志：浏览器起来了、登录态种好了，然后 45s 内**没有任何 captcha 日志**，直接
+`browser upload hard timeout`。根因是 `_request_sts()` 在页面里
+`fetch('/api/v2/files/getstsToken')`，WAF 挑战时这个 promise **永不 settle**。
+
+真实 Chromium（headless，`/usr/bin/chromium`）+ 真 `chat.qwen.ai` 页面的探针结论：
+
+| 探针 | 结果 |
+|---|---|
+| `window.fetch.toString()` 是否 `native code` | **否**（baxia 的 `AWSC` 包装，混淆前缀 `\u01c5\u01a4…`） |
+| `XMLHttpRequest.prototype.open/send` 是否 `native` | **否**（同一包装） |
+| 页面全局 | `__baxia__` / `ALIYUN_WAF` / `AWSC` / `AWSCFY` / `BaxiaCookieManager` 全在 |
+| `context.request.post(getstsToken)` | 秒回（本机未被挑战时 0.27s / 200 + JSON），**一定 settle** |
+| `context.request` 是否共享 cookie jar | **是**（请求头里带着页面的 `acw_tc` / `isg` / `tfstk` 等 13 个 cookie） |
+| 页面内 fire-and-forget XHR | `page.evaluate` **44ms 返回**（不 await 就不会被挂住） |
+
+**结论（关键）**：验证码是 **baxia SDK 在页面里**渲染的——它劫持的正是 `fetch` / `XHR`。
+`context.request` 是浏览器进程级 HTTP 客户端，响应从头到尾不进页面，所以
+**单靠 `context.request` 拿到 WAF HTML 不会让 `#aliyunCaptcha-sliding-slider` 出现**；
+必须由页面内的 XHR 把挑战响应喂给 baxia。
+
+因此最终实现是「两条腿」：
+
+1. **取 STS** → `page.request.post(...)`（`APIRequestContext`，共享 cookie、带超时、
+   永不挂死）；
+2. **过验证码** → 检测到 WAF 页后，页面自己发一次 fire-and-forget XHR（只 `send()`
+   不 `await`）让 baxia 渲染拼图，再 `solve_puzzle()`；解完回到 ① 拿 JSON。
+
+本机（沙箱出口）打 `getstsToken` 只会拿到 `200 + {"code":"RateLimited","details":"401 未授权"}`
+（无登录态、且该 IP 未被挑战），因此「WAF 页出现后拼图是否渲染」只能在生产账号 +
+被挑战的出口 IP 上复验；`solve_puzzle` 的等待已按 `UPLOAD_CAPTCHA_TIMEOUT_SECONDS`
+双向兜底，复验时看一行日志即可判断：`[BrowserUpload] captcha slider did not appear`。

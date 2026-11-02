@@ -405,6 +405,7 @@ base64 膨胀 1.33 倍，因此内联实际只能承载约 **6KB 二进制**：
     UPLOAD_CAPTCHA_MAX_ROUNDS=3      # 验证码可能要过两轮
     UPLOAD_DRAG_MAPPING=auto         # auto | linear | quadratic
     UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS=45   # 整段浏览器上传的硬超时
+    UPLOAD_STS_REQUEST_TIMEOUT_SECONDS=15    # 单次取 STS（context.request）的超时
     ```
   - **local**：`UPLOAD_CDP_ENDPOINT` **留空**即在本进程内启动一个 Playwright Chromium，
     不需要任何外部机器（镜像已带 playwright + chromium）：
@@ -429,6 +430,13 @@ base64 膨胀 1.33 倍，因此内联实际只能承载约 **6KB 二进制**：
 - **硬超时**：`UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS`（默认 45s）包住整段「读字节 + 换 STS +
   OSS PUT」，超时按「浏览器不可用」处理并降级到 HTTP 上传 / 内联，同时立即熔断该账号
   10 分钟——浏览器卡死时绝不让请求等满两分钟。
+- **取 STS 用 `context.request`，不用页面内 `fetch`**：`chat.qwen.ai` 的 baxia SDK 劫持了
+  `window.fetch` / `XMLHttpRequest.prototype.send`（实测 `toString()` 不是 `native code`），
+  WAF 挑战时页面内的 promise **永不 settle**（`AbortController` 也无效），历史上因此只能等
+  45s 硬超时。现在 STS 走 playwright 的 `APIRequestContext`（自动共享 context 的 cookie jar，
+  带 `UPLOAD_STS_REQUEST_TIMEOUT_SECONDS` 超时，一定返回）；页面只负责**过验证码**——检测到
+  WAF 页后先让页面自己发一次 fire-and-forget XHR（不 await，`evaluate` 几十毫秒返回），
+  baxia 收到挑战响应才会把拼图渲染进 DOM。
 - 排查：`GET /admin/upload/probe` 返回 `mode`（`remote` / `local` / `off`）、连接状态与浏览器版本。
 - ⚠️ 该通道依赖真实浏览器环境与干净的出口 IP；同一 IP 短时间内反复触发验证码会被风控
   回 `F015`（频率类），此时需要冷却或更换出口。

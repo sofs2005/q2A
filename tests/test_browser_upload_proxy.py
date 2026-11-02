@@ -11,6 +11,7 @@
 真实浏览器只由 `backend/services/browser_upload_proxy.py` 在运行时连，单测一律 fake。
 """
 
+import asyncio
 import json
 import random
 import tempfile
@@ -106,6 +107,7 @@ def _settings(**overrides) -> types.SimpleNamespace:
         "UPLOAD_VIA_BROWSER": "auto",
         "UPLOAD_CAPTCHA_MAX_ROUNDS": 3,
         "UPLOAD_CAPTCHA_TIMEOUT_SECONDS": 5,
+        "UPLOAD_STS_REQUEST_TIMEOUT_SECONDS": 15,
         "UPLOAD_DRAG_MAPPING": "linear",
         "UPLOAD_BROWSER_TIMEOUT_SECONDS": 30,
         "UPLOAD_DRAG_CALIBRATION_FILE": "",
@@ -127,18 +129,55 @@ class FakeResponse:
         return self._body
 
 
-class FakeRequestContext:
-    """`page.request`：按 URL 下发素材字节。"""
+class FakeStsResponse:
+    """`context.request.post()`（取 STS）的返回值：只需要 status / text()。"""
 
-    def __init__(self, assets: dict[str, bytes]) -> None:
+    def __init__(self, status: int, text: str) -> None:
+        self.status = status
+        self._text = text
+
+    async def text(self) -> str:
+        return self._text
+
+
+class FakeRequestContext:
+    """`page.request`：按 URL 下发素材字节，并承接取 STS 的 POST。
+
+    `sts_results` 是 `getstsToken` 的预设应答队列，元素为 `(kind, payload)` 或可调用
+    对象（收到 fake request context 后返回同结构）；也允许直接放 `Exception` 实例来
+    模拟 `context.request` 超时 / 连接错误。
+    """
+
+    def __init__(self, assets: dict[str, bytes], sts_results: list | None = None) -> None:
         self.assets = dict(assets)
         self.requested: list[str] = []
+        self.sts_results: list = list(sts_results or [])
+        self.post_calls: list[tuple[str, dict, dict]] = []
+        #: 每次 POST 传的 timeout（毫秒），用于断言「有超时护栏」。
+        self.timeouts: list = []
 
     async def get(self, url: str) -> FakeResponse:
         self.requested.append(url)
         if url not in self.assets:
             raise RuntimeError(f"unexpected asset url: {url}")
         return FakeResponse(self.assets[url])
+
+    async def post(self, url: str, headers=None, data=None, timeout=None):
+        self.post_calls.append((url, dict(headers or {}), json.loads(data or "{}")))
+        self.timeouts.append(timeout)
+        if not self.sts_results:
+            return FakeStsResponse(403, WAF_HTML)
+        item = self.sts_results.pop(0)
+        if callable(item) and not isinstance(item, Exception):
+            item = item(self)
+        if isinstance(item, Exception):
+            raise item
+        kind, payload = item
+        if kind == "waf":
+            return FakeStsResponse(403, payload)
+        if kind == "raw":
+            return FakeStsResponse(200, payload)
+        return FakeStsResponse(200, json.dumps(payload))
 
 
 class FakeElement:
@@ -180,12 +219,13 @@ class FakePage:
         puzzle_offset: float | None = None,
     ) -> None:
         self.fetch_results = list(fetch_results)
-        self.request = FakeRequestContext(assets)
+        #: 取 STS 走 `page.request.post`（`context.request`），不再走页面内 fetch。
+        self.request = FakeRequestContext(assets, sts_results=self.fetch_results)
         self.display_width = display_width
         self.slider_visible = slider_visible
         self.slider_visible_after_drag = slider_visible_after_drag
         self.puzzle_offset = puzzle_offset
-        self.fetch_calls: list[list] = []
+        self.triggers: list[list] = []
         self.waits: list[tuple[str, int | None]] = []
         self._assets_by_kind = {
             kind: url
@@ -194,13 +234,19 @@ class FakePage:
             if url.endswith(f"{kind}.png")
         }
 
+    @property
+    def fetch_calls(self) -> list[list]:
+        """兼容旧断言：取 STS 的请求（url, headers, body）三元组。"""
+        return self.request.post_calls
+
     # -- Page API ---------------------------------------------------------
 
     async def evaluate(self, script: str, arg=None):
         text = str(script)
-        if "fetch(" in text:
-            self.fetch_calls.append(arg)
-            return self._next_fetch()
+        if "XMLHttpRequest" in text:
+            # fire-and-forget 触发：立即返回，绝不等页面内的 promise。
+            self.triggers.append(arg)
+            return "started"
         if "getEntriesByType" in text:
             return {
                 "shadow": self._assets_by_kind.get("shadow", ""),
@@ -227,21 +273,6 @@ class FakePage:
 
     def mark_drag_released(self) -> None:
         self.slider_visible = self.slider_visible_after_drag
-
-    # -- 内部 -------------------------------------------------------------
-
-    def _next_fetch(self) -> dict:
-        if not self.fetch_results:
-            return {"status": 403, "body": WAF_HTML}
-        item = self.fetch_results.pop(0)
-        if callable(item):
-            item = item(self)
-        kind, payload = item
-        if kind == "waf":
-            return {"status": 403, "body": payload}
-        if kind == "raw":
-            return {"status": 200, "body": payload}
-        return {"status": 200, "body": json.dumps(payload)}
 
 
 class FakeLocalPage:
@@ -437,6 +468,83 @@ class FetchStsLoopTests(ProxyTestBase):
         self.assertEqual(cdp.event_types[0], "mouseMoved")  # 起手前先 hover
         self.assertTrue(proxy.recent_captcha_pass())
         self.assertEqual(proxy.failure_streak("alice@example.com"), 0)
+
+    async def test_waf_page_triggers_page_side_xhr_before_solving(self) -> None:
+        """WAF 页 → 页面内 fire-and-forget XHR（让 baxia 渲染拼图）→ 解一次 → 拿 JSON。"""
+        page, cdp = self.build_page(fetch_results=[("waf", WAF_HTML), ("json", {"data": STS_DATA})])
+        proxy = self.build_proxy(_settings(UPLOAD_CAPTCHA_MAX_ROUNDS=3))
+        solves: list[int] = []
+        original = proxy.solve_puzzle
+
+        async def counting(page_arg, cdp_arg):
+            # 求解前必须先触发页面内请求，否则 baxia 不会渲染拼图。
+            self.assertEqual(len(page.triggers), 1)
+            solves.append(1)
+            return await original(page_arg, cdp_arg)
+
+        proxy.solve_puzzle = counting  # type: ignore[assignment]
+
+        with self.patch_page(proxy, page, cdp):
+            result = await proxy.fetch_sts(_account(), "test-2m.mp4", "video/mp4", VIDEO_SIZE)
+
+        self.assertEqual(result["file_id"], STS_DATA["file_id"])
+        self.assertEqual(len(solves), 1)
+        self.assertEqual(len(page.triggers), 1)
+        # 触发请求与取 STS 的请求体一致（同一个接口、同样的参数）
+        url, _headers, body = page.triggers[0]
+        self.assertEqual(url, "https://chat.qwen.ai/api/v2/files/getstsToken")
+        self.assertEqual(body["filename"], "test-2m.mp4")
+        self.assertEqual(body["filesize"], str(VIDEO_SIZE))
+        self.assertEqual(body["filetype"], "video")
+        # 取 STS 走的是 context.request（有超时），不是页面内 fetch
+        self.assertEqual(len(page.request.post_calls), 2)
+        self.assertTrue(all(isinstance(t, int) and t > 0 for t in page.request.timeouts))
+        self.assertEqual(page.request.timeouts[0], 15000)
+
+    async def test_sts_request_timeout_degrades_without_hanging(self) -> None:
+        """`context.request` 超时 → BrowserUploadUnavailable（可降级），且不烧熔断。"""
+        page, cdp = self.build_page(fetch_results=[TimeoutError("Timeout 15000ms exceeded")])
+        proxy = self.build_proxy(_settings(UPLOAD_CAPTCHA_MAX_ROUNDS=3))
+
+        with self.patch_page(proxy, page, cdp):
+            with self.assertRaises(BrowserUploadUnavailable):
+                await asyncio.wait_for(
+                    proxy.fetch_sts(_account(), "test-2m.mp4", "video/mp4", VIDEO_SIZE),
+                    timeout=5.0,
+                )
+        # 只发了一次请求，没有无限重试
+        self.assertEqual(len(page.request.post_calls), 1)
+        self.assertEqual(len(page.triggers), 0)
+        self.assertEqual(proxy.failure_streak("alice@example.com"), 0)
+        self.assertFalse(proxy.is_cooled_down("alice@example.com"))
+
+    async def test_waf_rounds_never_loop_forever(self) -> None:
+        """连续 WAF：最多解 `UPLOAD_CAPTCHA_MAX_ROUNDS` 轮就抛错，请求次数有限。"""
+        page, cdp = self.build_page(
+            fetch_results=[("waf", WAF_HTML) for _ in range(50)],
+            slider_visible_after_drag=True,
+        )
+        proxy = self.build_proxy(_settings(UPLOAD_CAPTCHA_MAX_ROUNDS=2))
+        solves: list[int] = []
+        original = proxy.solve_puzzle
+
+        async def counting(page_arg, cdp_arg):
+            solves.append(1)
+            return await original(page_arg, cdp_arg)
+
+        proxy.solve_puzzle = counting  # type: ignore[assignment]
+
+        with self.patch_page(proxy, page, cdp):
+            with self.assertRaises(BrowserUploadError):
+                await asyncio.wait_for(
+                    proxy.fetch_sts(_account(), "test-2m.mp4", "video/mp4", VIDEO_SIZE),
+                    timeout=5.0,
+                )
+
+        self.assertEqual(len(solves), 2)
+        self.assertEqual(len(page.request.post_calls), 3)  # 1 次初始 + 每轮解完再试 2 次
+        self.assertEqual(len(page.triggers), 2)  # 每轮 WAF 都触发一次页面内请求
+        self.assertTrue(proxy.is_cooled_down("alice@example.com"))
 
     async def test_two_waf_rounds_then_json(self) -> None:
         page, cdp = self.build_page(

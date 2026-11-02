@@ -39,8 +39,18 @@
    `localStorage.token` / `at_expire_time`，再把账号 cookies（含 `waf_cookies`）
    `context.add_cookies` 进去，然后 `goto` 首页并 `Escape` 关掉欢迎弹窗
    （有弹窗时 drop / 请求会异常）。
-3. **在页面上下文 fetch**：`page.evaluate` 里调 `fetch('/api/v2/files/getstsToken')`，
-   这样 cookie / TLS 指纹 / 设备指纹都由真浏览器承担。
+3. **取 STS 走 `context.request`（不是页面内 fetch）**：`page.request.post(...)`
+   （playwright 的 `APIRequestContext`，自动共享该 context 的 cookie jar）发
+   `getstsToken`，带 15s 超时，**永远会 settle**。
+   历史上的实现是在 `page.evaluate` 里 `fetch(...)`，但 `chat.qwen.ai` 的 baxia SDK
+   把 `window.fetch` / `XMLHttpRequest.prototype.send` 全劫持了（实测
+   `window.fetch.toString()` 不是 `native code`），WAF 挑战时那个 promise **永不
+   settle**，`AbortController` 也不生效（实测 40s abort 后 evaluate 仍挂到 90s），
+   于是只能等外层 45s 硬超时 → 上传必挂。
+   页面从此只负责**过验证码**：检测到 WAF 页后先让页面**自己**发一次（fire-and-forget
+   XHR，不 await），baxia 收到挑战响应才会把拼图渲染进 DOM；取 STS 仍由
+   `context.request` 负责（验证码通过后 baxia 把放行 cookie 写进共享 cookie jar，
+   下一轮 `context.request` 就能拿到 JSON）。
 4. **缺口定位**：:mod:`backend.services.puzzle_solver`（纯计算）。
 5. **拖动比例自动标定**：`UPLOAD_DRAG_MAPPING=auto` 时读
    `data/drag_calibration.json`；没有缓存就做两点标定（拖 40px、80px，按住时读
@@ -180,6 +190,10 @@ _WAF_CHALLENGE_MARKERS = (
 
 _VERIFY_CODE_RE = re.compile(r"\b([TF]\d{3})\b")
 
+#: 取 STS 的默认超时（秒）：`context.request` 单次 HTTP 的护栏。
+#: 必须显著小于 `UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS`，否则又会退化成「等外层硬超时」。
+DEFAULT_STS_REQUEST_TIMEOUT_SECONDS = 15.0
+
 # fetch() 不能设置的「禁止头」，浏览器自己会带（含 Cookie / UA / Referer / Origin）。
 _FORBIDDEN_FETCH_HEADERS = frozenset(
     {
@@ -194,19 +208,38 @@ _FORBIDDEN_FETCH_HEADERS = frozenset(
     }
 )
 
+# `context.request`（APIRequestContext）不能/不该设置的「禁止头」：Cookie 由 context
+# 的 cookie jar 自动带，其余几个由 playwright 自己算。UA / sec-ch-ua **保留**（用账号
+# 指纹，别用 HeadlessChrome 默认值），Referer / Origin 由 build_api_request_headers 补。
+_FORBIDDEN_API_HEADERS = frozenset(
+    {
+        "cookie",
+        "host",
+        "content-length",
+        "connection",
+        "accept-encoding",
+    }
+)
+
 # ---- 页面内 JS --------------------------------------------------------------
 
-_FETCH_STS_JS = """
-async ([url, headers, body]) => {
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: headers,
-    body: JSON.stringify(body),
-    credentials: 'include',
-    mode: 'cors',
-  });
-  const text = await resp.text();
-  return {status: resp.status, body: text};
+# 注意：**不能 await**。页面里的 fetch / XHR 都被 baxia 劫持，WAF 挑战时 promise 永不
+# settle（AbortController 也无效），await 就是把整条链路挂死。这里只负责「让页面自己
+# 发一次请求」，好让 baxia 收到挑战响应并把拼图渲染进 DOM，然后立刻返回。
+_TRIGGER_WAF_JS = """
+([url, headers, body]) => {
+  try {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url, true);
+    for (const name in headers) {
+      try { xhr.setRequestHeader(name, headers[name]); } catch (e) {}
+    }
+    xhr.onreadystatechange = function () {};
+    xhr.send(JSON.stringify(body));
+    return 'started';
+  } catch (e) {
+    return 'error:' + String(e);
+  }
 }
 """
 
@@ -830,6 +863,38 @@ def sanitize_fetch_headers(headers: dict[str, str]) -> dict[str, str]:
     }
 
 
+def sanitize_api_headers(headers: dict[str, str]) -> dict[str, str]:
+    """剔除 `APIRequestContext` 不能设置的头；UA / sec-ch-ua 保留（用账号指纹）。"""
+    return {
+        name: value
+        for name, value in (headers or {}).items()
+        if str(name).strip().lower() not in _FORBIDDEN_API_HEADERS
+    }
+
+
+def build_api_request_headers(account: Any) -> dict[str, str]:
+    """构造 `context.request` 用的 `getstsToken` 请求头。
+
+    与 :func:`build_request_headers` 的区别：那条路是页面内 `fetch`，`Cookie` /
+    `Referer` / `Origin` / `User-Agent` 全由浏览器补齐，必须剔掉；这里没有页面 JS
+    参与，所以：
+
+    - `Cookie` 仍由 context 的 cookie jar 自动带（保持共享，验证码放行后才生效）；
+    - `Referer` / `Origin` 必须显式补上，否则上游看到的同源特征与网页端不一致；
+    - `User-Agent` / `sec-ch-ua*` 用账号指纹，避免暴露 `HeadlessChrome`。
+
+    Args:
+        account: 账号对象（需要 `email` / `token`）。
+
+    Returns:
+        可直接传给 `context.request.post(headers=...)` 的字典。
+    """
+    headers = sanitize_api_headers(build_request_headers(account))
+    headers.setdefault("Referer", f"{QWEN_BASE_URL}/")
+    headers.setdefault("Origin", QWEN_BASE_URL)
+    return headers
+
+
 _SETTINGS_SINGLETON: Any = None
 
 
@@ -855,6 +920,7 @@ class _NullSettings:
     UPLOAD_VIA_BROWSER = "never"
     UPLOAD_CAPTCHA_MAX_ROUNDS = 3
     UPLOAD_CAPTCHA_TIMEOUT_SECONDS = 30
+    UPLOAD_STS_REQUEST_TIMEOUT_SECONDS = DEFAULT_STS_REQUEST_TIMEOUT_SECONDS
     UPLOAD_DRAG_MAPPING = "auto"
     UPLOAD_BROWSER_TIMEOUT_SECONDS = 120
     UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS = 45
@@ -959,6 +1025,18 @@ class BrowserUploadProxy:
             return max(1.0, float(self._cfg("UPLOAD_CAPTCHA_TIMEOUT_SECONDS", 30)))
         except (TypeError, ValueError):
             return 30.0
+
+    @property
+    def sts_request_timeout_seconds(self) -> float:
+        """`context.request` 单次取 STS 的超时（秒）。
+
+        历史上取 STS 是页面内 `fetch`，被 baxia 劫持后永不 settle，只能等外层 45s 硬
+        超时；改成 `APIRequestContext` 后必须自己给超时，且要明显小于硬超时。
+        """
+        try:
+            return max(1.0, float(self._cfg("UPLOAD_STS_REQUEST_TIMEOUT_SECONDS", DEFAULT_STS_REQUEST_TIMEOUT_SECONDS)))
+        except (TypeError, ValueError):
+            return DEFAULT_STS_REQUEST_TIMEOUT_SECONDS
 
     @property
     def browser_timeout_seconds(self) -> float:
@@ -1358,6 +1436,70 @@ class BrowserUploadProxy:
 
     # -- getstsToken --------------------------------------------------------
 
+    @staticmethod
+    def _sts_body(filename: str, content_type: str, size: int) -> dict[str, Any]:
+        """`getstsToken` 请求体（与网页端抓包逐字段一致，`filesize` 是字符串）。"""
+        return {
+            "filename": filename,
+            # 官网网页端传字符串；与官方抓包保持一致。
+            "filesize": str(int(size)),
+            "filetype": upload_filetype_from_content_type(content_type),
+        }
+
+    async def _post_sts(self, page: Any, account: Any, body: dict[str, Any]) -> tuple[int, str]:
+        """用 `context.request`（`page.request`）发一次 `getstsToken`。
+
+        为什么不用页面内 `fetch`：baxia SDK 劫持了 `window.fetch` /
+        `XMLHttpRequest.prototype.send`，WAF 挑战时页面内的 promise 永不 settle，
+        `AbortController` 也拦不住 → 只能等外层硬超时。`APIRequestContext` 是浏览器
+        进程级 HTTP 客户端，不经过页面 JS，带超时后一定能返回；同时它**自动共享该
+        context 的 cookie jar**（实测请求头里带着 `acw_tc` / `isg` / `tfstk` 等），
+        所以验证码通过后 baxia 写下的放行 cookie 下一轮就生效。
+
+        Args:
+            page: playwright Page（用它挂着的 context APIRequestContext）。
+            account: 账号对象（取请求头指纹）。
+            body: `getstsToken` 请求体。
+
+        Returns:
+            `(status, text)`。
+
+        Raises:
+            BrowserUploadUnavailable: HTTP 层不可用（拿不到 `page.request` / 超时 /
+                连接错误）——上层直接降级到内联或 400，**不**消耗账号熔断计数。
+            BrowserUploadError: 拿到了响应但读 body 失败。
+        """
+        request = getattr(page, "request", None)
+        poster = getattr(request, "post", None)
+        if not callable(poster):
+            raise BrowserUploadUnavailable(
+                "page.request (APIRequestContext) unavailable; cannot fetch STS"
+            )
+        headers = build_api_request_headers(account)
+        timeout = self.sts_request_timeout_seconds
+        try:
+            response = await poster(
+                f"{QWEN_BASE_URL}{GETSTS_PATH}",
+                headers=headers,
+                data=json.dumps(body),
+                timeout=int(timeout * 1000),
+            )
+        except Exception as exc:
+            # 超时 / DNS / 连接被重置：浏览器 HTTP 层当前不可用，按「不可用」降级，
+            # 绝不能把请求拖到外层硬超时，也不该因此熔断账号。
+            raise BrowserUploadUnavailable(
+                f"{GETSTS_PATH} request failed ({type(exc).__name__}): {str(exc)[:160]}"
+            ) from exc
+        try:
+            text = await asyncio.wait_for(response.text(), timeout=timeout)
+        except Exception as exc:
+            raise BrowserUploadError(f"{GETSTS_PATH} read body failed: {exc}") from exc
+        try:
+            status = int(getattr(response, "status", 0) or 0)
+        except (TypeError, ValueError):
+            status = 0
+        return status, str(text or "")
+
     async def _request_sts(
         self,
         page: Any,
@@ -1366,29 +1508,17 @@ class BrowserUploadProxy:
         content_type: str,
         size: int,
     ) -> tuple[str, Any]:
-        """在页面上下文里调 `getstsToken`。
+        """调 `getstsToken`（走 `context.request`，见 :meth:`_post_sts`）。
 
         Returns:
             `("json", sts_data)` 或 `("waf", body)`。
 
         Raises:
-            BrowserUploadError: 非 WAF 的硬失败（网络 / 非 JSON / 缺 file_id / 配额）。
+            BrowserUploadUnavailable: 浏览器 HTTP 层不可用（超时 / 无 `page.request`）。
+            BrowserUploadError: 非 WAF 的硬失败（非 JSON / 缺 file_id）。
         """
-        headers = sanitize_fetch_headers(build_request_headers(account))
-        body = {
-            "filename": filename,
-            # 官网网页端传字符串；与官方抓包保持一致。
-            "filesize": str(int(size)),
-            "filetype": upload_filetype_from_content_type(content_type),
-        }
-        try:
-            result = await page.evaluate(_FETCH_STS_JS, [f"{QWEN_BASE_URL}{GETSTS_PATH}", headers, body])
-        except Exception as exc:
-            raise BrowserUploadError(f"page fetch {GETSTS_PATH} failed: {exc}") from exc
-        if not isinstance(result, dict):
-            raise BrowserUploadError(f"page fetch {GETSTS_PATH} returned unexpected payload: {result!r}")
-        status = int(result.get("status") or 0)
-        text = str(result.get("body") or "")
+        body = self._sts_body(filename, content_type, size)
+        status, text = await self._post_sts(page, account, body)
         if looks_like_waf_challenge(text):
             return "waf", text
         try:
@@ -1415,6 +1545,52 @@ class BrowserUploadProxy:
             raise BrowserUploadError(f"{GETSTS_PATH} missing file_id: {text[:200]}")
         return "json", payload
 
+    async def _trigger_waf_challenge(
+        self,
+        page: Any,
+        account: Any,
+        filename: str,
+        content_type: str,
+        size: int,
+    ) -> bool:
+        """让**页面自己**再发一次 `getstsToken`，把 WAF 拼图渲染进 DOM。
+
+        实测依据（2026-11-02，真实 Chromium 打 `chat.qwen.ai`）：
+
+        - 页面里 `window.fetch` / `XMLHttpRequest.prototype.open/send` 全部**不是**
+          `native code`（被 baxia 的 `AWSC` 包装过），`window.__baxia__` /
+          `ALIYUN_WAF` / `BaxiaCookieManager` 都在；
+        - 所以 `context.request` 拿到 WAF HTML **不会**触发验证码渲染（那个响应从头到尾
+          没进页面），必须由页面内的 XHR 把挑战响应喂给 baxia，`#aliyunCaptcha-*`
+          才会出现；
+        - 这个 XHR 只 `send()` 不 `await`：`page.evaluate` 实测 44ms 返回，不会被
+          永不 settle 的 promise 拖住。
+
+        Args:
+            page: playwright Page。
+            account: 账号对象（请求头指纹）。
+            filename / content_type / size: 与 `getstsToken` 一致的上传参数。
+
+        Returns:
+            True 表示触发请求已发出；False 表示页面执行失败（调用方仍会尝试等滑块）。
+        """
+        evaluator = getattr(page, "evaluate", None)
+        if not callable(evaluator):
+            return False
+        headers = sanitize_fetch_headers(build_request_headers(account))
+        body = self._sts_body(filename, content_type, size)
+        try:
+            result = await evaluator(_TRIGGER_WAF_JS, [f"{QWEN_BASE_URL}{GETSTS_PATH}", headers, body])
+        except Exception as exc:
+            log.warning("[BrowserUpload] trigger waf challenge failed: %s", str(exc)[:160])
+            return False
+        started = result == "started"
+        log.info(
+            "[BrowserUpload] waf challenge triggered in page result=%s (page-side XHR, not awaited)",
+            result,
+        )
+        return started
+
     # -- 验证码求解 ---------------------------------------------------------
 
     async def solve_puzzle(self, page: Any, cdp: Any) -> str | None:
@@ -1429,10 +1605,21 @@ class BrowserUploadProxy:
                 上传降级，由上层回退内联 / 400。
         """
         timeout_ms = int(self.captcha_timeout_seconds * 1000)
+        deadline = asyncio.get_event_loop().time() + self.captcha_timeout_seconds
         try:
-            await page.wait_for_selector(SLIDER_SELECTOR, timeout=timeout_ms)
+            # 双重护栏：`wait_for_selector` 自带 timeout，外面再包一层 `wait_for`——
+            # 页面被 baxia 挂住时连 CDP 调用都可能不返回，不能只依赖 playwright 的
+            # 内部超时（历史上就因此整条链路卡到外层 45s 硬超时）。
+            await asyncio.wait_for(
+                page.wait_for_selector(SLIDER_SELECTOR, timeout=timeout_ms),
+                timeout=self.captcha_timeout_seconds + 1.0,
+            )
         except Exception as exc:
-            log.warning("[BrowserUpload] captcha slider did not appear: %s", exc)
+            log.warning(
+                "[BrowserUpload] captcha slider did not appear within %.1fs: %s",
+                self.captcha_timeout_seconds,
+                str(exc)[:160],
+            )
             return None
         # 验证码有入场动画：等动画结束再读坐标 / 素材，否则会拿到过渡中间值。
         await self._sleep(self._rng.uniform(0.4, 0.8))
@@ -1440,6 +1627,10 @@ class BrowserUploadProxy:
         mapping_mode = self.drag_mapping_mode
         # 最多 3 轮：auto 标定会把当前拼图拖废，需要重新取素材再拖一次。
         for _attempt in range(3):
+            if asyncio.get_event_loop().time() > deadline:
+                # 整个求解过程（含标定/重取素材）不允许超过 `UPLOAD_CAPTCHA_TIMEOUT_SECONDS`。
+                log.warning("[BrowserUpload] captcha solve deadline exceeded, abort")
+                return None
             mapping = await self._resolve_mapping(page, cdp, mode=mapping_mode)
             if mapping.calibrated_now:
                 # 标定拖废了当前拼图，等风控下发新拼图（素材 URL 会变）再继续。
@@ -1727,7 +1918,9 @@ class BrowserUploadProxy:
                     self._on_success(email)
                     self._log_upload(account, filename, size, rounds, verify, started, ok=True)
                     return payload
-                # WAF 页面：求解验证码
+                # WAF 页面：先让页面自己发一次（fire-and-forget），baxia 才会把拼图渲染
+                # 进 DOM；`context.request` 拿到的挑战页从头到尾没进页面，单靠它渲染不出
+                # 验证码。然后求解验证码，解完再回到 `context.request` 取 STS。
                 if rounds >= max_rounds:
                     self._register_failure(email, count=max_rounds)
                     self._log_upload(account, filename, size, rounds, verify, started, ok=False)
@@ -1735,6 +1928,7 @@ class BrowserUploadProxy:
                         f"captcha not passed after {rounds} rounds ({GETSTS_PATH} still returns WAF page)"
                     )
                 rounds += 1
+                await self._trigger_waf_challenge(page, account, filename, content_type, size)
                 solved = await self.solve_puzzle(page, cdp)
                 if solved:
                     verify = solved

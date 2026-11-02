@@ -191,6 +191,12 @@ class Settings(BaseSettings):
     UPLOAD_CAPTCHA_MAX_ROUNDS: int = int(os.getenv("UPLOAD_CAPTCHA_MAX_ROUNDS", 3))
     # 等验证码滑块出现的超时（秒）
     UPLOAD_CAPTCHA_TIMEOUT_SECONDS: int = int(os.getenv("UPLOAD_CAPTCHA_TIMEOUT_SECONDS", 30))
+    # 取 STS（`context.request.post`）的单次超时（秒）。必须是有限值且明显小于
+    # UPLOAD_BROWSER_HARD_TIMEOUT_SECONDS：页面内 fetch 曾被 baxia 挂死到外层硬超时，
+    # 改走 APIRequestContext 后靠这个超时保证「一定会返回」。
+    UPLOAD_STS_REQUEST_TIMEOUT_SECONDS: float = float(
+        os.getenv("UPLOAD_STS_REQUEST_TIMEOUT_SECONDS", 15)
+    )
     # 鼠标位移 ↔ 拼图位移的映射：auto（默认，优先读标定缓存）/ linear / quadratic
     UPLOAD_DRAG_MAPPING: str = os.getenv("UPLOAD_DRAG_MAPPING", "auto").strip().lower() or "auto"
     # 单次浏览器上传（连接 + 验证码 + 取 STS）的总超时（秒）
