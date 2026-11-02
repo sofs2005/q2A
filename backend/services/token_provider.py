@@ -54,7 +54,7 @@ REFRESH_MARGIN_SECONDS = 120
 SESSION_DIR = Path(DATA_DIR) / "browser_sessions"
 
 # refresh 请求头里的 version。官网 2026-10-30 抓包为 0.3.28，允许部署侧覆盖。
-_REFRESH_VERSION = os.getenv("QWEN_REFRESH_VERSION", "0.3.28").strip() or "0.3.28"
+_REFRESH_VERSION = os.getenv("QWEN_REFRESH_VERSION", "0.3.32").strip() or "0.3.28"
 # 同上：bx-v 也是 auth 域校验的必需头
 _BX_VERSION = os.getenv("QWEN_BX_VERSION", "2.5.37").strip() or "2.5.37"
 
