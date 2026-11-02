@@ -217,6 +217,7 @@ class FakePage:
         slider_visible: bool = True,
         slider_visible_after_drag: bool = False,
         puzzle_offset: float | None = None,
+        track_width: float = 300.0,
     ) -> None:
         self.fetch_results = list(fetch_results)
         #: 取 STS 走 `page.request.post`（`context.request`），不再走页面内 fetch。
@@ -225,6 +226,7 @@ class FakePage:
         self.slider_visible = slider_visible
         self.slider_visible_after_drag = slider_visible_after_drag
         self.puzzle_offset = puzzle_offset
+        self.track_width = track_width
         self.triggers: list[list] = []
         self.waits: list[tuple[str, int | None]] = []
         self._assets_by_kind = {
@@ -252,6 +254,8 @@ class FakePage:
                 "shadow": self._assets_by_kind.get("shadow", ""),
                 "back": self._assets_by_kind.get("back", ""),
             }
+        if "aliyunCaptcha-sliding-body" in text:
+            return {"width": self.track_width, "height": 6.0}
         if "aliyunCaptcha-sliding-slider" in text:
             return {"x": 100.0, "y": 500.0, "width": 40.0, "height": 40.0}
         if "aliyunCaptcha-img" in text:
@@ -864,20 +868,145 @@ class DragMappingTests(ProxyTestBase):
             self.assertFalse(resolution.calibrated_now)
             self.assertAlmostEqual(resolution.mouse_dx(157.0), 199.7, delta=0.5)
 
-    async def test_calibration_failure_falls_back_to_builtin_constants(self) -> None:
-        proxy = self.build_proxy(_settings(UPLOAD_DRAG_MAPPING="auto"))
+    async def test_unstable_calibration_falls_back_to_measured_defaults(self) -> None:
+        """两次采样读到同一个陈旧值 → 判标定无效 → 内置常数，且不落盘。
 
-        async def failing_probe(_page, _cdp, _mouse_dx: float):
-            return None
+        生产回归（2026-11）：拖 40px 与拖 80px 都读到 8.75，拟合出 `b≈0.13` 的假线性
+        曲线，`piece_dx=150` 反解成 1142px（轨道只有 300px），验证码必失败。
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "drag_calibration.json"
+            proxy = self.build_proxy(
+                _settings(UPLOAD_DRAG_MAPPING="auto", UPLOAD_DRAG_CALIBRATION_FILE=str(path)),
+                calibration_path=path,
+            )
 
-        proxy._probe_hold_offset = failing_probe  # type: ignore[assignment]
+            async def stale_probe(_page, _cdp, _mouse_dx: float) -> float:
+                return 8.75  # 两次都读到上一次的值
+
+            proxy._probe_hold_offset = stale_probe  # type: ignore[assignment]
+            page, cdp = self.build_page(fetch_results=[])
+
+            with self.assertLogs("qwen2api.browser_upload_proxy", level="WARNING") as logs:
+                calibration = await proxy.calibrate_drag(page, cdp)
+
+            self.assertIsNotNone(calibration)
+            self.assertEqual(calibration.source, "builtin")
+            self.assertAlmostEqual(calibration.a, BUILTIN_QUADRATIC_A, places=6)
+            self.assertAlmostEqual(calibration.b, BUILTIN_QUADRATIC_B, places=6)
+            # 无效标定绝不能写进缓存文件
+            self.assertFalse(path.exists())
+            self.assertTrue(
+                any("falling back to measured defaults" in line for line in logs.output),
+                logs.output,
+            )
+            # piece_dx=150 → ≈195px（旧代码是 1142px），且落在轨道行程内
+            mouse_dx = calibration.mouse_dx(150.0)
+            self.assertAlmostEqual(mouse_dx, 195.0, delta=3.0)
+            self.assertLess(mouse_dx, 256.0)
+            # 内存里的标定被复用，下一轮不会再标定（每次标定都会拖废一张拼图）
+            resolution = await proxy._resolve_mapping(page, cdp, mode="auto")
+            self.assertFalse(resolution.calibrated_now)
+            self.assertAlmostEqual(resolution.mouse_dx(150.0), mouse_dx, places=6)
+
+    def test_fit_calibration_from_measured_points(self) -> None:
+        """实测点 `(40, 8.75) / (80, 28.9)` → a≈0.0035、b≈0.0755（误差 <10%）。"""
+        calibration = fit_calibration([(40.0, 8.75), (80.0, 28.9)])
+        self.assertIsNotNone(calibration)
+        self.assertFalse(calibration.is_linear)
+        self.assertAlmostEqual(calibration.a, 0.0035, delta=0.0035 * 0.1)
+        self.assertAlmostEqual(calibration.b, 0.0755, delta=0.0755 * 0.1)
+
+    def test_calibration_is_usable_requires_piece_gap(self) -> None:
+        self.assertFalse(bux.calibration_is_usable([(40.0, 8.75), (80.0, 8.75)]))
+        self.assertFalse(bux.calibration_is_usable([(40.0, 8.75), (80.0, 10.0)]))
+        self.assertTrue(bux.calibration_is_usable([(40.0, 8.75), (80.0, 28.9)]))
+        self.assertFalse(bux.calibration_is_usable([(40.0, 8.75)]))
+
+    def test_clamp_drag_distance_uses_track_travel(self) -> None:
+        # 轨道 300 - 滑块 40 - 4 = 256 是上限
+        self.assertEqual(bux.max_drag_distance(300.0, 40.0), 256.0)
+        self.assertEqual(bux.clamp_drag_distance(1142.86, track_width=300.0, handle_width=40.0), (256.0, True))
+        self.assertEqual(bux.clamp_drag_distance(199.7, track_width=300.0, handle_width=40.0), (199.7, False))
+        # 读不到轨道宽度时退回 300 兜底，仍然不会放过 1142px
+        self.assertEqual(bux.clamp_drag_distance(1142.86, track_width=0.0, handle_width=40.0), (256.0, True))
+
+    async def test_drag_distance_is_clamped_and_logged(self) -> None:
+        """反解出 280px（>256）→ 钳到 256px，并打 `clamped from X to Y` 日志。"""
+        page, cdp = self.build_page(fetch_results=[], track_width=300.0)
+        proxy = self.build_proxy(_settings(UPLOAD_DRAG_MAPPING="quadratic"))
+        solution = types.SimpleNamespace(dx_display=300.0)
+        self.assertGreater(quadratic_mouse_dx(300.0), 256.0)
+
+        with patch.object(bux, "locate_gap", lambda *args, **kwargs: solution):
+            with self.assertLogs("qwen2api.browser_upload_proxy", level="INFO") as logs:
+                verify = await proxy.solve_puzzle(page, cdp)
+
+        self.assertEqual(verify, "T001")
+        moves = [params for _method, params in cdp.events if params.get("type") == "mouseMoved"]
+        # 滑块中心 x=120（100 + 40/2），终点必须落在 120 + 256 = 376
+        self.assertAlmostEqual(moves[-1]["x"], 376.0, places=3)
+        self.assertTrue(any("clamped from" in line for line in logs.output), logs.output)
+        self.assertTrue(
+            any("track_width=300.00 clamped=True" in line for line in logs.output),
+            logs.output,
+        )
+
+    async def test_probe_waits_for_transition_to_settle(self) -> None:
+        """读数还在变（CSS 过渡没跑完）→ 取稳定后的值，而不是第一次读到的陈旧值。"""
         page, cdp = self.build_page(fetch_results=[])
+        readings = [8.75, 8.75, 28.9, 28.9]
+        calls = {"n": 0}
 
-        self.assertIsNone(await proxy.calibrate_drag(page, cdp))
-        resolution = await proxy._resolve_mapping(page, cdp, mode="auto")
-        self.assertFalse(resolution.calibrated_now)
-        self.assertIsNone(resolution.calibration)
-        self.assertAlmostEqual(resolution.mouse_dx(157.0), 199.7, delta=0.5)
+        async def fake_offset(_page):
+            index = min(calls["n"], len(readings) - 1)
+            calls["n"] += 1
+            return readings[index]
+
+        sleeps: list[float] = []
+
+        async def record_sleep(seconds: float) -> None:
+            sleeps.append(float(seconds))
+
+        proxy = self.build_proxy()
+        proxy._sleep = record_sleep  # type: ignore[assignment]
+        proxy._puzzle_offset = fake_offset  # type: ignore[assignment]
+
+        offset = await proxy._probe_hold_offset(page, cdp, 80.0)
+
+        self.assertEqual(offset, 28.9)
+        # 至少轮询 3 次（每次间隔 400ms，基础等待 ≥1.2s）才认稳定值
+        self.assertGreaterEqual(calls["n"], 3)
+        self.assertGreaterEqual(sleeps.count(bux.CALIBRATION_PROBE_INTERVAL_SECONDS), 3)
+
+    async def test_calibration_failure_falls_back_to_builtin_constants(self) -> None:
+        """探针失败（读不到位移）→ 内置常数兜底，且只放内存、不落盘。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "drag_calibration.json"
+            proxy = self.build_proxy(
+                _settings(UPLOAD_DRAG_MAPPING="auto", UPLOAD_DRAG_CALIBRATION_FILE=str(path)),
+                calibration_path=path,
+            )
+
+            async def failing_probe(_page, _cdp, _mouse_dx: float):
+                return None
+
+            proxy._probe_hold_offset = failing_probe  # type: ignore[assignment]
+            page, cdp = self.build_page(fetch_results=[])
+
+            with self.assertLogs("qwen2api.browser_upload_proxy", level="WARNING"):
+                calibration = await proxy.calibrate_drag(page, cdp)
+            self.assertIsNotNone(calibration)
+            self.assertEqual(calibration.source, "builtin")
+            self.assertAlmostEqual(calibration.a, BUILTIN_QUADRATIC_A, places=6)
+            self.assertAlmostEqual(calibration.b, BUILTIN_QUADRATIC_B, places=6)
+            self.assertFalse(path.exists())
+
+            # 内存里已有兜底标定 → 不再重复标定（重复标定会把每张拼图都拖废）
+            resolution = await proxy._resolve_mapping(page, cdp, mode="auto")
+            self.assertFalse(resolution.calibrated_now)
+            self.assertIsNotNone(resolution.calibration)
+            self.assertAlmostEqual(resolution.mouse_dx(157.0), 199.7, delta=0.5)
 
     async def test_solve_puzzle_retries_after_calibration_spoils_puzzle(self) -> None:
         """auto 模式标定会把当前拼图拖废 → 必须用新拼图再拖一次。"""

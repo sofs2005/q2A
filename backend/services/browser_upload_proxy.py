@@ -154,7 +154,10 @@ DRAG_MAPPING_QUADRATIC = "quadratic"
 DRAG_MAPPING_MODES = (DRAG_MAPPING_AUTO, DRAG_MAPPING_LINEAR, DRAG_MAPPING_QUADRATIC)
 
 #: 实测拟合出的二次映射常数：`piece_dx = a * mouse_dx^2 + b * mouse_dx`。
-#: 8 个实测点拟合误差 < 0.1px（例：拼图要动 157px，鼠标要拖 199.7px）。
+#: 来源：2026-11 生产环境实测拟合（local 模式、容器内 Chromium，5 个采样点：
+#: `piece(40)=8.7` / `piece(80)=28.9` / `piece(120)=60.3` / `piece(180)=128.9` /
+#: `piece(240)=223`），拟合误差 < 0.1px（例：拼图要动 157px，鼠标要拖 199.7px）。
+#: 现场标定被判定无效时直接回退到这两个值（见 :func:`builtin_calibration`）。
 BUILTIN_QUADRATIC_A = 0.003555
 BUILTIN_QUADRATIC_B = 0.075899
 
@@ -170,6 +173,25 @@ SLIDER_TRACK_SELECTOR = "#aliyunCaptcha-sliding-body"
 
 #: 标定用的两个鼠标位移（px）。
 CALIBRATION_PROBE_OFFSETS: tuple[float, ...] = (40.0, 80.0)
+
+#: 标定两点之间「拼图位移」的最小差值（px）。小于该值说明采样没等到 CSS 过渡结束
+#: （两次读到同一个陈旧值），此时拟合会退化成 `a=0, b≈0.13` 的假线性曲线，反解出
+#: 1100px+ 的荒谬距离（2026-11 生产实测踩过：轨道只有 300px，却要拖 1142px），
+#: 因此直接判标定无效、回退内置常数、且**不落盘**。
+CALIBRATION_MIN_PIECE_DELTA = 3.0
+
+#: 标定采样：按住滑块后轮询读拼图位移的次数 / 间隔（秒）。基础等待 3 × 0.4s = 1.2s。
+CALIBRATION_PROBE_SAMPLES = 3
+CALIBRATION_PROBE_INTERVAL_SECONDS = 0.4
+#: 过渡还没跑完（读数仍在变）时的额外补采次数（总等待上限约 2.0s）。
+CALIBRATION_PROBE_EXTRA_SAMPLES = 2
+#: 相邻两次读数之差 ≤ 该值即视为「过渡已稳定」。
+CALIBRATION_PROBE_STABLE_EPS = 0.5
+
+#: 拖动距离钳位留白：最大可拖距离 = `track_width - handle_width - DRAG_TRACK_EDGE_PADDING`。
+DRAG_TRACK_EDGE_PADDING = 4.0
+#: 读不到 `#aliyunCaptcha-sliding-body` 宽度时的兜底值（与 `_display_width` 的 300 一致）。
+SLIDER_TRACK_FALLBACK_WIDTH = 300.0
 
 # ---- 熔断 --------------------------------------------------------------------
 
@@ -278,6 +300,15 @@ _PUZZLE_OFFSET_JS = """
   const img = document.querySelector('#aliyunCaptcha-img');
   if (!puzzle || !img) return null;
   return puzzle.getBoundingClientRect().x - img.getBoundingClientRect().x;
+}
+"""
+
+_TRACK_BOX_JS = """
+() => {
+  const el = document.querySelector('#aliyunCaptcha-sliding-body');
+  if (!el) return null;
+  const rect = el.getBoundingClientRect();
+  return {width: rect.width, height: rect.height};
 }
 """
 
@@ -586,6 +617,175 @@ def fit_calibration(
         source="measured",
         mode=str(mode or ""),
     )
+
+
+def _clean_samples(
+    samples: Iterable[tuple[float, float] | dict[str, float]],
+) -> list[tuple[float, float]]:
+    """把采样点归一化成 `[(mouse_dx, piece_dx), ...]`（丢弃非法 / 非有限值）。"""
+    points: list[tuple[float, float]] = []
+    for item in samples:
+        if isinstance(item, dict):
+            try:
+                mouse = float(item.get("mouse_dx"))
+                piece = float(item.get("piece_dx"))
+            except (TypeError, ValueError):
+                continue
+        else:
+            try:
+                mouse, piece = float(item[0]), float(item[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+        if not math.isfinite(mouse) or not math.isfinite(piece):
+            continue
+        points.append((mouse, piece))
+    return points
+
+
+def _piece_delta(samples: Iterable[tuple[float, float] | dict[str, float]]) -> float:
+    """采样点里「鼠标位移最大 / 最小」两点的拼图位移差（采样点不足时返回 0）。"""
+    points = _clean_samples(samples)
+    if len(points) < 2:
+        return 0.0
+    points.sort(key=lambda point: point[0])
+    return float(points[-1][1] - points[0][1])
+
+
+def calibration_is_usable(
+    samples: Iterable[tuple[float, float] | dict[str, float]],
+    *,
+    min_delta: float = CALIBRATION_MIN_PIECE_DELTA,
+) -> bool:
+    """两点标定是否可信（防「两次读到同一个陈旧值」的退化标定）。
+
+    判定依据：鼠标位移最大与最小的两个采样点之间，拼图位移必须拉开
+    `min_delta`（默认 3px）。读数相同（例如拖 40px 与 80px 都读到 8.75）说明采样
+    时 CSS 过渡还没跑完，拟合出来的曲线必然是 `a≈0` 的假线性，反解出的鼠标距离会
+    远超滑块轨道长度。
+
+    Args:
+        samples: 采样点，元素可以是 `(mouse_dx, piece_dx)` 元组或同名字典。
+        min_delta: 首尾拼图位移的最小差值（px）。
+
+    Returns:
+        True 表示标定可信；False 表示应回退内置常数且不落盘。
+    """
+    if len(_clean_samples(samples)) < 2:
+        return False
+    delta = _piece_delta(samples)
+    return math.isfinite(delta) and delta >= float(min_delta)
+
+
+
+def is_stable_reading(
+    readings: Iterable[float],
+    *,
+    eps: float = CALIBRATION_PROBE_STABLE_EPS,
+) -> bool:
+    """最后两次读数是否已稳定（差值 ≤ `eps`，即 CSS 过渡已跑完）。"""
+    values = [float(item) for item in readings if item is not None]
+    if len(values) < 2:
+        return False
+    return abs(values[-1] - values[-2]) <= float(eps)
+
+
+def stable_offset(
+    readings: Iterable[float],
+    *,
+    eps: float = CALIBRATION_PROBE_STABLE_EPS,
+) -> float | None:
+    """从轮询读数里取稳定值：已稳定就取最后两次的值，否则取最大值。
+
+    位移随拖动单调递增，因此「还在变」时最大值最接近终态；完全没读到则返回 None。
+    """
+    values = [float(item) for item in readings if item is not None]
+    if not values:
+        return None
+    if is_stable_reading(values, eps=eps):
+        return values[-1]
+    return max(values)
+
+
+def builtin_calibration(
+    *,
+    now: float | None = None,
+    mode: str = "",
+    samples: Iterable[tuple[float, float] | dict[str, float]] = (),
+) -> "DragCalibration":
+    """内置默认标定（`a=0.003555` / `b=0.075899`，2026-11 实测拟合）。
+
+    现场标定不可信时用它兜底：只放在内存里（不写 `drag_calibration.json`），避免把
+    错误曲线固化到磁盘上。
+
+    Args:
+        now: 注入的时间戳（便于测试）。
+        mode: 当前连接模式（`remote` / `local`）。
+        samples: 本次标定的原始采样点，仅用于日志/排查。
+
+    Returns:
+        带 `source="builtin"` 的 :class:`DragCalibration`。
+    """
+    recorded: list[dict[str, float]] = []
+    for item in samples:
+        if isinstance(item, dict):
+            try:
+                recorded.append(
+                    {
+                        "mouse_dx": float(item.get("mouse_dx")),
+                        "piece_dx": float(item.get("piece_dx")),
+                    }
+                )
+            except (TypeError, ValueError):
+                continue
+        else:
+            try:
+                recorded.append({"mouse_dx": float(item[0]), "piece_dx": float(item[1])})
+            except (TypeError, ValueError, IndexError):
+                continue
+    return DragCalibration(
+        a=BUILTIN_QUADRATIC_A,
+        b=BUILTIN_QUADRATIC_B,
+        measured_at=float(now if now is not None else time.time()),
+        samples=recorded,
+        source="builtin",
+        mode=str(mode or ""),
+    )
+
+
+def max_drag_distance(track_width: float, handle_width: float) -> float:
+    """滑块轨道的最大可用行程：`track_width - handle_width - 4`（通常 ≈256px）。"""
+    width = float(track_width or 0.0)
+    if not math.isfinite(width) or width <= 0:
+        width = SLIDER_TRACK_FALLBACK_WIDTH
+    handle = float(handle_width or 0.0)
+    if not math.isfinite(handle) or handle < 0:
+        handle = 0.0
+    return max(0.0, width - handle - DRAG_TRACK_EDGE_PADDING)
+
+
+def clamp_drag_distance(
+    mouse_dx: float,
+    *,
+    track_width: float,
+    handle_width: float,
+) -> tuple[float, bool]:
+    """把鼠标位移钳到轨道行程内。
+
+    Args:
+        mouse_dx: 反解出来的鼠标位移（px）。
+        track_width: `#aliyunCaptcha-sliding-body` 的宽度（读不到时传 0）。
+        handle_width: 滑块（handle）宽度。
+
+    Returns:
+        `(钳位后的位移, 是否发生了钳位)`。
+    """
+    value = max(0.0, float(mouse_dx or 0.0))
+    if not math.isfinite(value):
+        value = 0.0
+    limit = max_drag_distance(track_width, handle_width)
+    if value > limit:
+        return limit, True
+    return value, False
 
 
 def load_calibration(path: str | Path) -> "DragCalibration | None":
@@ -1177,6 +1377,21 @@ class BrowserUploadProxy:
         except (TypeError, ValueError):
             return None
 
+    async def _track_width(self, page: Any) -> float:
+        """滑块轨道（`#aliyunCaptcha-sliding-body`）的显示宽度；读不到用 300 兜底。"""
+        try:
+            payload = await page.evaluate(_TRACK_BOX_JS)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            try:
+                width = float(payload.get("width") or 0.0)
+            except (TypeError, ValueError):
+                width = 0.0
+            if math.isfinite(width) and width > 0:
+                return width
+        return SLIDER_TRACK_FALLBACK_WIDTH
+
     async def _puzzle_offset(self, page: Any) -> float | None:
         """拼图块相对背景图左边缘的位移（按住时读，显示坐标）。"""
         try:
@@ -1671,6 +1886,25 @@ class BrowserUploadProxy:
             if box is None:
                 log.warning("[BrowserUpload] captcha slider box unavailable")
                 return None
+            # 钳位：反解出的位移不能超过轨道实际行程（`track_width - handle_width - 4`，
+            # 通常 ≈256px）。映射标定跑偏时（例如退化曲线反解出 1142px）必须在这里
+            # 被拦住，否则拖动轨迹直接飞出轨道路径、验证码必失败。
+            track_width = await self._track_width(page)
+            raw_mouse_dx = mouse_dx
+            mouse_dx, clamped = clamp_drag_distance(
+                mouse_dx,
+                track_width=track_width,
+                handle_width=box["width"],
+            )
+            if clamped:
+                log.info(
+                    "[BrowserUpload] captcha drag distance clamped from %.2f to %.2f "
+                    "(track_width=%.2f handle_width=%.2f)",
+                    raw_mouse_dx,
+                    mouse_dx,
+                    track_width,
+                    box["width"],
+                )
             start_x = box["x"] + box["width"] / 2.0
             start_y = box["y"] + box["height"] / 2.0
             self._last_verify_code = ""
@@ -1679,10 +1913,13 @@ class BrowserUploadProxy:
             passed = not await self._slider_visible(page)
             verify = self._last_verify_code or ("T001" if passed else "F001")
             log.info(
-                "[BrowserUpload] captcha drag mapping=%s piece_dx=%.2f mouse_dx=%.2f verify=%s passed=%s",
+                "[BrowserUpload] captcha drag mapping=%s piece_dx=%.2f mouse_dx=%.2f "
+                "track_width=%.2f clamped=%s verify=%s passed=%s",
                 mapping.mode,
                 solution.dx_display,
                 mouse_dx,
+                track_width,
+                clamped,
                 verify,
                 passed,
             )
@@ -1747,23 +1984,31 @@ class BrowserUploadProxy:
         """两点标定：拖 40px / 80px，按住时读拼图位移，拟合二次曲线并落盘。
 
         标定本身会让当前拼图失败、触发新拼图，属预期成本。
+
+        采样可信度校验（`piece(80) - piece(40) >= 3px`）：两次读数一样说明读到了
+        过渡中间的陈旧值，此时拟合出来的是假线性曲线（`b≈0.13`），反解出的鼠标位移
+        会远超轨道长度。这种情况判标定无效 → **不落盘** → 回退内置实测常数
+        （`a=0.003555, b=0.075899`），并打 WARNING。
         """
         samples: list[tuple[float, float]] = []
         for target in CALIBRATION_PROBE_OFFSETS:
             offset = await self._probe_hold_offset(page, cdp, target)
             if offset is None or offset <= 0:
                 log.warning(
-                    "[BrowserUpload] drag calibration probe failed mouse_dx=%.1f offset=%s",
+                    "[BrowserUpload] drag calibration probe failed mouse_dx=%.1f offset=%s samples=%s",
                     target,
                     offset,
+                    samples,
                 )
-                return None
+                return self._use_builtin_calibration(samples, reason="probe failed")
             samples.append((float(target), float(offset)))
-            await self._sleep(self._rng.uniform(0.5, 0.9))
+            await self._sleep(self._rng.uniform(1.0, 1.6))
+        if not calibration_is_usable(samples):
+            return self._use_builtin_calibration(samples, reason="unstable")
         calibration = fit_calibration(samples, now=self._clock(), mode=self.mode)
         if calibration is None:
             log.warning("[BrowserUpload] drag calibration fit failed samples=%s", samples)
-            return None
+            return self._use_builtin_calibration(samples, reason="fit failed")
         self._calibration = calibration
         self._calibration_loaded = True
         try:
@@ -1780,9 +2025,48 @@ class BrowserUploadProxy:
         )
         return calibration
 
+    def _use_builtin_calibration(
+        self,
+        samples: list[tuple[float, float]],
+        *,
+        reason: str,
+    ) -> DragCalibration:
+        """标定不可信 → 用内置实测常数兜底（只放内存，**不落盘**）。
+
+        缓存在内存里是必须的：否则每一轮验证码都会重新标定，而每次标定都会拖废一张
+        拼图（2026-11 生产实测：3 轮各标定一次，直接烧掉整条 45s 硬超时）。
+        """
+        fallback = builtin_calibration(now=self._clock(), mode=self.mode, samples=samples)
+        self._calibration = fallback
+        self._calibration_loaded = True
+        log.warning(
+            "[BrowserUpload] drag calibration unstable, falling back to measured defaults "
+            "reason=%s a=%.6f b=%.6f samples=%s delta=%.2f min_delta=%.1f (not cached)",
+            reason,
+            fallback.a,
+            fallback.b,
+            samples,
+            _piece_delta(samples),
+            CALIBRATION_MIN_PIECE_DELTA,
+        )
+        return fallback
+
     async def _probe_hold_offset(self, page: Any, cdp: Any, mouse_dx: float) -> float | None:
-        """按住滑块拖 `mouse_dx`，等过渡结束后读拼图位移，再松开。"""
-        box = await self._slider_box(page)
+        """按住滑块拖 `mouse_dx`，等过渡稳定后读拼图位移，再松开。
+
+        拼图块的位移是 CSS 过渡动画：拖到位后立刻读会拿到**上一次**的陈旧值（2026-11
+        生产实测：拖 40px 和拖 80px 都读到 8.75，标定直接退化成假线性曲线）。因此这里
+        轮询采样 `CALIBRATION_PROBE_SAMPLES` 次（间隔 400ms，基础等待 ≥1.2s），取
+        「连续两次相同」的稳定值；一直在变就继续补采，最终仍不稳则取最大值
+        （位移随拖动单调递增，最大值最接近终态）。
+
+        按下之前还要等滑块回到静止位置：上一次标定失败后阿里会把滑块动画归位，动画
+        中途按下会「拖不动」（2026-11 实测第二点读到 0.0 就是这个原因）。
+
+        Returns:
+            稳定后的拼图位移（显示坐标 px）；读不到返回 None。
+        """
+        box = await self._wait_slider_settled(page)
         if box is None:
             return None
         start_x = box["x"] + box["width"] / 2.0
@@ -1793,12 +2077,44 @@ class BrowserUploadProxy:
             for index in range(1, steps + 1):
                 await self._sleep(0.016)
                 await self._cdp_move(cdp, start_x + mouse_dx * index / steps, start_y)
-            # 必须等 CSS 过渡结束再读，否则读到的是动画中间值（历史上被这个坑过）。
-            await self._sleep(0.6)
-            offset = await self._puzzle_offset(page)
+            readings = await self._sample_puzzle_offset(page)
         finally:
             await self._cdp_release(cdp, start_x + mouse_dx, start_y)
-        return offset
+        if not readings:
+            return None
+        return stable_offset(readings)
+
+    async def _wait_slider_settled(self, page: Any) -> dict[str, float] | None:
+        """等滑块位置稳定（连续两次读数相同）再返回它的 box。
+
+        上一次拖动结束后滑块会动画归位，动画中途按下 CDP 事件会被丢掉，拼图完全不动。
+        """
+        box: dict[str, float] | None = None
+        for _ in range(CALIBRATION_PROBE_SAMPLES):
+            await self._sleep(CALIBRATION_PROBE_INTERVAL_SECONDS)
+            current = await self._slider_box(page)
+            if current is not None and box is not None:
+                if abs(current["x"] - box["x"]) <= CALIBRATION_PROBE_STABLE_EPS:
+                    return current
+            box = current
+        return box
+
+    async def _sample_puzzle_offset(self, page: Any) -> list[float]:
+        """轮询读拼图位移，直到读数稳定或采够次数（总等待 ≥1.2s）。"""
+        readings: list[float] = []
+        total = CALIBRATION_PROBE_SAMPLES + CALIBRATION_PROBE_EXTRA_SAMPLES
+        for index in range(total):
+            await self._sleep(CALIBRATION_PROBE_INTERVAL_SECONDS)
+            offset = await self._puzzle_offset(page)
+            if offset is None:
+                # 读不到就继续等（拼图可能还在入场动画里）
+                continue
+            readings.append(float(offset))
+            if len(readings) >= CALIBRATION_PROBE_SAMPLES and is_stable_reading(readings):
+                break
+            if index + 1 >= total:
+                break
+        return readings
 
     # -- CDP 拖动 -----------------------------------------------------------
 
