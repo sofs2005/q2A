@@ -245,12 +245,13 @@ qwen2API 同时提供 OpenAI Videos 风格的视频生成能力（底层走千�
 ### 媒体库接口（后台）
 
 图片与视频生成物统一进「媒体库」，需管理凭证（`Authorization: Bearer <ADMIN_KEY 或任一 API Key>`）。
-控制台侧对应页面是 **`/media`**（侧栏「生成工作台 → 媒体库」）：按类型筛选、按提示词搜索、
-网格预览（图片走 `?w=` 缩略图）、点开全屏查看、单条或批量删除。
+控制台侧对应页面是 **`/media`**（侧栏「生成工作台 → 媒体库」）：按类型 / 生成时间 / 体积 / 排序筛选，
+按提示词搜索，网格预览（图片走 `?w=` 缩略图），点开全屏查看，支持**全选（含未加载的跨页条目）/ 反选 /
+清空选择**后批量删除，也可单条删除。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/api/admin/media` | 列表。查询参数：`kind`（`all`/`image`/`video`）、`q`（对 prompt / 文件名 / 比例做大小写不敏感搜索）、`limit`（1..100，默认 24）、`offset`。返回 `items`/`total`/`offset`/`limit`/`has_more`/`stats`（`image`/`video`/`bytes` 基于 kind 过滤前的全量） |
+| `GET` | `/api/admin/media` | 列表。查询参数：`kind`（`all`/`image`/`video`）、`q`（对 prompt / 文件名 / 比例做大小写不敏感搜索）、`since_days`（只返回最近 N 天，`0`=不限）、`min_size`（体积下限，字节，`0`=不限）、`sort`（`newest` / `oldest` / `largest`）、`limit`（1..100，默认 24）、`offset`。返回 `items`/`total`/`offset`/`limit`/`has_more`/`stats`（`image`/`video`/`bytes`；**只忽略类型维度**，其它筛选照常生效） |
 | `DELETE` | `/api/admin/media/{file_id}` | 删除单个生成物（元数据 + 磁盘文件）；不存在或非生成物返回 404 |
 | `POST` | `/api/admin/media/delete` | 批量删除，body `{"ids": [...]}`，返回 `deleted` 数量与 `ids`/`missing` 两组 id |
 

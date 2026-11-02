@@ -233,6 +233,128 @@ class MediaLibraryHttpTests(unittest.TestCase):
         self.assertIn(wrong.status_code, (401, 403))
 
     # ------------------------------------------------------------------
+    # 新增筛选维度：时间窗 / 体积下限 / 排序
+    # ------------------------------------------------------------------
+
+    def _backdate(self, meta: dict, days: float) -> None:
+        """把某条元数据的 created_at 拨到 N 天前（模拟历史生成物）。"""
+        self.store._metadata[meta["id"]]["created_at"] = time.time() - days * 86400
+
+    def test_list_filters_by_time_window(self) -> None:
+        self._backdate(self.image_a, 10)   # 10 天前
+        self._backdate(self.image_b, 100)  # 100 天前
+        # video 保持「刚刚」
+
+        today = self.client.get(
+            "/api/admin/media", params={"since_days": 1}, headers=self.headers
+        ).json()
+        self.assertEqual([item["id"] for item in today["items"]], [self.video["id"]])
+        # stats 同样只统计时间窗内的数据（除类型维度外都生效）
+        self.assertEqual(today["stats"], {"image": 0, "video": 1, "bytes": len(VIDEO_BYTES)})
+
+        week = self.client.get(
+            "/api/admin/media", params={"since_days": 7}, headers=self.headers
+        ).json()
+        self.assertEqual(week["total"], 1)
+
+        month = self.client.get(
+            "/api/admin/media", params={"since_days": 30}, headers=self.headers
+        ).json()
+        self.assertEqual({item["id"] for item in month["items"]}, {self.video["id"], self.image_a["id"]})
+
+        all_time = self.client.get(
+            "/api/admin/media", params={"since_days": 0}, headers=self.headers
+        ).json()
+        self.assertEqual(all_time["total"], 3)
+
+        # 负数按 0（不限）处理，不能把结果清空
+        negative = self.client.get(
+            "/api/admin/media", params={"since_days": -5}, headers=self.headers
+        ).json()
+        self.assertEqual(negative["total"], 3)
+
+    def test_list_filters_by_min_size(self) -> None:
+        # 体积：image_a=5B < image_b=6B < video=9B
+        big = self.client.get(
+            "/api/admin/media", params={"min_size": 6}, headers=self.headers
+        ).json()
+        self.assertEqual({item["id"] for item in big["items"]}, {self.image_b["id"], self.video["id"]})
+        self.assertEqual(big["total"], 2)
+        self.assertEqual(big["stats"]["bytes"], len(IMAGE_B_BYTES) + len(VIDEO_BYTES))
+
+        huge = self.client.get(
+            "/api/admin/media", params={"min_size": 10_000}, headers=self.headers
+        ).json()
+        self.assertEqual(huge["items"], [])
+        self.assertEqual(huge["stats"], {"image": 0, "video": 0, "bytes": 0})
+
+        # 0 / 负数 = 不限
+        for value in (0, -1):
+            with self.subTest(min_size=value):
+                payload = self.client.get(
+                    "/api/admin/media", params={"min_size": value}, headers=self.headers
+                ).json()
+                self.assertEqual(payload["total"], 3)
+
+    def test_list_sort_modes(self) -> None:
+        # 造出明确的时间序：image_a 最旧 → video 最新
+        self._backdate(self.image_a, 3)
+        self._backdate(self.image_b, 2)
+        self._backdate(self.video, 1)
+
+        newest = self.client.get(
+            "/api/admin/media", params={"sort": "newest"}, headers=self.headers
+        ).json()
+        self.assertEqual(
+            [item["id"] for item in newest["items"]],
+            [self.video["id"], self.image_b["id"], self.image_a["id"]],
+        )
+
+        oldest = self.client.get(
+            "/api/admin/media", params={"sort": "oldest"}, headers=self.headers
+        ).json()
+        self.assertEqual(
+            [item["id"] for item in oldest["items"]],
+            [self.image_a["id"], self.image_b["id"], self.video["id"]],
+        )
+
+        largest = self.client.get(
+            "/api/admin/media", params={"sort": "largest"}, headers=self.headers
+        ).json()
+        self.assertEqual(
+            [item["id"] for item in largest["items"]],
+            [self.video["id"], self.image_b["id"], self.image_a["id"]],
+        )
+
+        # 未知排序值退回 newest，而不是报错或返回空
+        unknown = self.client.get(
+            "/api/admin/media", params={"sort": "banana"}, headers=self.headers
+        ).json()
+        self.assertEqual([item["id"] for item in unknown["items"]],
+                         [item["id"] for item in newest["items"]])
+
+    def test_list_filters_combine_with_kind_and_query(self) -> None:
+        self._backdate(self.image_b, 30)
+        payload = self.client.get(
+            "/api/admin/media",
+            params={"kind": "image", "q": "cat", "since_days": 7, "min_size": 1},
+            headers=self.headers,
+        ).json()
+        self.assertEqual([item["id"] for item in payload["items"]], [self.image_a["id"]])
+        # stats 只忽略类型维度：关键字/时间窗照样生效（video 不匹配 "cat"）
+        self.assertEqual(payload["stats"]["video"], 0)
+        self.assertEqual(payload["stats"]["image"], 1)
+
+        # 同一组条件放宽关键字后，video 回到 stats（证明类型维度确实被忽略）
+        wider = self.client.get(
+            "/api/admin/media",
+            params={"kind": "image", "since_days": 7},
+            headers=self.headers,
+        ).json()
+        self.assertEqual(wider["stats"]["video"], 1)
+        self.assertEqual(wider["stats"]["image"], 1)
+
+    # ------------------------------------------------------------------
     # 删除
     # ------------------------------------------------------------------
 

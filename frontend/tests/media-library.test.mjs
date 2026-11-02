@@ -52,3 +52,29 @@ test("media library page lists and deletes through the admin API", () => {
   assert.doesNotMatch(source, /window\.confirm/)
   assert.match(source, /role="dialog"/)
 })
+
+test("media library offers select-all, invert and clear selection", () => {
+  const source = read("pages/MediaLibraryPage.tsx")
+  for (const label of ["全选", "反选", "清空选择", "删除所选"]) {
+    assert.ok(source.includes(label), `expected a "${label}" control`)
+  }
+  // 全选要覆盖「还没加载出来」的条目：翻页拉 id，并且有页数上限兜底
+  assert.match(source, /SELECT_ALL_PAGE_SIZE/)
+  assert.match(source, /SELECT_ALL_MAX_PAGES/)
+  assert.match(source, /fetchAllIds/)
+  assert.match(source, /hasUnloaded/)
+})
+
+test("media library exposes extra filters wired to the backend params", () => {
+  const source = read("pages/MediaLibraryPage.tsx")
+  for (const param of ["since_days", "min_size", "sort"]) {
+    assert.ok(source.includes(param), `expected the ${param} query param`)
+  }
+  for (const label of ["生成时间", "体积", "排序", "重置筛选"]) {
+    assert.ok(source.includes(label), `expected a "${label}" filter`)
+  }
+  // 排序取值必须与后端约定一致
+  for (const sort of ["newest", "oldest", "largest"]) {
+    assert.ok(source.includes(`"${sort}"`), `expected sort mode ${sort}`)
+  }
+})

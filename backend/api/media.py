@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -48,6 +49,11 @@ _CONTENT_URL_PREFIX = {
 _DEFAULT_LIMIT = 24
 _MIN_LIMIT = 1
 _MAX_LIMIT = 100
+
+# 排序取值
+_SORT_NEWEST = "newest"
+_SORT_OLDEST = "oldest"
+_SORT_LARGEST = "largest"
 
 
 class MediaDeleteBatchRequest(BaseModel):
@@ -120,7 +126,11 @@ def _build_item(meta: dict[str, Any], kind: str) -> dict[str, Any]:
 
 
 def _build_stats(all_media: list[dict[str, Any]]) -> dict[str, Any]:
-    """统计信息：基于 kind 过滤前的全量生成物。"""
+    """统计信息：基于 kind 过滤前的集合（其它筛选条件已生效）。
+
+    这样「图片 x / 视频 y / 占用 z」始终描述用户当前看到的这批数据；
+    只有类型维度不参与统计，否则选了「图片」就永远看不到视频数量。
+    """
     image_count = 0
     video_count = 0
     total_bytes = 0
@@ -132,6 +142,38 @@ def _build_stats(all_media: list[dict[str, Any]]) -> dict[str, Any]:
             video_count += 1
         total_bytes += int(meta.get("size") or 0)
     return {"image": image_count, "video": video_count, "bytes": total_bytes}
+
+
+def _normalize_sort(value: str | None) -> str:
+    """排序归一：newest（默认）/ oldest / largest，未知值退回 newest。"""
+    candidate = str(value or "").strip().lower()
+    if candidate in {_SORT_OLDEST, _SORT_LARGEST}:
+        return candidate
+    return _SORT_NEWEST
+
+
+def _passes_filters(meta: dict[str, Any], *, needle: str, cutoff: float | None, min_size: int) -> bool:
+    """与 kind 无关的筛选：关键字 / 时间窗 / 体积下限。
+
+    统一放在这里，stats 与 items 共用同一套判断，避免两边口径漂移。
+    """
+    if not _matches_query(meta, needle):
+        return False
+    if cutoff is not None and float(meta.get("created_at") or 0) < cutoff:
+        return False
+    if min_size > 0 and int(meta.get("size") or 0) < min_size:
+        return False
+    return True
+
+
+def _sort_items(items: list[dict[str, Any]], sort: str) -> None:
+    """就地排序（列表项已带 created_at / size）。"""
+    if sort == _SORT_OLDEST:
+        items.sort(key=lambda item: item.get("created_at") or 0)
+    elif sort == _SORT_LARGEST:
+        items.sort(key=lambda item: item.get("size") or 0, reverse=True)
+    else:
+        items.sort(key=lambda item: item.get("created_at") or 0, reverse=True)
 
 
 def _get_file_store(request: Request):
@@ -146,8 +188,15 @@ async def list_media(
     q: str = Query(""),
     limit: int = Query(_DEFAULT_LIMIT),
     offset: int = Query(0),
+    since_days: int = Query(0),
+    min_size: int = Query(0),
+    sort: str = Query(_SORT_NEWEST),
 ):
-    """列出媒体库条目（图片/视频），支持关键字搜索与分页。"""
+    """列出媒体库条目（图片/视频）。
+
+    筛选维度：类型 kind、关键字 q、时间窗 since_days（天，0=不限）、
+    体积下限 min_size（字节，0=不限）；排序 sort = newest / oldest / largest。
+    """
     file_store = _get_file_store(request)
     if file_store is None:
         raise HTTPException(status_code=503, detail="File store unavailable")
@@ -160,20 +209,30 @@ async def list_media(
     raw_offset = 0 if offset is None else int(offset)
     safe_offset = max(raw_offset, 0)
 
-    # 全量（kind 过滤前）用于 stats
+    safe_since = max(int(since_days or 0), 0)
+    cutoff = time.time() - safe_since * 86400 if safe_since > 0 else None
+    safe_min_size = max(int(min_size or 0), 0)
+    normalized_sort = _normalize_sort(sort)
+
     all_media = await file_store.list_metadata(purposes=list(MEDIA_PURPOSES))
-    stats = _build_stats(all_media)
+    # 先过与类型无关的筛选：stats 用这批（忽略 kind），items 再叠类型条件
+    base = [
+        meta
+        for meta in all_media
+        if _passes_filters(meta, needle=needle, cutoff=cutoff, min_size=safe_min_size)
+    ]
+    stats = _build_stats(base)
 
     items: list[dict[str, Any]] = []
-    for meta in all_media:
+    for meta in base:
         item_kind = _kind_of(meta)
         if item_kind is None:
             continue
         if normalized_kind != _KIND_ALL and item_kind != normalized_kind:
             continue
-        if not _matches_query(meta, needle):
-            continue
         items.append(_build_item(meta, item_kind))
+
+    _sort_items(items, normalized_sort)
 
     total = len(items)
     page = items[safe_offset:safe_offset + safe_limit]
