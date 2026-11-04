@@ -430,11 +430,13 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Human (CURRENT TASK - TOP PRIORITY): 现在检查当前项目为什么工具不可见", prompt)
         self.assertNotIn(f"Human (CURRENT TASK - TOP PRIORITY): {SYSTEM_CONTEXT_PROMPT_NOTE}", prompt)
 
-    async def test_generated_context_fallback_preserves_full_history_summary(self) -> None:
-        """`mode="file"` + 上传失败：兜底注入必须是**完整历史正文**，不截断。
+    async def test_generated_context_fallback_truncates_full_history_summary(self) -> None:
+        """`mode="file"` + 上传失败：兜底注入按字符预算**截掉最早的历史**。
 
         历史构造 5 万字符（远超 CONTEXT_FORCE_FILE_MAX_CHARS=10000 → plan.mode
-        必为 "file"），上传撞 WAF 后断言最终 payload 里拿到全部 5 万字符。
+        必为 "file"）。上游对超大内联 prompt 直接返回 x5sec punish 页，所以兜底
+        注入必须压到 `ATTACHMENT_INLINE_TEXT_MAX_CHARS`（这里取默认 8000）以内：
+        丢的是最早那条超长历史，最近的尾巴（tail_marker / latest task）完整保留。
         """
 
         async def save_text(filename, text, content_type, purpose):
@@ -498,9 +500,13 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["attachment_fallback"])
         self.assertEqual(result["context_mode"], "inline")
         joined = "\n".join(str(message.get("content", "")) for message in result["payload"]["messages"])
+        # 最近的尾巴保留（最新用户消息永远不截断）。
         self.assertIn(tail_marker, joined)
-        # 完整历史：781 行一行不少（不是摘要、不是截断）。
-        self.assertGreaterEqual(joined.count(history_line), 781)
+        self.assertIn("latest task", joined)
+        # 最早那条 5 万字符历史被**整条**丢弃，并带省略标记。
+        self.assertNotIn("## Message 1 [user]", joined)
+        self.assertEqual(joined.count(history_line), 0)
+        self.assertIn("已省略前", joined)
 
     async def test_generated_context_ignores_existing_affinity_when_selecting_upload_account(self) -> None:
         async def save_text(filename, text, content_type, purpose):

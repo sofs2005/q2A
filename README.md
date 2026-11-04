@@ -337,6 +337,7 @@ Anthropic Messages（`POST /v1/messages`）：
 | `INLINE_ATTACHMENT_REMOTE_FETCH` | `false` | 是否允许下载远程 http(s) 附件（**默认关闭**，见下方 SSRF 说明）。 |
 | `ATTACHMENT_INLINE_TEXT_ENABLED` | `true` | 纯文本类附件（txt/md/csv/json/…）由网关本地解码后直接注入 prompt，**零上游请求**（不调 `getstsToken` / 不 PUT / 不 parse）。 |
 | `ATTACHMENT_INLINE_TEXT_MAX_BYTES` | `131072` | 单个文本附件注入的字节上限（128KB）；超过即截断并标注 `…（已截断，原文件 N KB）`。 |
+| `ATTACHMENT_INLINE_TEXT_MAX_CHARS` | `8000` | 内联上下文**总字符预算**。上游对超大内联 prompt 直接返回 x5sec punish 页（8k 通过 / 12k 必挂），历史 blob 超预算时按整条消息从**最早**丢弃并标注 `…（已省略前 K 条历史消息，原始 N 字符，保留最近 M 字符）`；`<=0` 表示不限制。 |
 | `DOCUMENT_PARSE_MAX_FAILURES` | `2` | `files/parse` 连续失败多少次后熔断（撞 WAF 则一次即熔断）。 |
 | `DOCUMENT_PARSE_COOLDOWN_SECONDS` | `600` | 熔断冷却时长：期内文档类附件**直接跳过「上传 + parse」**走文本降级。 |
 | `MULTIMODAL_STRICT` | `true` | 模型不支持该模态时是否直接 400；`false` 时只丢弃并告警。 |
@@ -361,6 +362,27 @@ Anthropic Messages（`POST /v1/messages`）：
 - 注入的字符数按 `count_tokens` 计入 `context_attachment_tokens`；
 - 超过 `ATTACHMENT_INLINE_TEXT_MAX_BYTES` 则截断 + 标注；前 4KB 有 NUL 字节
   （二进制 sniff）则不当文本，回落到原上传路径。
+
+#### 内联体积预算（`ATTACHMENT_INLINE_TEXT_MAX_CHARS`）
+
+上游对大段内联 prompt **不是变慢，而是直接拒绝**：实测短文本 200 / 6.5s、6k 200 /
+10.3s、8k 200 / 12.2s，而 12k、15k 直接返回 x5sec punish 页 + idle timeout ×3 → 500。
+`files/parse` 被 WAF 拦、parse 熔断打开后，兜底路径会把**全文历史**内联进 prompt，
+正好撞上这条线，所以内联正文统一受 `ATTACHMENT_INLINE_TEXT_MAX_CHARS`（默认 8000）约束：
+
+- **历史 blob**（`## Message N [role]` 序列，最早在前、最新在后）超预算 → 按**整条
+  消息**从**最早**开始丢弃（绝不按字符位置切，切不出半个 `## Message N` 头），
+  保留的块原样拼接、不重编号，最前面加一行
+  `…（已省略前 K 条历史消息，原始 N 字符，保留最近 M 字符）`，并打日志
+  `[ContextAttachment] inline fallback truncated original=… kept=… dropped_messages=…`；
+- **单条消息自身超预算**（例如一条 20k 的工具输出）→ 该条保留**开头**（分块头完整）
+  并在结尾标注 `…（已截断，原消息 N 字符）`；
+- **附件文本块**超预算 → 每块保留**开头**（文件开头通常更关键），结尾标注
+  `…（已截断，原文件 N 字符）`；
+- 优先级：**最新用户消息（永不截断） > 用户附件文本 > 历史 blob**（最新用户消息丢
+  了就答非所问，所以先给它留预算，并用「检查 + 兜底补回」保证它 100% 在场）；
+- 预算内 → 行为完全不变（逐字节相同、不加任何标记）；配 `0` / 负数 → 不限制（旧行为，
+  打一次 WARNING）。
 
 #### 文档 parse 熔断（`DOCUMENT_PARSE_*`）
 

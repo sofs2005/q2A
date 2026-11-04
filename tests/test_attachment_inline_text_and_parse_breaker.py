@@ -43,6 +43,7 @@ def _settings(**overrides):
         INLINE_ATTACHMENT_MAX_BYTES=10 * 1024 * 1024,
         ATTACHMENT_INLINE_TEXT_ENABLED=True,
         ATTACHMENT_INLINE_TEXT_MAX_BYTES=131072,
+        ATTACHMENT_INLINE_TEXT_MAX_CHARS=8000,
         DOCUMENT_PARSE_MAX_FAILURES=2,
         DOCUMENT_PARSE_COOLDOWN_SECONDS=600,
         CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS=5,
@@ -412,7 +413,11 @@ class ParseCooldownGateTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FullHistoryFallbackTests(unittest.IsolatedAsyncioTestCase):
-    """生成文件上传失败 → 兜底注入必须保留**完整**历史正文（不截断）。"""
+    """生成文件上传失败 → 兜底内联必须**压到字符预算内**（上游 12k 必拒）。
+
+    完整历史 50k 字符直接内联会被上游判定为 x5sec punish → 500，所以兜底注入
+    只保留**最近**的若干条消息（丢最早的那条超长历史），并带上省略标记。
+    """
 
     def setUp(self) -> None:
         reset_document_parse_breaker()
@@ -420,7 +425,7 @@ class FullHistoryFallbackTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         reset_document_parse_breaker()
 
-    async def test_fallback_injects_full_50k_history(self) -> None:
+    async def test_fallback_truncates_50k_history_to_budget(self) -> None:
         settings = _settings()
         history_line = "0123456789abcdef" * 4  # 64 字符一行
         history = "\n".join(history_line for _ in range(781))  # ≈50_000 字符
@@ -453,16 +458,20 @@ class FullHistoryFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["attachment_fallback"])
         self.assertEqual(result["context_mode"], "inline")
         joined = "\n".join(str(message.get("content", "")) for message in result["payload"]["messages"])
+        # 最新内容保留（最新用户消息 + 紧随其后的助手标记）。
         self.assertIn("TAIL_MARKER_KEEP_ME", joined)
         self.assertIn("latest task", joined)
-        # 完整历史：50k 字符一行不少（兜底注入不截断）。
-        self.assertGreaterEqual(joined.count(history_line), 781)
+        # 最早的超长历史被整条丢弃，不再是「50k 一行不少」。
+        self.assertNotIn("## Message 1 [user]", joined)
+        self.assertNotIn(history_line, joined)
+        self.assertIn("已省略前", joined)
         fallback_lines = [
             record.getMessage() for record in logs.records if "inline fallback chars=" in record.getMessage()
         ]
         self.assertEqual(len(fallback_lines), 1)
         chars = int(fallback_lines[0].split("inline fallback chars=")[1].split()[0])
-        self.assertGreaterEqual(chars, 50_000)
+        self.assertLessEqual(chars, 8000)
+        self.assertLess(chars, 50_000)
 
 
 if __name__ == "__main__":

@@ -169,6 +169,12 @@ class Settings(BaseSettings):
     ATTACHMENT_INLINE_TEXT_ENABLED: bool = os.getenv("ATTACHMENT_INLINE_TEXT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     # 单文件注入字节上限（默认 128KB）。超过则截断并在结尾标注「已截断，原文件 N KB」。
     ATTACHMENT_INLINE_TEXT_MAX_BYTES: int = int(os.getenv("ATTACHMENT_INLINE_TEXT_MAX_BYTES", 131072))
+    # 内联上下文**总字符预算**（默认 8000 字符）。与上面的「单文件字节上限」是两回事：
+    # 上游对超大内联 prompt 不是「变慢」而是**直接拒绝**（x5sec punish 页 + idle
+    # timeout → 500），实测阈值在 8k~12k 字符之间（12k 必挂、8k 稳过）。历史 blob /
+    # 附件正文合计超预算时按整条消息从**最早**开始丢弃（最新的在最后面），绝不按
+    # 字符位置切。<=0 表示不限制（保持旧行为，启动后首次使用打一次 WARNING）。
+    ATTACHMENT_INLINE_TEXT_MAX_CHARS: int = int(os.getenv("ATTACHMENT_INLINE_TEXT_MAX_CHARS", 8000))
     # ---- 文档 parse 熔断（`/api/v2/files/parse` 进程级冷却）----
     # 连续失败 `DOCUMENT_PARSE_MAX_FAILURES` 次（或直接撞 WAF）后，接下来
     # `DOCUMENT_PARSE_COOLDOWN_SECONDS` 秒内**跳过「上传 + parse」**直接走文本降级，

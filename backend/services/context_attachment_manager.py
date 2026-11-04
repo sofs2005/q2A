@@ -4,6 +4,7 @@ import asyncio
 import codecs
 import hashlib
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -276,6 +277,26 @@ _TEXT_DECODE_ORDER = ("utf-8", "utf-8-sig", "gb18030", "latin-1")
 _BINARY_SNIFF_BYTES = 4096
 #: 单文件注入字节上限默认值（128KB）。
 _DEFAULT_INLINE_TEXT_MAX_BYTES = 128 * 1024
+#: 内联上下文总字符预算默认值（8K 字符）。上游对超大内联 prompt 直接返回 x5sec
+#: punish 页（实测 8k 通过 / 12k 必挂），所以内联正文必须有体积上限。
+_DEFAULT_INLINE_TEXT_MAX_CHARS = 8000
+
+#: 历史 blob 里每条消息的分块头（`## Message 12 [user]`），行首对齐。
+#: 只认「行首 + 数字序号 + [role]」的形式，避免把正文里出现的 `## Message` 误当分块头。
+_HISTORY_BLOCK_HEADER_RE = re.compile(r"^## Message \d+ \[[^\]]*\]\s*$", re.MULTILINE)
+#: 判断某一行是否「像一个分块头」（用于把 header 与正文拆开）。
+_HISTORY_BLOCK_HEADER_PREFIX_RE = re.compile(r"^## Message \d+ \[")
+#: 历史 blob 被按整条丢弃时的提示行（放在最前面）。
+_HISTORY_TRUNCATION_NOTE = "…（已省略前 {dropped} 条历史消息，原始 {original} 字符，保留最近 {kept} 字符）"
+#: 只有一条消息且它本身就超预算时（退化成头部截断）的提示行。
+_HISTORY_HEAD_TRUNCATION_NOTE = "…（已截断，原始 {original} 字符，保留开头 {kept} 字符）"
+#: 单条消息/单个注入块自身被截断时，追加在**结尾**的提示（保留的是开头）。
+_BLOCK_TRUNCATION_NOTE = "…（已截断，原消息 {original} 字符）"
+#: 纯文本附件注入块被字符预算截断时的提示（保留的是开头，与文件开头更关键一致）。
+_FILE_TRUNCATION_NOTE = "…（已截断，原文件 {original} 字符）"
+
+#: 「预算 <= 0 → 不限制」的 WARNING 只打一次，避免每个请求刷屏。
+_inline_budget_warned = False
 
 
 def _is_inline_text_attachment(attachment: Any) -> bool:
@@ -478,15 +499,247 @@ async def _collect_inline_text_blocks(
     return blocks, tokens, leftovers
 
 
-def _inject_inline_text_blocks(payload: dict[str, Any], blocks: list[str]) -> dict[str, Any]:
+def _inline_char_budget(settings_obj: Any) -> int | None:
+    """读取内联上下文总字符预算。
+
+    Returns:
+        正数预算；`None` 表示不限制（配置为 0 / 负数，或读不到时按默认值处理）。
+    """
+    global _inline_budget_warned
+    raw = getattr(settings_obj, "ATTACHMENT_INLINE_TEXT_MAX_CHARS", _DEFAULT_INLINE_TEXT_MAX_CHARS)
+    try:
+        budget = int(raw)
+    except (TypeError, ValueError):
+        budget = _DEFAULT_INLINE_TEXT_MAX_CHARS
+    if budget <= 0:
+        if not _inline_budget_warned:
+            _inline_budget_warned = True
+            log.warning(
+                "[ContextAttachment] ATTACHMENT_INLINE_TEXT_MAX_CHARS=%s <= 0 → 内联上下文不限制体积"
+                "（旧行为；上游对超大内联 prompt 会返回 x5sec punish 页）",
+                raw,
+            )
+        return None
+    return budget
+
+
+def _remaining_budget(budget: int | None, used: int) -> int | None:
+    """扣掉已占用字符后的剩余预算；预算不限制时继续返回 `None`。"""
+    if budget is None:
+        return None
+    return max(0, budget - max(0, int(used)))
+
+
+def _latest_user_text(messages: list[Any] | None) -> str:
+    """取最后一条 user 消息的纯文本（截断预算要给它让路，永不截断）。"""
+    for message in reversed(list(messages or [])):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        text = _text_from_content(message.get("content", ""))
+        if text:
+            return text
+    return ""
+
+
+def _latest_user_len(payload: dict[str, Any]) -> int:
+    """payload 里最后一条 user 消息的字符数（预算要给它让路，附件不能把它挤掉）。"""
+    return len(_latest_user_text(payload.get("messages")))
+
+
+def _ensure_latest_user_intact(
+    messages: list[Any],
+    latest_text: str,
+    *,
+    session_key: str,
+) -> list[Any]:
+    """不变式：最新的用户消息**永远完整**保留在 payload 里。
+
+    截断只允许动「历史 blob」和「附件正文」，最新用户消息是真正的问题本身，丢了
+    就等于答非所问。这里用「检查 + 兜底补回」而不是 `assert`：真出现回归时宁可
+    多带一条消息，也不能让整条请求 500（500 正是本次要消灭的故障形态）。
+    """
+    if not latest_text:
+        return messages
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if latest_text in _text_from_content(message.get("content", "")):
+            return messages
+    log.error(
+        "[ContextAttachment] latest user message lost after inline truncation; re-appending session_key=%s chars=%s",
+        session_key,
+        len(latest_text),
+    )
+    return [*messages, {"role": "user", "content": latest_text}]
+
+
+def _split_history_blocks(text: str) -> list[str]:
+    """把历史 blob 按 `## Message N [role]` **整条**切块。
+
+    切出来的块首尾相接（`"".join(blocks) == text`），所以拼接后逐字节等于原文，
+    不做任何重编号 / 改内容。没有分块头时整体当作一块返回。
+    """
+    starts = [match.start() for match in _HISTORY_BLOCK_HEADER_RE.finditer(text)]
+    if not starts:
+        return [text]
+    bounds: list[int] = [0]
+    bounds.extend(start for start in starts if start > 0)
+    blocks: list[str] = []
+    for index, start in enumerate(bounds):
+        end = bounds[index + 1] if index + 1 < len(bounds) else len(text)
+        blocks.append(text[start:end])
+    return blocks
+
+
+def _split_block_header(block: str) -> tuple[str, str]:
+    """拆出「分块头」与「正文」；不像分块头时返回 `("", block)`。"""
+    newline = block.find("\n")
+    if newline < 0:
+        return "", block
+    header = block[: newline + 1]
+    if not _HISTORY_BLOCK_HEADER_PREFIX_RE.match(header):
+        return "", block
+    return header, block[newline + 1 :]
+
+
+def _history_note(dropped: int, original: int, kept: int) -> str:
+    """历史 blob 的截断提示行。"""
+    if dropped > 0:
+        return _HISTORY_TRUNCATION_NOTE.format(dropped=dropped, original=original, kept=kept)
+    return _HISTORY_HEAD_TRUNCATION_NOTE.format(original=original, kept=kept)
+
+
+def _truncate_block_head(block: str, *, budget: int, original: int) -> str:
+    """单块超预算：保留**开头**（分块头完整）+ 结尾提示。
+
+    分块头（`## Message N [role]`）一定整体保留：宁可略微超出预算，也绝不输出半
+    个分块头 —— 半个头会让下游分块解析出错。
+    """
+    header, body = _split_block_header(block)
+    marker = _BLOCK_TRUNCATION_NOTE.format(original=original)
+    available = int(budget) - len(header) - len(marker) - 1
+    if available <= 0:
+        return f"{header}{marker}"
+    return f"{header}{body[:available]}\n{marker}"
+
+
+def _truncate_history_blob(text: str, budget: int | None) -> tuple[str, int, int, int]:
+    """把历史序列化文本压到字符预算内（**最新内容在最后面，所以截最早的部分**）。
+
+    策略：按 `## Message N [role]` 整条切块 → 从**头部**逐条丢弃，直到
+    「保留正文 + 提示行」≤ 预算；只丢整条，不做字符位置切片。最新那几条消息
+    因此在结果里完整保留。
+
+    Args:
+        text: 完整历史序列化文本（`plan.summary_text`）。
+        budget: 字符预算上限；`None` 表示不限制（配置 0 / 负数时由
+            `_inline_char_budget` 归一成 `None`）。`0` 是「一点都放不下」的硬上限，
+            此时只保留提示行。
+
+    Returns:
+        `(结果文本, 原始字符数, 保留字符数, 丢弃的消息条数)`。未截断时结果与入参
+        逐字节相同，且不加任何提示行。
+    """
+    original = len(text or "")
+    if not text or budget is None or original <= int(budget):
+        return text, original, original, 0
+
+    blocks = _split_history_blocks(text)
+    dropped = 0
+    while True:
+        kept_text = "".join(blocks)
+        note = _history_note(dropped, original, len(kept_text))
+        if len(kept_text) + len(note) + 1 <= int(budget) or len(blocks) <= 1:
+            break
+        blocks.pop(0)
+        dropped += 1
+
+    kept_text = "".join(blocks)
+    note = _history_note(dropped, original, len(kept_text))
+    if len(kept_text) + len(note) + 1 > int(budget):
+        # 只剩一条（或首块）仍然超预算 → 退化成「保留开头」的头部截断。
+        # 内层预算要先扣掉提示行本身（-4 是提示行里数字位数变化的安全余量）。
+        inner_budget = max(0, int(budget) - len(note) - 1 - 4)
+        kept_text = _truncate_block_head(kept_text, budget=inner_budget, original=original)
+        note = _history_note(dropped, original, len(kept_text))
+    return f"{note}\n{kept_text}", original, len(kept_text), dropped
+
+
+def _truncate_inline_text_blocks(
+    blocks: list[str],
+    budget: int | None,
+) -> tuple[list[str], int]:
+    """把多个注入块的总字符压到预算内（**保留每块开头**，文件开头通常更关键）。
+
+    预算按「剩余块数」均分，保证多个附件都还能被看到一部分，而不是前面的大文件
+    把预算吃光、后面的附件彻底消失。
+
+    Args:
+        blocks: 注入块列表（`[附件: name]\\n正文`）。
+        budget: 字符预算（含块间 `\\n\\n` 分隔符）；`None` 表示不限制。
+
+    Returns:
+        `(块列表, 被截断的块数)`。未超预算时原样返回（逐字节不变、无提示）。
+    """
+    items = list(blocks or [])
+    if not items or budget is None:
+        return items, 0
+    separators = 2 * max(0, len(items) - 1)
+    if sum(len(block) for block in items) + separators <= int(budget):
+        return items, 0
+
+    remaining = max(0, int(budget) - separators)
+    kept: list[str] = []
+    truncated = 0
+    total = len(items)
+    for index, block in enumerate(items):
+        share = max(1, remaining // max(1, total - index))
+        if len(block) <= share:
+            kept.append(block)
+            remaining = max(0, remaining - len(block))
+            continue
+        marker = _FILE_TRUNCATION_NOTE.format(original=len(block))
+        if share <= len(marker):
+            # 预算连标记都放不下：只留标记（让模型知道这里被截断过）。
+            kept.append(marker)
+            remaining = 0
+            truncated += 1
+            continue
+        keep_chars = max(1, share - len(marker))
+        kept.append(f"{block[:keep_chars]}{marker}")
+        remaining = max(0, remaining - keep_chars - len(marker))
+        truncated += 1
+    return kept, truncated
+
+
+def _inject_inline_text_blocks(
+    payload: dict[str, Any],
+    blocks: list[str],
+    *,
+    budget: int | None = None,
+) -> dict[str, Any]:
     """把注入块拼进最后一条 user 消息（保持角色交替，不新增 role）。
 
     为什么要拼进「当前用户消息」而不是追加新消息：prompt 构建会把**最后一条
     user 消息**渲染成 `Human (CURRENT TASK - TOP PRIORITY)`，追加一条用户消息会
     把附件正文顶成「当前任务」，真实问题反而被降级。
+
+    Args:
+        payload: 原始 payload。
+        blocks: 注入块列表。
+        budget: 注入块总字符预算；`None` 表示不限制。超预算时每块保留开头
+            并在结尾标注「已截断，原文件 N 字符」。
     """
     if not blocks:
         return payload
+    blocks, truncated_blocks = _truncate_inline_text_blocks(blocks, budget)
+    if truncated_blocks:
+        log.info(
+            "[ContextAttachment] inline text truncated blocks=%s kept_chars=%s budget=%s",
+            truncated_blocks,
+            sum(len(block) for block in blocks),
+            budget,
+        )
     text = "\n\n".join(blocks)
     rewritten = dict(payload)
     messages: list[Any] = []
@@ -568,17 +821,45 @@ def _fallback_context_attachment_result(
     inline_text_blocks: list[str] | None = None,
     inline_text_tokens: int = 0,
     upstream_files: list[dict[str, Any]] | None = None,
+    settings_obj: Any = None,
 ) -> dict[str, Any]:
-    """上传 / parse 不可用时的兜底：把**完整历史正文**当成一条 user 消息注入。
+    """上传 / parse 不可用时的兜底：把历史正文当成一条 user 消息内联注入。
 
-    这里刻意**不做任何截断**：`plan.summary_text` 就是完整历史正文（不是摘要），
-    注入它意味着「附件上传失败也不丢上下文」。只在日志里报 `inline fallback chars=N`
-    便于核对（截断会让 N 明显小于历史长度）。
+    `plan.summary_text` 就是完整历史正文（不是摘要），注入它意味着「附件上传失败
+    也不丢上下文」。但上游对超大内联 prompt **直接拒绝**（x5sec punish 页 → 500），
+    所以这里按 `ATTACHMENT_INLINE_TEXT_MAX_CHARS` 做**体积裁剪**：
+
+    1. 历史 blob：按 `## Message N` 整条从**最早**开始丢弃（最新内容在最后面）；
+    2. 附件文本：每块保留开头 + 结尾标注；
+    3. 优先级：最新的用户消息（永不截断） > 用户附件文本 > 历史 blob。
     """
+    budget = _inline_char_budget(settings_obj)
     fallback_payload = dict(payload)
     summary_parts: list[str] = []
-    if use_generated_context_files and plan.summary_text:
-        summary_parts.append(plan.summary_text)
+
+    raw_history = str(plan.summary_text or "") if use_generated_context_files else ""
+    original_history_chars = len(raw_history)
+    history_text = raw_history
+    kept_history_chars = original_history_chars
+    dropped_messages = 0
+
+    latest_user_text = _latest_user_text(
+        plan.inline_messages if use_generated_context_files and getattr(plan, "inline_messages", None) else payload.get("messages")
+    )
+    # 附件文本优先于历史 blob：先按「预算 - 最新用户消息」裁附件，再把剩下的给历史。
+    attachment_budget = _remaining_budget(budget, len(latest_user_text))
+    text_blocks, truncated_blocks = _truncate_inline_text_blocks(list(inline_text_blocks or []), attachment_budget)
+    blocks_chars = sum(len(block) for block in text_blocks) + 2 * max(0, len(text_blocks) - 1)
+    history_budget = _remaining_budget(attachment_budget, blocks_chars)
+    truncated_history = False
+    if history_text:
+        history_text, original_history_chars, kept_history_chars, dropped_messages = _truncate_history_blob(
+            history_text, history_budget
+        )
+        truncated_history = kept_history_chars < original_history_chars
+
+    if history_text:
+        summary_parts.append(history_text)
     if manual_attachments:
         names = ", ".join(att.filename for att in manual_attachments[:4])
         summary_parts.append(
@@ -597,14 +878,29 @@ def _fallback_context_attachment_result(
     else:
         fallback_messages.extend(payload.get("messages", []) or [])
     fallback_payload["messages"] = fallback_messages
-    fallback_payload = _inject_inline_text_blocks(fallback_payload, list(inline_text_blocks or []))
+    fallback_payload = _inject_inline_text_blocks(fallback_payload, text_blocks, budget=attachment_budget)
+    # 不变式：最新用户消息在截断后必须完整存在（丢了就补回来，绝不让请求 500）。
+    fallback_payload["messages"] = _ensure_latest_user_intact(
+        list(fallback_payload.get("messages") or []),
+        latest_user_text,
+        session_key=session_key,
+    )
+    truncated = bool(truncated_history or truncated_blocks)
     log.info(
-        "[ContextAttachment] inline fallback chars=%s messages=%s session_key=%s text_attachment_tokens=%s truncated=false",
-        len(plan.summary_text or "") if use_generated_context_files else 0,
+        "[ContextAttachment] inline fallback chars=%s messages=%s session_key=%s text_attachment_tokens=%s truncated=%s",
+        kept_history_chars,
         len(fallback_payload.get("messages") or []),
         session_key,
         inline_text_tokens,
+        str(truncated).lower(),
     )
+    if truncated:
+        log.info(
+            "[ContextAttachment] inline fallback truncated original=%d kept=%d dropped_messages=%d",
+            original_history_chars,
+            kept_history_chars,
+            dropped_messages,
+        )
     return {
         "payload": fallback_payload,
         "session_key": session_key,
@@ -651,6 +947,8 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
     context_messages = _context_messages_for_payload(payload)
     manual_attachments = list(existing_attachments or [])
     plan = context_offloader.plan(context_messages, tools=tools, client_profile=client_profile)
+    # 内联正文总字符预算（None = 不限制）。超预算的截断由下面各条路径统一执行。
+    inline_char_budget = _inline_char_budget(context_offloader.settings)
     use_generated_context_files = bool(plan.generated_files)
     if not use_generated_context_files and not manual_attachments:
         return {
@@ -735,7 +1033,11 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
             len(manual_attachments),
         )
         return {
-            "payload": _inject_inline_text_blocks(payload, inline_text_blocks),
+            "payload": _inject_inline_text_blocks(
+                payload,
+                inline_text_blocks,
+                budget=_remaining_budget(inline_char_budget, _latest_user_len(payload)),
+            ),
             "session_key": session_key,
             "context_mode": "inline",
             "upstream_files": upstream_files,
@@ -777,6 +1079,7 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                 inline_text_blocks=inline_text_blocks,
                 inline_text_tokens=inline_text_tokens,
                 upstream_files=upstream_files,
+                settings_obj=context_offloader.settings,
             )
 
     requires_sticky_account = bool(manual_attachments or payload.get("upstream_files"))
@@ -817,6 +1120,7 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
             inline_text_blocks=inline_text_blocks,
             inline_text_tokens=inline_text_tokens,
             upstream_files=upstream_files,
+            settings_obj=context_offloader.settings,
         )
     await affinity.bind_account(session_key, surface, acc.email, context_offloader.settings.CONTEXT_ATTACHMENT_TTL_SECONDS)
 
@@ -1180,12 +1484,17 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
             inline_text_blocks=inline_text_blocks,
             inline_text_tokens=inline_text_tokens,
             upstream_files=upstream_files,
+            settings_obj=context_offloader.settings,
         )
 
     rewritten = dict(payload)
     rewritten["messages"] = plan.inline_messages if use_generated_context_files else messages
     # 纯文本类附件：正文拼进当前用户消息（已上传 / 已生成的文档不走这里）。
-    rewritten = _inject_inline_text_blocks(rewritten, inline_text_blocks)
+    rewritten = _inject_inline_text_blocks(
+        rewritten,
+        inline_text_blocks,
+        budget=_remaining_budget(inline_char_budget, _latest_user_len(rewritten)),
+    )
     return {
         "payload": rewritten,
         "session_key": session_key,
