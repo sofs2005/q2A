@@ -567,6 +567,131 @@ class ResponsesSurfaceTests(_PreprocessorTestBase):
         self.assertEqual(result.payload["messages"][0]["content"][0]["type"], "input_video")
 
 
+class NestedFileBlockTests(_PreprocessorTestBase):
+    """OpenAI 官方 chat completions 的嵌套文件写法：
+
+    `{"type": "file", "file": {"filename": ..., "file_data": ...}}`
+    """
+
+    async def test_nested_file_data_uri_is_extracted(self) -> None:
+        payload = {
+            "model": "qwen3.8-max",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "file",
+                            "file": {
+                                "filename": "secret.txt",
+                                "file_data": _data_uri("text/plain", b"nested secret"),
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with self.config_patch():
+            result = await preprocess_attachments(payload, self.store, owner_token="tok")
+
+        block = result.payload["messages"][0]["content"][0]
+        self.assertEqual(block["type"], "input_file")
+        self.assertEqual(block["filename"], "secret.txt")
+        self.assertEqual(block["mime_type"], "text/plain")
+        self.assertEqual(Path(result.attachments[0].local_path).read_bytes(), b"nested secret")
+        self.assertEqual(result.attachments[0].source, "manual-upload")
+
+    async def test_nested_file_data_bare_base64_uses_mime_type(self) -> None:
+        payload = {
+            "model": "qwen3.8-max",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "file",
+                            "file": {
+                                "name": "payload.json",
+                                "file_data": _b64(b'{"nested": true}'),
+                                "mime_type": "application/json",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with self.config_patch():
+            result = await preprocess_attachments(payload, self.store, owner_token="tok")
+
+        block = result.payload["messages"][0]["content"][0]
+        self.assertEqual(block["type"], "input_file")
+        self.assertEqual(block["filename"], "payload.json")
+        self.assertEqual(block["mime_type"], "application/json")
+        self.assertEqual(Path(result.attachments[0].local_path).read_bytes(), b'{"nested": true}')
+
+    async def test_top_level_fields_win_over_nested_file(self) -> None:
+        payload = {
+            "model": "qwen3.8-max",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "file",
+                            "filename": "top.txt",
+                            "file_data": _data_uri("text/plain", b"top-level wins"),
+                            "file": {
+                                "filename": "nested.txt",
+                                "file_data": _data_uri("text/plain", b"nested loses"),
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with self.config_patch():
+            result = await preprocess_attachments(payload, self.store, owner_token="tok")
+
+        block = result.payload["messages"][0]["content"][0]
+        self.assertEqual(block["filename"], "top.txt")
+        self.assertEqual(Path(result.attachments[0].local_path).read_bytes(), b"top-level wins")
+
+    async def test_nested_file_without_payload_is_ignored_without_raising(self) -> None:
+        # 只有 filename、既无 file_data 也无 file_id → 无可提取载荷。
+        self.assertIsNone(
+            attachment_preprocessor._extract_inline_file_payload(
+                {"type": "file", "file": {"filename": "empty.txt"}}
+            )
+        )
+        # `file.type` 是嵌套写法的 mime 兜底。
+        self.assertEqual(
+            attachment_preprocessor._extract_inline_file_payload(
+                {"type": "file", "file": {"filename": "a.csv", "type": "text/csv", "file_data": _b64(b"a,b")}}
+            ),
+            ("a.csv", "text/csv", b"a,b"),
+        )
+
+        payload = {
+            "model": "qwen3.8-max",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hi"}, {"type": "file", "file": {"filename": "empty.txt"}}],
+                }
+            ],
+        }
+
+        with self.config_patch():
+            result = await preprocess_attachments(payload, self.store, owner_token="tok")
+
+        self.assertEqual(result.attachments, [])
+        # 无载荷的块原样保留，不产生 skip notice。
+        self.assertEqual(result.payload["messages"][0]["content"][1], {"type": "file", "file": {"filename": "empty.txt"}})
+
+
 class AnthropicSurfaceTests(_PreprocessorTestBase):
     async def test_image_base64_source(self) -> None:
         payload = {

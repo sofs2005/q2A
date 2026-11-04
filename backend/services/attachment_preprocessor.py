@@ -4,6 +4,7 @@
 
 - **OpenAI chat**：`image_url`（data URI 与 http(s) URL）、`input_audio`、
   `audio_url`、`video_url`、`input_video`、`file` / `input_file`
+  （文件块同时支持顶层字段与官方嵌套 `file` 子对象两种写法）
 - **Responses API**：`input_image`（`image_url` 或 `file_id`）、`input_audio`、
   `input_video` / `video_url`、`input_file`
 - **Anthropic messages**：`{"type":"image","source":{...}}`、
@@ -194,6 +195,30 @@ def _as_url(value: Any) -> str:
     return ""
 
 
+def _nested_file_object(block: dict[str, Any]) -> dict[str, Any]:
+    """取出嵌套写法里的 `file` 子对象（非 dict 时返回空 dict）。
+
+    OpenAI 官方 chat completions 的文件块是**嵌套**的::
+
+        {"type": "file", "file": {"filename": "secret.txt", "file_data": "data:..."}}
+
+    而 Responses API / 部分客户端把字段直接摊在 block 顶层。两种写法都要支持，
+    取值优先级统一由 `_first_text` 处理（顶层优先、`file` 子对象兜底）。
+    """
+    nested = block.get("file")
+    return nested if isinstance(nested, dict) else {}
+
+
+def _first_text(sources: tuple[dict[str, Any], ...], *keys: str) -> str:
+    """按给定顺序（顶层在前、嵌套在后）取第一个非空字符串字段。"""
+    for source in sources:
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
 def _format_mime(fmt: str, mapping: dict[str, str], default: str) -> str:
     """`wav` / `audio/wav` 两种写法都接受。"""
     text = str(fmt or "").strip().lower()
@@ -263,34 +288,57 @@ def _spec_from_base64(
 
 
 def _extract_inline_file_payload(block: dict[str, Any]) -> tuple[str, str, bytes] | None:
-    """解析 `file` / `input_file` 块里的内联字节。"""
-    filename = str(block.get("filename") or block.get("name") or "attachment.txt")
-    content_type = str(block.get("mime_type") or block.get("content_type") or "text/plain")
+    """解析 `file` / `input_file` 块里的内联字节。
 
-    # OpenAI Responses 的 `file_data`：data URI 或裸 base64
-    if isinstance(block.get("file_data"), str):
-        value = block["file_data"].strip()
-        if value.startswith("data:"):
+    支持两种写法，**顶层字段优先**、嵌套 `file` 子对象兜底：
+
+    - 顶层（Responses API / 旧客户端）：
+      `{"type": "file", "filename": ..., "file_data": ...}`
+    - 嵌套（OpenAI 官方 chat completions）：
+      `{"type": "file", "file": {"filename": ..., "file_data": ...}}`
+
+    Returns:
+        `(filename, content_type, raw)`；没有任何内联载荷时返回 `None`。
+    """
+    nested = _nested_file_object(block)
+    filename = _first_text((block, nested), "filename", "name") or "attachment.txt"
+    # 注意：嵌套写法里的 `file.type` 表示 mime；顶层 `type` 是块类型（"file"），
+    # 不能当 mime 用，因此 `type` 只从 `file` 子对象兜底。
+    content_type = (
+        _first_text((block, nested), "mime_type", "content_type")
+        or _first_text((nested,), "type")
+        or "text/plain"
+    )
+
+    # OpenAI 的 `file_data`：data URI 或裸 base64
+    file_data = _first_text((block, nested), "file_data")
+    if file_data:
+        if file_data.startswith("data:"):
             try:
-                ct, raw = _decode_data_uri(value)
+                ct, raw = _decode_data_uri(file_data)
             except Exception:
                 return None
             return filename, ct, raw
-        raw = _b64decode(value)
+        raw = _b64decode(file_data)
         return (filename, content_type, raw) if raw is not None else None
-    if isinstance(block.get("text"), str):
-        return filename, content_type, block["text"].encode("utf-8")
-    if isinstance(block.get("content"), str) and not str(block.get("content", "")).startswith("data:"):
-        return filename, content_type, block["content"].encode("utf-8")
-    if isinstance(block.get("data_base64"), str):
-        raw = _b64decode(block["data_base64"])
-        return (filename, content_type, raw) if raw is not None else None
-    if isinstance(block.get("data"), str):
-        raw = _b64decode(block["data"])
-        return (filename, content_type, raw) if raw is not None else None
-    if isinstance(block.get("content"), str) and str(block.get("content", "")).startswith("data:"):
+
+    text = _first_text((block, nested), "text")
+    if text:
+        return filename, content_type, text.encode("utf-8")
+
+    content = _first_text((block, nested), "content")
+    if content and not content.startswith("data:"):
+        return filename, content_type, content.encode("utf-8")
+
+    for key in ("data_base64", "data"):
+        encoded = _first_text((block, nested), key)
+        if encoded:
+            raw = _b64decode(encoded)
+            return (filename, content_type, raw) if raw is not None else None
+
+    if content and content.startswith("data:"):
         try:
-            ct, raw = _decode_data_uri(block["content"])
+            ct, raw = _decode_data_uri(content)
         except Exception:
             return None
         return filename, ct, raw
@@ -385,16 +433,20 @@ def _classify_block(block: dict[str, Any]) -> _MediaSpec | None:
 
     # ---- 文档 / 通用文件 ----
     if block_type in {"file", "input_file"}:
-        file_id = str(block.get("file_id") or "").strip()
+        # 顶层优先、嵌套 `file` 子对象兜底（见 `_nested_file_object`）。
+        nested = _nested_file_object(block)
+        file_id = _first_text((block, nested), "file_id")
+        filename = _first_text((block, nested), "filename", "name")
+        mime_type = _first_text((block, nested), "mime_type", "content_type") or _first_text((nested,), "type")
         extracted = _extract_inline_file_payload(block)
         inline_spec: _MediaSpec | None = None
         if extracted is not None:
-            filename, content_type, raw = extracted
-            kind = classify_media(filename, content_type)
+            extracted_filename, content_type, raw = extracted
+            kind = classify_media(extracted_filename, content_type)
             inline_spec = _MediaSpec(
                 kind=kind,
-                filename=filename,
-                content_type=normalize_mime_type(content_type, filename),
+                filename=extracted_filename,
+                content_type=normalize_mime_type(content_type, extracted_filename),
                 data=raw,
                 origin="inline",
             )
@@ -402,8 +454,8 @@ def _classify_block(block: dict[str, Any]) -> _MediaSpec | None:
             # 旧行为优先用 file_id 指向的本地文件；解析失败时回退内联字节。
             return _MediaSpec(
                 kind=KIND_DOCUMENT,
-                filename=str(block.get("filename") or ""),
-                content_type=normalize_mime_type(str(block.get("mime_type") or "")),
+                filename=filename,
+                content_type=normalize_mime_type(mime_type),
                 file_id=file_id,
                 origin="ref",
                 fallback=inline_spec,
