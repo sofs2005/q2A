@@ -343,7 +343,7 @@ Anthropic Messages（`POST /v1/messages`）：
 | `CONTEXT_SUMMARY_MAX_SOURCE_CHARS` | `24000` | 送去总结的历史上限；超过只把**最近**这么多字符拿去总结，更早的丢弃并标注「更早的 N 条消息已省略」。 |
 | `CONTEXT_SUMMARY_TARGET_CHARS` | `2000` | 摘要目标字数（写进 prompt 约束输出；超长按字符截断 + `…`）。 |
 | `CONTEXT_SUMMARY_TIMEOUT_SECONDS` | `60` | 单次摘要请求超时；超时即回退硬截断。 |
-| `CONTEXT_SUMMARY_MODEL` | 空 | 摘要用的上游模型。**留空 = 跟主请求同模型**（解析结果不是 qwen 家族时退回 `QWEN_PLUS_MODEL`）。 |
+| `CONTEXT_SUMMARY_MODEL` | `qwen3.8-omni-flash` | 摘要用的上游模型（默认 `qwen3.8-omni-flash`：比 max 便宜，摘要质量够用）。**显式留空 = 跟主请求同模型**（解析结果不是 qwen 家族时退回 `QWEN_PLUS_MODEL`）；填其它值 = 固定用该模型。 |
 | `CONTEXT_SUMMARY_CACHE_TTL_SECONDS` | `1800` | 摘要缓存 TTL。同一 session 历史不变时第二次直接命中（日志 `cached=true`），不再打上游。 |
 | `CONTEXT_SUMMARY_CACHE_MAX_ENTRIES` | `256` | 摘要缓存条目上限（内存 LRU，按最久未用淘汰）。 |
 | `DOCUMENT_PARSE_MAX_FAILURES` | `2` | `files/parse` 连续失败多少次后熔断（撞 WAF 则一次即熔断）。 || `DOCUMENT_PARSE_COOLDOWN_SECONDS` | `600` | 熔断冷却时长：期内文档类附件**直接跳过「上传 + parse」**走文本降级。 |

@@ -25,7 +25,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -78,7 +83,9 @@ def _settings(**overrides):
         CONTEXT_SUMMARY_MAX_SOURCE_CHARS=24000,
         CONTEXT_SUMMARY_TARGET_CHARS=2000,
         CONTEXT_SUMMARY_TIMEOUT_SECONDS=60,
-        CONTEXT_SUMMARY_MODEL="",
+        # 与 `config.py` 的声明默认一致（不配置时摘要用 omni-flash，比 max 便宜）。
+        # 「显式空串 = 跟主请求同模型」的用例必须自己覆盖成 ""。
+        CONTEXT_SUMMARY_MODEL="qwen3.8-omni-flash",
         CONTEXT_SUMMARY_CACHE_TTL_SECONDS=1800,
         CONTEXT_SUMMARY_CACHE_MAX_ENTRIES=256,
         QWEN_PLUS_MODEL="qwen-plus-latest",
@@ -884,3 +891,85 @@ class SummarizerPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls, [], "历史前缀为空时不该有任何摘要请求")
         self.assertEqual(result["context_mode"], "inline")
         self.assertNotIn("【历史摘要】", _joined(result))
+
+    # ------------------------------------------------------------------
+    # 摘要模型的三态语义：默认 omni-flash / 显式空串跟主请求 / 其它值固定
+    # ------------------------------------------------------------------
+    async def test_default_summary_request_uses_omni_flash(self) -> None:
+        """未设置 `CONTEXT_SUMMARY_MODEL` → 摘要请求的 model 是 `qwen3.8-omni-flash`。"""
+        settings = _settings()
+        client = _FakeClient(reply="DEFAULT_MODEL_SUMMARY_LONG_ENOUGH")
+
+        await self._prepare(settings, client)
+
+        self.assertEqual(len(client.calls), 1, "应有且只有一次摘要请求")
+        self.assertEqual(
+            client.calls[0]["payload"]["model"],
+            "qwen3.8-omni-flash",
+            "不配置时不能退化成跟随主请求（gpt-4.1 → qwen-max/plus），那样白烧 max 额度",
+        )
+
+    async def test_explicit_empty_model_follows_main_request(self) -> None:
+        """显式空串 = 跟主请求同模型：主请求不是 qwen 家族 → 退回 `QWEN_PLUS_MODEL`。"""
+        settings = _settings(CONTEXT_SUMMARY_MODEL="")
+        client = _FakeClient(reply="FOLLOW_MAIN_MODEL_SUMMARY_LONG_ENOUGH")
+
+        await self._prepare(settings, client)
+
+        self.assertEqual(len(client.calls), 1, "应有且只有一次摘要请求")
+        self.assertEqual(client.calls[0]["payload"]["model"], settings.QWEN_PLUS_MODEL)
+
+    async def test_explicit_model_overrides_main_request(self) -> None:
+        """非空配置 = 固定用该模型，与主请求模型无关。"""
+        settings = _settings(CONTEXT_SUMMARY_MODEL="qwen3.7-plus")
+        client = _FakeClient(reply="PINNED_MODEL_SUMMARY_LONG_ENOUGH")
+
+        await self._prepare(settings, client)
+
+        self.assertEqual(client.calls[0]["payload"]["model"], "qwen3.7-plus")
+
+
+class SummaryModelConfigDefaultTests(unittest.TestCase):
+    """`config.py` 里 `CONTEXT_SUMMARY_MODEL` 的声明默认值。"""
+
+    def test_declared_default_is_omni_flash(self) -> None:
+        """未设置 `CONTEXT_SUMMARY_MODEL` → 默认模型是 `qwen3.8-omni-flash`。
+
+        `config.py` 的默认值在 import 期由 `os.getenv` 求值，进程内无法回放「未设置」，
+        所以照抄 `UploadViaBrowserDefaultTests` 的做法：清掉该变量、在临时目录里开子
+        进程读真实默认值（临时目录还能避开仓库根的 `.env`）。
+        """
+        repo_root = Path(__file__).resolve().parent.parent
+        script = (
+            "import json;"
+            "from backend.core.config import DEFAULT_CONTEXT_SUMMARY_MODEL, Settings;"
+            "s = Settings(_env_file=None);"
+            "print(json.dumps({"
+            "'constant': DEFAULT_CONTEXT_SUMMARY_MODEL,"
+            "'settings': s.CONTEXT_SUMMARY_MODEL,"
+            "'env_value': __import__('os').environ.get('CONTEXT_SUMMARY_MODEL'),"
+            "}))"
+        )
+        env = {key: value for key, value in os.environ.items() if key != "CONTEXT_SUMMARY_MODEL"}
+        env["PYTHONPATH"] = str(repo_root)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=tmp_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertIsNone(payload["env_value"], "环境变量必须真的未设置")
+        self.assertEqual(payload["constant"], "qwen3.8-omni-flash")
+        self.assertEqual(payload["settings"], "qwen3.8-omni-flash")
+
+    def test_settings_helper_matches_config_default(self) -> None:
+        """`_settings()` 替身的默认值必须跟着 `config.py` 走，否则用例会漂移。"""
+        from backend.core.config import DEFAULT_CONTEXT_SUMMARY_MODEL
+
+        self.assertEqual(DEFAULT_CONTEXT_SUMMARY_MODEL, "qwen3.8-omni-flash")
+        self.assertEqual(_settings().CONTEXT_SUMMARY_MODEL, DEFAULT_CONTEXT_SUMMARY_MODEL)

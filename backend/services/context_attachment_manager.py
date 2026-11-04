@@ -564,10 +564,14 @@ def _summary_threshold(settings_obj: Any) -> int:
 def _summary_model_for(payload: Any, settings_obj: Any) -> str:
     """决定摘要请求用哪个上游模型。
 
-    `CONTEXT_SUMMARY_MODEL` 为空时表示「跟主请求同模型」：这里取调用方请求的模型
-    并过一遍别名解析（`resolve_model`）。解析结果不是 qwen 家族（比如调用方用
-    `gpt-4.1` 这种网关别名）时，退回 `QWEN_PLUS_MODEL` —— 摘要只需要「便宜 + 会
-    归纳」，用最便宜的 plus 比把未知模型名丢给上游直接 400 更实用。
+    `CONTEXT_SUMMARY_MODEL` 默认是 `qwen3.8-omni-flash`（便宜、会归纳），非空即
+    **直接用该模型**，与调用方请求的模型无关；只有配置被**显式设成空串**时才表示
+    「跟主请求同模型」：这里取调用方请求的模型并过一遍别名解析（`resolve_model`）。
+    解析结果不是 qwen 家族（比如调用方用 `gpt-4.1` 这种网关别名）时，退回
+    `QWEN_PLUS_MODEL` —— 摘要只需要「便宜 + 会归纳」，用最便宜的 plus 比把未知
+    模型名丢给上游直接 400 更实用。
+
+    settings 对象上没有该属性时（精简的单测替身）按空串处理，即走跟随逻辑。
     """
     explicit = str(getattr(settings_obj, "CONTEXT_SUMMARY_MODEL", "") or "").strip()
     if explicit:

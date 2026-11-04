@@ -9,6 +9,8 @@ DATA_DIR = BASE_DIR / "data"
 
 DEFAULT_QWEN_MAX_MODEL = "qwen3.8-max"
 DEFAULT_QWEN_PLUS_MODEL = "qwen3.7-plus"
+# 上下文摘要默认模型：比 max 便宜得多，摘要只要「便宜 + 会归纳」，flash 够用。
+DEFAULT_CONTEXT_SUMMARY_MODEL = "qwen3.8-omni-flash"
 # 上游 Version 头。**以实测可用性为准，不以抓包为准。**
 # 0.3.10 确为官网浏览器实际发送值，但服务端对它返回 401
 # （"Your session has expired, or the token is no longer valid."）—— 即该版本号
@@ -190,8 +192,15 @@ class Settings(BaseSettings):
     CONTEXT_SUMMARY_TARGET_CHARS: int = int(os.getenv("CONTEXT_SUMMARY_TARGET_CHARS", 2000))
     # 单次摘要请求超时（秒）。超时即回退截断。
     CONTEXT_SUMMARY_TIMEOUT_SECONDS: float = float(os.getenv("CONTEXT_SUMMARY_TIMEOUT_SECONDS", 60))
-    # 摘要用的上游模型；**留空 = 跟主请求同模型**（解析结果不是 qwen 家族时退回 QWEN_PLUS_MODEL）
-    CONTEXT_SUMMARY_MODEL: str = os.getenv("CONTEXT_SUMMARY_MODEL", "").strip()
+    # 摘要用的上游模型。三种语义，按优先级：
+    #   1. **未设置** → 默认 `qwen3.8-omni-flash`（比 max 便宜，摘要质量够用）；
+    #   2. **显式空串**（部署侧真的写了 `CONTEXT_SUMMARY_MODEL=`）→ 跟主请求同模型
+    #      （解析结果不是 qwen 家族时退回 QWEN_PLUS_MODEL），见
+    #      `context_attachment_manager._summary_model_for()`；
+    #   3. 其它值 → 固定用该模型。
+    # 只有「环境变量显式存在且为空」才走跟随逻辑 —— 默认值本身非空，所以不配置
+    # 时不会退化成「跟主请求同模型」而白烧 max 的额度。
+    CONTEXT_SUMMARY_MODEL: str = os.getenv("CONTEXT_SUMMARY_MODEL", DEFAULT_CONTEXT_SUMMARY_MODEL).strip()
     # 摘要缓存 TTL（秒）与条目上限（内存 LRU）。同一 session 历史不变时第二次直接命中，
     # 不再打上游；key = sha256(历史正文 + model + target_chars)。
     CONTEXT_SUMMARY_CACHE_TTL_SECONDS: float = float(os.getenv("CONTEXT_SUMMARY_CACHE_TTL_SECONDS", 1800))
