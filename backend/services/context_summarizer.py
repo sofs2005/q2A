@@ -27,10 +27,15 @@
 2. **缓存必须真的生效**：同一 session 连续对话时历史不变 → 第二次直接命中内存
    缓存（日志 `cached=true`），不再打上游。key 里带 model（不同模型摘要质量不同）。
 3. **摘要请求天然不会二次触发上下文卸载 / 附件预处理**：它走
-   `QwenClient.complete_chat_once()`（非流式、`chat_transport=True`），payload 是
-   单条纯文本 user 消息、`files=[]`，不经过 `prepare_context_attachments` 管线。
-   代码里对这两点做了**保护性校验**（`_assert_isolated_payload`），一旦将来有人
-   把这条请求接回主管线会立刻失败而不是静默递归。
+   `QwenClient.stream_chat_once()`（`chat_transport=True`、`accept: application/json`），
+   payload 是单条纯文本 user 消息、`files=[]`，不经过 `prepare_context_attachments`
+   管线。代码里对这两点做了**保护性校验**（`_assert_isolated_payload`），一旦将来
+   有人把这条请求接回主管线会立刻失败而不是静默递归。
+4. **摘要请求必须是流式**：t2t 对话上游**不支持非流式** —— `stream=False` 会得到
+   HTTP 200 + `{"success":false,"data":{"code":"Bad_Request"}}`（生产实测 b430d19
+   每次都失败，日志只有 `empty body`）。所以 payload 保持
+   `stream=True` / `incremental_output=True`，按 SSE 逐帧取
+   `choices[].delta.content`，并且**只取非思考** phase 的正文。
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ from typing import Any
 
 from backend.core.config import settings as default_settings
 from backend.upstream.payload_builder import build_chat_payload
+from backend.upstream.sse_consumer import parse_sse_chunk
 
 log = logging.getLogger("qwen2api.context_summary")
 
@@ -79,6 +85,10 @@ _TEXT_PATHS: tuple[tuple[Any, ...], ...] = (
 
 #: 递归兜底时认的「正文键」（顺序即优先级）。
 _TEXT_KEYS: tuple[str, ...] = ("content", "answer", "text", "output_text", "response")
+
+#: 上游「思考」阶段的 phase 名（多版本拼写）。这些帧的正文**不进摘要**：
+#: 思考过程会把摘要预算吃光，而且模型自己也不会需要它。
+_THINK_PHASES: frozenset[str] = frozenset({"think", "thinking", "thinking_summary"})
 
 #: 默认值（配置缺失时的兜底，与 `config.py` 里的默认保持一致）。
 _DEFAULTS: dict[str, Any] = {
@@ -136,7 +146,10 @@ def _dig(obj: Any, path: tuple[Any, ...]) -> Any:
 
 
 def extract_summary_text(body: str) -> str:
-    """从上游非流式响应体里取出正文。
+    """从上游**非流式**响应体里取出正文。
+
+    摘要主路径已改成流式（见 :class:`SummaryStreamCollector`），本函数保留为
+    「少数部署仍回非流式 JSON 体」时的兜底解析器，也被单测直接覆盖。
 
     Args:
         body: `QwenClient.complete_chat_once()` 返回的 `body`（JSON 文本，少数
@@ -173,6 +186,131 @@ def extract_summary_text(body: str) -> str:
         elif isinstance(node, list):
             queue.extend(node)
     return ""
+
+
+def describe_upstream_error(event: dict) -> str:
+    """把 `parse_sse_chunk()` 的错误事件翻译成可诊断的一行消息。
+
+    上游风控软拦的形态是 HTTP 200 + `{"success":false,"data":{"code":"Bad_Request",
+    "details":"..."}}`；不把 `code` / `details` 带进异常消息，日志里就只剩
+    `empty body`，等于把原因扔掉了。
+
+    Args:
+        event: `parse_sse_chunk()` 产出的 `type == "error"` 事件。
+
+    Returns:
+        形如 `upstream error code=Bad_Request details=Internal error ...` 的消息。
+    """
+    code = str(event.get("code") or "").strip() or "unknown"
+    details = str(event.get("details") or "").strip()
+    message = f"upstream error code={code}"
+    if details:
+        message = f"{message} details={details[:200]}"
+    return message
+
+
+class SummaryStreamCollector:
+    """增量解析摘要请求的 SSE 流，按 phase 分桶收集正文。
+
+    两个必须处理的现实：
+
+    1. **分片边界与行边界无关**：`stream_chat_once()` 按 TCP 到达分片 yield，
+       一行 `data: {...}` 可能被切成两半，所以先按 `\\n` 缓冲、凑齐一行才解析；
+    2. **上游会混入思考帧**：`phase` 为 `think` / `thinking` / `thinking_summary`
+       的正文若也拼进摘要，摘要预算会被思考过程吃光。
+
+    因此正文优先取「非思考」帧；全是思考、没有 answer 时才退回思考正文兜底
+    （总比空摘要 → 回退截断好）。
+    """
+
+    def __init__(self) -> None:
+        """初始化收集器（每个请求一个实例，不要复用）。"""
+        self.answer: list[str] = []
+        self.think: list[str] = []
+        self.error: str = ""
+        self.saw_data_line: bool = False
+        self._raw: list[str] = []
+        self._buffer: str = ""
+
+    def feed(self, chunk: Any) -> None:
+        """喂入一个流分片（已解码文本），按整行解析。"""
+        text = str(chunk or "")
+        if not text:
+            return
+        self._raw.append(text)
+        self._buffer += text
+        while True:
+            newline = self._buffer.find("\n")
+            if newline < 0:
+                return
+            line = self._buffer[:newline]
+            self._buffer = self._buffer[newline + 1 :]
+            self._handle_line(line)
+
+    def flush(self) -> None:
+        """处理最后一个没有换行结尾的残行（流结束时调用一次）。"""
+        remainder = self._buffer
+        self._buffer = ""
+        if remainder.strip():
+            self._handle_line(remainder)
+
+    def body(self) -> str:
+        """拼出摘要正文：优先非思考内容，全是思考时用思考正文兜底。"""
+        answer = "".join(self.answer).strip()
+        if answer:
+            return answer
+        return "".join(self.think).strip()
+
+    def raw_text(self) -> str:
+        """原始流文本（诊断 / 非流式兜底解析用）。"""
+        return "".join(self._raw)
+
+    def _handle_line(self, line: str) -> None:
+        """解析单行：`data: {...}` 走 SSE，裸 JSON 错误体走 sse_consumer 的兜底。"""
+        stripped = str(line or "").strip()
+        if not stripped:
+            return
+        if stripped.startswith("data:"):
+            self.saw_data_line = True
+        try:
+            events = parse_sse_chunk(stripped)
+        except Exception:  # noqa: BLE001 - 单行解析失败不该中断整个摘要
+            return
+        if not events and stripped.startswith("data:"):
+            # 错误信封也可能被包在 `data:` 里（{"success":false,...}）：把 JSON 本体
+            # 去掉前缀再走一次，命中 sse_consumer 的裸 JSON 错误识别。
+            events = self._parse_wrapped_error(stripped[5:].strip())
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "error":
+                if not self.error:
+                    self.error = describe_upstream_error(event)
+                continue
+            content = event.get("content")
+            if not isinstance(content, str) or not content:
+                continue
+            phase = str(event.get("phase") or "answer")
+            if phase in _THINK_PHASES:
+                self.think.append(content)
+            else:
+                self.answer.append(content)
+
+    @staticmethod
+    def _parse_wrapped_error(payload_text: str) -> list[dict]:
+        """把 `data:` 前缀后的 JSON 当裸错误体重解析一次（非错误体返回空列表）。"""
+        if not payload_text.startswith("{"):
+            return []
+        try:
+            payload = json.loads(payload_text)
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(payload, dict) or payload.get("success") is not False:
+            return []
+        try:
+            return parse_sse_chunk(payload_text)
+        except Exception:  # noqa: BLE001 - 解析失败按「无事件」处理
+            return []
 
 
 def clip_history_source(text: str, max_chars: int) -> tuple[str, int]:
@@ -335,7 +473,8 @@ class ContextSummarizer:
             text: 完整历史序列化文本（`## Message N [role]` 格式）。
             model: 上游模型名；空串表示跟主请求同模型（由调用方决定）。
             account: 用于发请求的上游账号（需带 `token`）。
-            client: `QwenClient`（或其测试替身），需实现 `complete_chat_once`。
+            client: `QwenClient`（或其测试替身），需实现 `stream_chat_once`
+                （异步生成器，逐片 yield `{"chunk": ...}` / `{"status": ...}`）。
             target_chars: 覆盖配置里的摘要目标字数。
             max_source_chars: 覆盖配置里的「送去总结的历史上限」。
             timeout_seconds: 覆盖配置里的超时。
@@ -381,7 +520,6 @@ class ContextSummarizer:
                     model=model_name,
                     account=account,
                     client=client,
-                    timeout=timeout,
                 ),
                 timeout=timeout,
             )
@@ -433,16 +571,24 @@ class ContextSummarizer:
         model: str,
         account: Any,
         client: Any,
-        timeout: float,
     ) -> str:
-        """发一次非流式 completions 取回摘要正文。
+        """发一次**流式** completions，把 SSE 正文拼成摘要。
+
+        为什么必须流式：t2t 对话上游**不支持非流式** —— `stream=False` 会拿到
+        HTTP 200 + `{"success":false,"data":{"code":"Bad_Request"}}`（只有视频 t2v
+        才需要非流式，因为它要的是 body 里的 `task_id`）。走流式的另一个好处是
+        能按 `phase` 过滤掉思考帧。
+
+        超时由调用方的 `asyncio.wait_for` 统一负责（`stream_chat_once` 不接受
+        `timeout` 参数，底层超时取 `QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS`）。
 
         Raises:
-            RuntimeError: 传输不可用 / 上游非 200 / 响应体里取不到正文。
+            RuntimeError: 传输不可用 / 上游非 200 / 上游错误信封 / 取不到正文。
+                错误消息里必须带 `code` / `details`，否则日志只剩 `empty body`。
         """
-        complete = getattr(client, "complete_chat_once", None)
-        if not callable(complete):
-            raise RuntimeError("non-stream transport unavailable")
+        stream = getattr(client, "stream_chat_once", None)
+        if not callable(stream):
+            raise RuntimeError("stream transport unavailable")
         if account is None:
             raise RuntimeError("account unavailable")
 
@@ -455,20 +601,41 @@ class ContextSummarizer:
             files=None,
             chat_type="t2t",
         )
-        # 非流式一次性取回整个响应体（与视频 t2v 同一条传输）。
-        payload["stream"] = False
-        payload["incremental_output"] = False
+        # 保持 build_chat_payload 的 t2t 默认（stream / incremental_output 均为 True），
+        # 绝不覆盖成 False —— 非流式上游必然 Bad_Request。
+        payload["stream"] = True
+        payload["incremental_output"] = True
         _assert_isolated_payload(payload)
 
         token = str(getattr(account, "token", "") or "")
-        res = await complete(token, chat_id, payload, account=account, timeout=timeout)
-        status = _as_int((res or {}).get("status"), 0)
-        body = str((res or {}).get("body") or "")
-        if status != 200:
-            raise RuntimeError(f"http {status}: {body[:160]}")
-        text = extract_summary_text(body)
+        collector = SummaryStreamCollector()
+        async for item in stream(token, chat_id, payload, account=account):
+            if not isinstance(item, dict):
+                continue
+            status = item.get("status")
+            if isinstance(status, int) and not isinstance(status, bool) and status != 200:
+                preview = " ".join(str(item.get("body") or "").split())[:200]
+                raise RuntimeError(f"http {status}: {preview}")
+            chunk = item.get("chunk")
+            if chunk:
+                collector.feed(chunk)
+        collector.flush()
+
+        text = collector.body()
+        if not text and not collector.saw_data_line:
+            # 少数部署仍回非流式 JSON 体（choices / messages / content）：复用旧解析。
+            text = extract_summary_text(collector.raw_text())
+        if not text and collector.error:
+            raise RuntimeError(collector.error)
         if not text:
-            raise RuntimeError("empty body")
+            raw_text = collector.raw_text()
+            preview = " ".join(raw_text.split())[:200]
+            raise RuntimeError(f"empty summary body raw_len={len(raw_text)} preview={preview!r}")
+        if collector.error:
+            log.warning(
+                "[ContextSummary] stream had upstream error frame but produced text: %s",
+                collector.error,
+            )
         return text
 
     async def _resolve_chat_id(self, client: Any, account: Any, model: str) -> str:

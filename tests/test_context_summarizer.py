@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -89,25 +90,71 @@ def _history_text(count: int = 20, body_chars: int = 750) -> str:
     return "".join(parts)
 
 
-class _FakeClient:
-    """假 QwenClient：记录调用次数，按脚本返回 / 抛异常 / 挂住。"""
+def _sse_delta(content: str, phase: str = "answer") -> str:
+    """拼一帧上游 SSE（与 /api/v2/chat/completions 实测形状一致）。"""
+    return (
+        "data: "
+        + json.dumps({"choices": [{"delta": {"content": content, "phase": phase}}]}, ensure_ascii=False)
+        + "\n\n"
+    )
 
-    def __init__(self, *, reply: str = "SUMMARY_TEXT", error: Exception | None = None, delay: float = 0.0):
+
+#: 上游风控软拦的裸 JSON 错误信封（生产实测：stream=False 必回这个）。
+BAD_REQUEST_BODY = (
+    '{"success":false,"request_id":"req-1",'
+    '"data":{"code":"Bad_Request","details":"Internal error, please try again"}}'
+)
+
+
+class _FakeClient:
+    """假 QwenClient：记录调用，按脚本产出 SSE 分片 / 抛异常 / 挂住。
+
+    摘要请求走**流式**（t2t 上游不支持非流式），所以替身必须实现
+    `stream_chat_once` 异步生成器，逐片 yield `{"chunk": ...}`。
+    """
+
+    def __init__(
+        self,
+        *,
+        reply: str = "SUMMARY_TEXT",
+        error: Exception | None = None,
+        delay: float = 0.0,
+        stream_body: str | None = None,
+        pieces: list[str] | None = None,
+    ):
         self.reply = reply
         self.error = error
         self.delay = delay
+        self.stream_body = stream_body
+        self._pieces = pieces
         self.calls: list[dict] = []
         self.prompts: list[str] = []
 
-    async def complete_chat_once(self, token, chat_id, payload, account=None, timeout=None):
-        self.calls.append({"token": token, "chat_id": chat_id, "payload": payload, "timeout": timeout})
+    def _build_body(self) -> str:
+        if self.stream_body is not None:
+            return self.stream_body
+        return _sse_delta(self.reply, "answer")
+
+    def _chunks(self) -> list[str]:
+        body = self._build_body()
+        if self._pieces is not None:
+            return list(self._pieces)
+        # 默认按 2 片切（顺带覆盖「一帧被切成两半」的缓冲逻辑只有 1 片时不会触发）。
+        middle = max(1, len(body) // 2)
+        return [body[:middle], body[middle:]]
+
+    async def stream_chat_once(self, token, chat_id, payload, account=None):
+        self.calls.append({"token": token, "chat_id": chat_id, "payload": payload})
         message = (payload.get("messages") or [{}])[0]
         self.prompts.append(str(message.get("content") or ""))
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.error is not None:
             raise self.error
-        return {"status": 200, "body": f'{{"data": {{"messages": [{{"content": "{self.reply}"}}]}}}}'}
+        for piece in self._chunks():
+            if piece:
+                yield {"chunk": piece}
+        yield {"status": "streamed"}
 
 
 def _account(email: str = "bot@example.com") -> SimpleNamespace:
@@ -282,9 +329,9 @@ class SummarizerUnitTests(unittest.IsolatedAsyncioTestCase):
         summarizer = ContextSummarizer(_settings())
 
         class _Boom(_FakeClient):
-            async def complete_chat_once(self, token, chat_id, payload, account=None, timeout=None):
+            async def stream_chat_once(self, token, chat_id, payload, account=None):
                 self.calls.append({"payload": payload})
-                return {"status": 500, "body": "boom"}
+                yield {"status": 500, "body": "boom"}
 
         summary = await summarizer.summarize(text=_history_text(20, 750), model="qwen-plus", account=_account(), client=_Boom())
         self.assertIsNone(summary)
@@ -313,7 +360,97 @@ class SummarizerUnitTests(unittest.IsolatedAsyncioTestCase):
         payload = client.calls[0]["payload"]
         self.assertEqual(len(payload["messages"]), 1)
         self.assertEqual(payload["messages"][0]["files"], [])
-        self.assertFalse(payload["stream"])
+        # t2t 上游不支持非流式：stream / incremental_output 必须是 True。
+        self.assertTrue(payload["stream"], "摘要请求必须走流式，非流式上游回 Bad_Request")
+        self.assertTrue(payload["incremental_output"])
+
+    async def test_stream_parses_only_answer_phase(self) -> None:
+        """SSE 多帧含 think + answer：只拼 answer，思考不污染摘要。"""
+        summarizer = ContextSummarizer(_settings())
+        body = (
+            'data: {"response.created":{"response_id":"r1"}}\n\n'
+            + _sse_delta("让我先想想…", "think")
+            + _sse_delta("思考摘要片段", "thinking_summary")
+            + _sse_delta("ANSWER_PART_1 ", "answer")
+            + _sse_delta("ANSWER_PART_2", "answer")
+        )
+        client = _FakeClient(stream_body=body)
+
+        summary = await summarizer.summarize(text=_history_text(20, 750), model="qwen-plus", account=_account(), client=client)
+
+        self.assertEqual(summary, "ANSWER_PART_1 ANSWER_PART_2")
+        self.assertNotIn("让我先想想", summary or "")
+        self.assertNotIn("思考摘要", summary or "")
+
+    async def test_stream_falls_back_to_think_when_no_answer(self) -> None:
+        """只有思考帧、没有 answer 时用思考正文兜底（总比空摘要→截断好）。"""
+        summarizer = ContextSummarizer(_settings())
+        client = _FakeClient(stream_body=_sse_delta("ONLY_THINKING", "think"))
+
+        summary = await summarizer.summarize(text=_history_text(20, 750), model="qwen-plus", account=_account(), client=client)
+
+        self.assertEqual(summary, "ONLY_THINKING")
+
+    async def test_stream_frame_split_across_chunks_is_reassembled(self) -> None:
+        """一帧被 TCP 切成两半（甚至切在 `data:` 中间）也要拼回来。"""
+        summarizer = ContextSummarizer(_settings())
+        frame = _sse_delta("SPLIT_OK", "answer")
+        pieces = [frame[:7], frame[7:25], frame[25:]]
+        client = _FakeClient(pieces=pieces)
+
+        summary = await summarizer.summarize(text=_history_text(20, 750), model="qwen-plus", account=_account(), client=client)
+
+        self.assertEqual(summary, "SPLIT_OK")
+
+    async def test_upstream_error_envelope_is_diagnosable(self) -> None:
+        """`{"success":false,"data":{"code":"Bad_Request"}}` → 日志里必须出现 Bad_Request。"""
+        summarizer = ContextSummarizer(_settings())
+        client = _FakeClient(stream_body=BAD_REQUEST_BODY)
+
+        with self.assertLogs("qwen2api.context_summary", level="WARNING") as logs:
+            summary = await summarizer.summarize(
+                text=_history_text(20, 750),
+                model="qwen-plus",
+                account=_account(),
+                client=client,
+            )
+
+        self.assertIsNone(summary)
+        messages = [record.getMessage() for record in logs.records]
+        self.assertTrue(any("Bad_Request" in line for line in messages), messages)
+        self.assertFalse(any("empty body" == line.rstrip() for line in messages), messages)
+
+    async def test_upstream_error_envelope_wrapped_in_data_line(self) -> None:
+        """错误信封也可能被包在 `data:` 里：同样要留下 Bad_Request。"""
+        summarizer = ContextSummarizer(_settings())
+        client = _FakeClient(stream_body=f"data: {BAD_REQUEST_BODY}\n\n")
+
+        with self.assertLogs("qwen2api.context_summary", level="WARNING") as logs:
+            summary = await summarizer.summarize(
+                text=_history_text(20, 750),
+                model="qwen-plus",
+                account=_account(),
+                client=client,
+            )
+
+        self.assertIsNone(summary)
+        messages = [record.getMessage() for record in logs.records]
+        self.assertTrue(any("Bad_Request" in line for line in messages), messages)
+
+    async def test_upstream_error_envelope_without_choices_raises_code(self) -> None:
+        """错误信封走 `_request_summary` 时异常消息里也要带 code / details。"""
+        summarizer = ContextSummarizer(_settings())
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await summarizer._request_summary(
+                prompt="P",
+                model="qwen-plus",
+                account=_account(),
+                client=_FakeClient(stream_body=BAD_REQUEST_BODY),
+            )
+        message = str(ctx.exception)
+        self.assertIn("Bad_Request", message)
+        self.assertIn("Internal error", message)
 
     def test_clip_history_source_keeps_tail_and_counts_omitted(self) -> None:
         text = _history_text(50, 800)

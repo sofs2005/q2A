@@ -419,9 +419,16 @@ Anthropic Messages（`POST /v1/messages`）：
 实现要点：
 
 - 摘要器在 `backend/services/context_summarizer.py`；请求走
-  `QwenClient.complete_chat_once()`（非流式、`chat_transport=True`、复用当前账号），
+  `QwenClient.stream_chat_once()`（`chat_transport=True`、复用当前账号），
   单条纯文本消息 + `files=[]`，**天然不会二次触发**上下文卸载 / 附件预处理
   （代码里另有保护性校验，防止将来被接回主管线造成递归）；
+- **必须流式**：t2t 对话上游不支持非流式，`stream=False` 只会拿到
+  `HTTP 200 + {"success":false,"data":{"code":"Bad_Request"}}`。payload 保持
+  `stream=true` / `incremental_output=true`，按 SSE 逐帧取
+  `choices[].delta.content`；`phase` 为 `think` / `thinking` / `thinking_summary`
+  的思考帧**不进摘要**（只有全是思考、没有 answer 时才拿思考正文兜底）；
+- 上游错误信封（`success:false`）会把 `data.code` / `data.details` 写进异常消息，
+  日志里能直接看出是 `Bad_Request` 而不是 `empty body`；
 - 超时用 `asyncio.wait_for`（`CONTEXT_SUMMARY_TIMEOUT_SECONDS`，默认 60s）；
   任何异常都返回 `None`，调用方回退截断；
 - **摘要优先级高于截断，但摘要失败必须回退截断**：`_summarize_history_blob()` 返回
