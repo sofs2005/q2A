@@ -124,6 +124,16 @@ async def lifespan(app: FastAPI):
         app.state.upstream_file_cache = UpstreamFileCache(app.state.context_cache_db)
         app.state.context_offloader = ContextOffloader(settings)
         app.state.upstream_file_uploader = UpstreamFileUploader(app.state.qwen_client, settings)
+        # 上传出口池：`getstsToken` 挂到不同出口 IP 上绕开出口级 WAF 惩罚。
+        # `UPLOAD_EXIT_POOL` 为空 / `UPLOAD_VIA_EXIT=never` 时是 None（不碰代理）。
+        app.state.upload_exit_pool = app.state.upstream_file_uploader.exit_pool
+        if app.state.upload_exit_pool is not None:
+            log.info(
+                "[UploadExit] exit pool enabled exits=%s cooldown=%ss max_failures=%s",
+                len(app.state.upload_exit_pool.exit_ids),
+                int(app.state.upload_exit_pool.cooldown_seconds),
+                app.state.upload_exit_pool.max_failures,
+            )
         # 浏览器上传代理：惰性连接（首次真正上传时才连浏览器）。endpoint 非空走远程
         # CDP，为空则在进程内启动 Playwright Chromium（local 模式）；两者都由
         # UPLOAD_BROWSER_MODE / UPLOAD_VIA_BROWSER 决定。

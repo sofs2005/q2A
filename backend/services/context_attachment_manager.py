@@ -102,6 +102,25 @@ def _upload_account_excludes(account_pool) -> set:
     return set()
 
 
+def _upload_exit_pool_enabled(uploader: Any) -> bool:
+    """出口池取 STS 这条链路是否启用。
+
+    判定口径：上传器带 `exit_pool` 且池非空（`UPLOAD_EXIT_POOL` 配了出口）。
+
+    - 池为空 / `UPLOAD_VIA_EXIT=never` → `ExitPool.from_settings()` 返回 None，
+      上传器的 `exit_pool` 属性就是 None → 本函数 False，降级顺序退化为
+      「浏览器 → 直连 HTTP」（与历史行为一致，一行代理都不碰）。
+    - 单测替身可能只给一个裸 `exit_pool` 对象（无 `enabled` 属性）：视为启用。
+    """
+    pool = getattr(uploader, "exit_pool", None)
+    if pool is None:
+        return False
+    enabled = getattr(pool, "enabled", None)
+    if enabled is None:
+        return True
+    return bool(enabled)
+
+
 def _browser_upload_enabled(settings_obj: Any, browser_proxy: Any) -> bool:
     """浏览器上传链路是否可用。
 
@@ -626,11 +645,55 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
         )
         return remote
 
+    async def _try_exit_pool_upload(current_acc, local_meta) -> dict[str, Any] | None:
+        """出口池取 STS + OSS 直传：最快（~6s）且不烧风控分，**降级链第一档**。
+
+        `uploader.upload_local_file()` 内部会在池里轮询出口，拿到 STS 后 OSS PUT
+        直连。池里所有出口都被 WAF 拦 / 连不上时抛 `UpstreamWafChallengeError`，
+        这里吞掉返回 None，把机会交给浏览器代理。
+
+        Returns:
+            与 `uploader.upload_local_file()` 同结构的结果字典，或 None。
+        """
+        if not _upload_exit_pool_enabled(uploader):
+            return None
+        try:
+            return await uploader.upload_local_file(current_acc, local_meta)
+        except UpstreamWafChallengeError as exc:
+            log.warning(
+                "[ContextAttachment] exit pool upload unavailable session_key=%s surface=%s account=%s filename=%s error=%s",
+                session_key,
+                surface,
+                getattr(current_acc, "email", None),
+                str(local_meta.get("filename") or ""),
+                str(exc)[:200],
+            )
+            return None
+
+    async def _upload_direct_http(current_acc, local_meta) -> dict[str, Any]:
+        """直连 HTTP（现状）：不挂代理取 STS → OSS PUT。
+
+        没有出口池的老部署、或出口池已全部失败时的最后一条 HTTP 路径。
+        上传器若没实现 `upload_local_file_direct`（老实现 / 单测替身），
+        退回 `upload_local_file`。
+        """
+        direct = getattr(uploader, "upload_local_file_direct", None)
+        if callable(direct):
+            return await direct(current_acc, local_meta)
+        return await uploader.upload_local_file(current_acc, local_meta)
+
     async def _upload_with_failover(current_acc, local_meta, ext, *, allow_browser: bool):
         """上传单文件并处理换号回退，返回 (remote, acc, uploaded)。
 
+        降级顺序（快 / 便宜 → 慢 / 贵）：
+
+        1. **出口池取 STS + 直传 OSS**（~6s，不烧风控分）：池启用时才试；
+        2. **浏览器代理**（过验证码换 STS，45s 硬超时）：`allow_browser=True` 时；
+        3. **直连 HTTP**（现状）：`upload_local_file_direct`，撞 WAF 就抛；
+        4. 内联 / 400：由外层统一处理。
+
+        另：
         - 命中缓存：直接返回 (remote, acc, False)
-        - `allow_browser=True` 且浏览器上传可用：先试浏览器（过验证码换 STS），失败再走 HTTP 上传
         - RateLimited（每日上传配额）：标记超限号→落盘→排除→换号循环，无号可用则抛出（外层回退内联）
         - 网络类错误：换号重试一次，仍失败则抛出
 
@@ -641,11 +704,14 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
         下没有替代路径，慢一点也比丢附件好。
 
         而 `plan.generated_files`（上下文卸载生成的 context 文件）是**网关自己造的**：
-        它每个「带 tools / 大上下文」的请求都会产生，且**永远有替代路径**（HTTP OSS
-        上传，撞 WAF 就按既有逻辑降级为内联文本）。一旦让内部生成文件也走浏览器上传，
-        就等于「每个普通请求都去开一次浏览器解一次拼图」：请求被拖死、风控分被打高，
-        且收益为零（内联文本本来就是可接受的降级）。2026-11 的生产事故就是这么来的：
-        一个 3s 的带 tools 请求被拖成 120s 超时。
+        它每个「带 tools / 大上下文」的请求都会产生，且**永远有替代路径**（出口池 /
+        直连 OSS 上传，撞 WAF 就按既有逻辑降级为内联文本）。一旦让内部生成文件也走
+        浏览器上传，就等于「每个普通请求都去开一次浏览器解一次拼图」：请求被拖死、
+        风控分被打高，且收益为零（内联文本本来就是可接受的降级）。2026-11 的生产
+        事故就是这么来的：一个 3s 的带 tools 请求被拖成 120s 超时。
+
+        出口池**不受这条限制**：它只是换出口 IP 直连上游，几秒内结束、不碰风控分，
+        所以生成文件同样走第一档。
         """
         network_retry_used = False
         while True:
@@ -653,11 +719,16 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
             if cache_entry is not None:
                 return cache_entry.remote_file_meta, current_acc, False
             try:
-                # 先试浏览器（过验证码换 STS），失败/未启用再走原 HTTP 上传。
+                # 1) 出口池取 STS + 直传 OSS（最快，且不烧风控分）
+                pool_remote = await _try_exit_pool_upload(current_acc, local_meta)
+                if pool_remote is not None:
+                    return pool_remote, current_acc, True
+                # 2) 浏览器代理（过验证码换 STS），失败/未启用再往下走
                 browser_remote = await _try_browser_upload(current_acc, local_meta, allow=allow_browser)
                 if browser_remote is not None:
                     return browser_remote, current_acc, True
-                remote = await uploader.upload_local_file(current_acc, local_meta)
+                # 3) 直连 HTTP（现状）
+                remote = await _upload_direct_http(current_acc, local_meta)
                 return remote, current_acc, True
             except FileUploadRateLimitedError as rate_exc:
                 current_acc = await _switch_account_on_upload_limit(current_acc, rate_exc)

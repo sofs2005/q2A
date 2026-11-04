@@ -373,22 +373,62 @@ base64 膨胀 1.33 倍，因此内联实际只能承载约 **6KB 二进制**：
 - 关闭 httpx 自动重定向，**每一跳**都重新校验主机与解析结果（防重定向绕过 / DNS rebinding）；
 - 20s 超时、字节上限、最多 3 跳重定向。
 
+### 上传出口池（`getstsToken` 主路径，推荐）
+
+阿里的风控惩罚是**出口级**的（按出口 IP 记分）：从一个被记分的出口打
+`POST /api/v2/files/getstsToken` 会 100% 撞拼图验证码，**换一个干净出口就直接返回
+`file_id`**，完全不触发验证码。
+
+代理系统给的是「一个端口 + 不同用户名后缀 = 不同粘性出口」：
+
+```
+socks5h://Default.<后缀>@10.6.6.114:2260
+```
+
+实测 12 个后缀里 8 个可用（`g/j/l/c/d/e/i/b`）。整条链路（2MB 视频，零验证码）：
+
+| 步骤 | 走不走代理 | 实测耗时 |
+| --- | --- | --- |
+| `getstsToken` | **走**（出口池里挑一个） | 5~6s |
+| OSS PUT（`oss2`） | 直连 | 4.0s / 2MB |
+| `chats/new` + `completions` | 直连（走代理反而被 WAF 拦） | 200 |
+
+```bash
+UPLOAD_EXIT_POOL=socks5h://Default.g@10.6.6.114:2260,socks5h://Default.j@10.6.6.114:2260
+UPLOAD_VIA_EXIT=auto                     # auto（默认，池非空即启用）| always | never
+UPLOAD_EXIT_COOLDOWN_SECONDS=600         # 连续失败达阈值后的冷却时长
+UPLOAD_EXIT_MAX_FAILURES=2               # 连续失败多少次投入冷却（成功后清零）
+UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS=10     # 单次健康探测超时
+```
+
+- 出口不稳（SOCKS5 connect 失败 / 25s 超时）由池自己处理：**轮询挑下一个 + 连续失败冷却**，
+  冷却中的出口被 `pick()` 跳过，冷却到期自动复位（失败计数清零，重新给满 N 次机会）。
+- 日志里只有后缀 id，**不含凭据**：`[UploadExit] sts ok exit=Default.g elapsed=5.9s file=xx size=...`、
+  `[UploadExit] exit=Default.c blocked reason=waf → next`。
+- 观测：`GET /admin/upload/probe` 的 `exit_pool` 字段给出
+  `{enabled, exits: [{id, state, failures, successes, cooldown_remaining, last_error}]}`。
+
+**上传降级顺序**（快 / 便宜 → 慢 / 贵）：
+
+```
+附件 → 内联放得下？ ── 是 ──▶ data URI 内联（默认路径）
+                     └ 否 ──▶ ① 出口池取 STS + 直传 OSS（~6s，不烧风控分）
+                               ② 浏览器代理（过验证码换 STS，45s 硬超时，默认仍需显式开启）
+                               ③ 直连 HTTP（不挂代理，现状）
+                               ④ 全失败 ──▶ 内联文本 / 400 attachment_too_large
+```
+
 ### 浏览器上传代理（突破 6KB 内联上限）
 
 > ⚠️ **默认关闭**（`UPLOAD_VIA_BROWSER=never`）。该通道通过率尚未验证，而失败代价是
 > 「起 Chromium + 种登录态 + 解拼图」把请求拖慢几十秒到几分钟、并消耗账号风控分。
 > 需要它的部署请显式设 `UPLOAD_VIA_BROWSER=auto`。
+> 现在它只是**第二档兜底**——首选是上面的出口池（更快且不烧风控分）。
 
 内联只装得下约 6KB，超过就得走上游 OSS 上传，而 `POST /api/v2/files/getstsToken`
 被阿里云 WAF 的**拼图验证码**拦着，纯 HTTP 客户端过不去。浏览器上传代理的做法是：
 **用一台真实浏览器只做「过验证码 + 换 STS 凭证」这件事**，拿到凭证后 OSS PUT 与 ref
 构造仍由 Python 侧完成（复用 `oss2` 与现有 uploader 逻辑），不依赖网页端内部状态。
-
-```
-附件 → 内联放得下？ ── 是 ──▶ data URI 内联（默认路径）
-                     └ 否 ──▶ 浏览器代理取 STS → oss2 PUT → 真实 ref
-                               └ 失败/未配置 ──▶ 400 attachment_too_large
-```
 
 **作用域（重要）**：浏览器上传**只用于调用方真实提供的附件**
 （`NormalizedAttachment`，`source` 为 `inline-*` / `remote-url` / `manual-upload`）。

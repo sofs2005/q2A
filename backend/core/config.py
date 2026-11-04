@@ -209,6 +209,22 @@ class Settings(BaseSettings):
     UPLOAD_DRAG_CALIBRATION_FILE: str = os.getenv(
         "UPLOAD_DRAG_CALIBRATION_FILE", str(DATA_DIR / "drag_calibration.json")
     )
+    # ---- 上传出口池（把 getstsToken 挂到不同出口 IP 上，绕开出口级 WAF 惩罚）----
+    # 逗号分隔的代理串。实测「不同后缀 = 不同粘性出口」，每个后缀是独立出口 IP：
+    #   UPLOAD_EXIT_POOL=socks5h://Default.g@10.6.6.114:2260,socks5h://Default.j@10.6.6.114:2260
+    # 12 个后缀里通常 8 个可用，从干净出口打 getstsToken 直接返回 file_id，
+    # 完全不触发拼图验证码。留空 = 不启用（走原直连路径）。
+    UPLOAD_EXIT_POOL: str = os.getenv("UPLOAD_EXIT_POOL", "").strip()
+    # auto   = 池非空即启用（默认）
+    # always = 同上，显式表达「一定要用出口池」
+    # never  = 完全不用代理（上传链路一行代理都不碰）
+    UPLOAD_VIA_EXIT: str = os.getenv("UPLOAD_VIA_EXIT", "auto").strip().lower() or "auto"
+    # 出口连续失败达阈值后冷却多久（秒）
+    UPLOAD_EXIT_COOLDOWN_SECONDS: float = float(os.getenv("UPLOAD_EXIT_COOLDOWN_SECONDS", 600))
+    # 连续失败多少次把出口投入冷却
+    UPLOAD_EXIT_MAX_FAILURES: int = int(os.getenv("UPLOAD_EXIT_MAX_FAILURES", 2))
+    # 单次出口健康探测（GET /api/v2/users/status）超时（秒）
+    UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS: float = float(os.getenv("UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS", 10))
     CONTEXT_GENERATED_DIR: str = os.getenv("CONTEXT_GENERATED_DIR", str(DATA_DIR / "context_files"))
     CONTEXT_CACHE_FILE: str = os.getenv("CONTEXT_CACHE_FILE", str(DATA_DIR / "context_cache.json"))
     UPLOADED_FILES_FILE: str = os.getenv("UPLOADED_FILES_FILE", str(DATA_DIR / "uploaded_files.json"))
