@@ -433,14 +433,22 @@ Anthropic Messages（`POST /v1/messages`）：
   任何异常都返回 `None`，调用方回退截断；
 - **摘要优先级高于截断，但摘要失败必须回退截断**：`_summarize_history_blob()` 返回
   `None` 时原样走 `_truncate_history_blob()`；
-- 缓存 key = `sha256(历史正文 + model + target_chars)`，内存 LRU + TTL。同一 session
-  连续对话、历史不变时第二次**必然命中**（`[ContextSummary] ok … cached=true`）；
-  历史或模型变化则 key 变化，自然 miss；
-- 日志：
+- **摘要只吃「历史前缀」**：最后一条 user 消息（本次提问）及其之后的工具续跑尾部
+  属于「当前任务」，**不进摘要**。切分口径只有一处
+  （`_split_current_task()`；卸载路径用 `_trim_current_task_from_blob()` 按
+  `## Message N [role]` 分块头切），摘要路径与 `_payload_with_history_summary()`
+  共用，避免规则漂移。切完历史为空或少于 3 条消息 → 直接不做摘要、走原逻辑；
+- 缓存 key = `sha256(历史正文 + model + target_chars)`，内存 LRU + TTL。因为 blob 里
+  不含当前提问，**同一段历史 + 不同问题第二次必然命中**
+  （`[ContextSummary] ok … cached=true`）；历史或模型变化则 key 变化，自然 miss；
+- **摘要太短视为失败**：源文本 > 1000 字符却只摘要出 < 20 字符（生产实测出现过
+  `summary=2`）→ `reason=summary too short` + 回退硬截断，垃圾摘要绝不进 prompt；
+- 日志（`summary_preview` 是摘要前 80 字符，用来一眼判断摘要质量）：
   ```
-  [ContextSummary] ok original=15555 summary=1980 model=qwen-plus cached=false elapsed=6.2s
-  [ContextSummary] ok original=15555 summary=1980 model=qwen-plus cached=true elapsed=0.0s
+  [ContextSummary] ok original=15555 summary=1980 model=qwen-plus cached=false elapsed=6.2s summary_preview='任务目标：把后端日志按天归档；已确认用 gzip；未完成：清理脚本尚未写。'
+  [ContextSummary] ok original=15555 summary=1980 model=qwen-plus cached=true elapsed=0.0s summary_preview='任务目标：把后端日志按天归档；已确认用 gzip；未完成：清理脚本尚未写。'
   [ContextSummary] failed reason=TimeoutError: → fallback truncate original=15555
+  [ContextSummary] failed reason=summary too short summary=2 min=20 original=15481 summary_preview='好的' → fallback truncate
   ```
 
 #### 文档 parse 熔断（`DOCUMENT_PARSE_*`）

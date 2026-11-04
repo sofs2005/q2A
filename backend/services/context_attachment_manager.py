@@ -306,6 +306,9 @@ _SUMMARY_ACCOUNT_TIMEOUT_SECONDS = 15.0
 _SUMMARY_BLOB_HEADER = "【历史摘要】"
 #: 摘要 blob 的尾行（原始规模，让模型知道上下文被压缩过）。
 _SUMMARY_BLOB_NOTE = "（原始 {original} 字符 / {messages} 条消息）"
+#: 历史条数太少就不摘要：1-2 条历史压出来的摘要几乎等于原文，白花一次上游请求。
+#: 切掉「当前任务」之后，短会话（只有一轮问答）会退化成 0-1 条历史 → 走原逻辑。
+_MIN_SUMMARY_HISTORY_MESSAGES = 3
 
 #: 「预算 <= 0 → 不限制」的 WARNING 只打一次，避免每个请求刷屏。
 _inline_budget_warned = False
@@ -588,8 +591,12 @@ async def _summarize_history_blob(
 ) -> str | None:
     """把完整历史正文换成摘要 blob（两段式总结的第一段）。
 
+    `blob` 必须是**历史前缀**（不含本次提问及其后的工具续跑尾部）：调用方要么用
+    `_split_current_task()` 过滤后的消息序列化，要么用
+    `_trim_current_task_from_blob()` 从 `plan.summary_text` 里切掉当前任务。
+
     Args:
-        blob: 完整历史正文（`plan.summary_text`）。
+        blob: 历史前缀正文（`## Message N [role]` 格式）。
         settings_obj: 配置对象（`context_offloader.settings`）。
         app: FastAPI app；用来取 `qwen_client` 与（必要时）借一个上游账号。
         payload: 原始请求 payload（取 model 决定摘要模型）。
@@ -598,9 +605,19 @@ async def _summarize_history_blob(
 
     Returns:
         `【历史摘要】\\n<摘要>\\n（原始 N 字符 / M 条消息）`；未启用 / 未超阈值 /
-        没有可用账号 / 摘要失败时返回 `None`（调用方回退到硬截断）。
+        历史条数太少 / 没有可用账号 / 摘要失败时返回 `None`（调用方回退到硬截断）。
     """
     if not blob or not _summary_enabled(settings_obj):
+        return None
+    message_count = count_history_messages(blob)
+    if message_count < _MIN_SUMMARY_HISTORY_MESSAGES:
+        # 切掉当前任务后历史太短（单轮问答就是这种情况）：摘要没有意义。
+        log.info(
+            "[ContextSummary] skipped reason=history_too_short messages=%d chars=%d session_key=%s",
+            message_count,
+            len(blob),
+            session_key,
+        )
         return None
     threshold = _summary_threshold(settings_obj)
     if len(blob) <= threshold:
@@ -735,6 +752,51 @@ def _split_block_header(block: str) -> tuple[str, str]:
     if not _HISTORY_BLOCK_HEADER_PREFIX_RE.match(header):
         return "", block
     return header, block[newline + 1 :]
+
+
+def _block_role(block: str) -> str | None:
+    """取分块头里的 role（`## Message 12 [user]` → `user`）；不是分块头返回 `None`。"""
+    header, _body = _split_block_header(block)
+    if not header:
+        return None
+    start = header.find("[")
+    end = header.find("]", start + 1)
+    if start < 0 or end < 0:
+        return None
+    return header[start + 1 : end].strip().lower()
+
+
+def _trim_current_task_from_blob(blob: str) -> str:
+    """按 `## Message N [role]` 结构切掉「最后一条 user 消息及其后的所有块」。
+
+    `ContextOffloader.plan()` 的 `summary_text` 是**全量**消息序列化，包含本次提问。
+    直接拿它做摘要有两个后果：
+
+    1. 换个问题 → blob 变 → 缓存 key（sha256(text+model+target)）变 → 永远 miss；
+    2. 把当前任务也拿去摘要，模型可能把「正在做的事」提前总结掉。
+
+    所以这里按分块头反向找最后一个 `[... user]` 块，从它开始整块丢弃（同时丢掉它
+    之后的 assistant / tool 续跑尾部），只留历史前缀。
+
+    Args:
+        blob: `plan.summary_text` 形态的历史序列化文本。
+
+    Returns:
+        历史前缀文本（已 strip）。切不出干净的历史（没有分块头 / 找不到 user 块）
+        时原样返回，由 `_summarize_history_blob()` 的「条数太少不摘要」兜底。
+    """
+    text = str(blob or "")
+    if not text.strip():
+        return ""
+    blocks = _split_history_blocks(text)
+    if len(blocks) <= 1:
+        # 没有分块头（或只有一块）：无法按消息切分，保持原样。
+        return text
+    for index in range(len(blocks) - 1, -1, -1):
+        if _block_role(blocks[index]) != "user":
+            continue
+        return "".join(blocks[:index]).strip()
+    return text
 
 
 def _history_note(dropped: int, original: int, kept: int) -> str:
@@ -945,6 +1007,35 @@ def _generated_context_filename(ext: str) -> str:
     return f"{uuid.uuid4().hex}.{ext}"
 
 
+def _split_current_task(messages: list[Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """把消息切成「历史前缀」与「当前任务」两段（**全模块唯一口径**）。
+
+    切分规则：**最后一条 user 消息及其之后的消息都属于「当前任务」**。
+
+    - 最后一条 user 消息 = 本次提问本身；
+    - 它之后的 assistant / tool 消息 = 工具续跑尾部（多轮工具调用），同样属于当前
+      任务，不能进摘要 —— 否则摘要会把「当前正在做的事」提前总结掉，多轮工具会断链。
+
+    摘要路径与 `_payload_with_history_summary()` 必须共用这一个函数，避免两处规则
+    漂移（漂移的直接后果：摘要 blob 里混进当前提问 → 缓存 key 每次都变 → 永远 miss）。
+
+    Args:
+        messages: 消息列表（元素可以是任意对象，非 `dict` 一律忽略）。
+
+    Returns:
+        `(history_messages, current_task_messages)`。没有 user 消息时返回
+        `(全部消息, [])`，即「整段都算历史」，与旧行为一致。
+    """
+    items = [message for message in (messages or []) if isinstance(message, dict)]
+    last_user_index = -1
+    for index, message in enumerate(items):
+        if message.get("role") == "user":
+            last_user_index = index
+    if last_user_index < 0:
+        return items, []
+    return items[:last_user_index], items[last_user_index:]
+
+
 def _serialize_history_messages(messages: list[Any]) -> str:
     """把消息序列化成与 `ContextOffloader.plan()` 同构的历史 blob。
 
@@ -970,15 +1061,13 @@ def _payload_with_history_summary(payload: dict[str, Any], summary_blob: str) ->
     最后一条 user 消息是「当前任务」，工具续跑的尾部（tool_result 等）也必须跟在
     它后面，否则多轮工具调用会断链。摘要放在它们**前面**，避免被 prompt 构建当成
     `CURRENT TASK - TOP PRIORITY`。
+
+    切分走 `_split_current_task()`（与摘要路径同一口径）。
     """
     messages = [message for message in (payload.get("messages") or []) if isinstance(message, dict)]
-    last_user_index = max(
-        (index for index, message in enumerate(messages) if message.get("role") == "user"),
-        default=-1,
-    )
-    tail = messages[last_user_index:] if last_user_index >= 0 else []
+    _history_messages, current_task_messages = _split_current_task(messages)
     rewritten = dict(payload)
-    rewritten["messages"] = [{"role": "user", "content": summary_blob}, *tail]
+    rewritten["messages"] = [{"role": "user", "content": summary_blob}, *current_task_messages]
     return rewritten
 
 
@@ -1023,8 +1112,12 @@ async def _fallback_context_attachment_result(
     history_text = raw_history
     summarized = False
     if history_text:
+        # 摘要只吃「历史前缀」：`plan.summary_text` 含本次提问（及其后的工具续跑
+        # 尾部），原样送进去会让缓存 key 随问题变化 → 永远 miss，而且把当前任务
+        # 也摘要掉。这里按分块头切掉「最后一条 user 及其后」，切完太短就不摘要。
+        summary_source = _trim_current_task_from_blob(history_text)
         summary_blob = await _summarize_history_blob(
-            blob=history_text,
+            blob=summary_source,
             settings_obj=settings_obj,
             app=app,
             payload=payload,
@@ -1157,7 +1250,11 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
         # 正常内联路径：历史原样留在 payload 里。默认配置下这里的历史 ≤ 8k（卸载
         # 阈值），无需处理；但把 `CONTEXT_INLINE_MAX_CHARS` 调大之后，这里会直接
         # 内联十几 k 的原文 —— 正好踩上游 punish 阈值，所以同样过一遍摘要。
-        history_blob = _serialize_history_messages(context_messages)
+        # 摘要只吃「历史前缀」（`_split_current_task` 与 `_payload_with_history_summary`
+        # 同一口径）：本次提问及其后的工具续跑尾部不进摘要，缓存 key 才对同一段历史
+        # 稳定。
+        history_messages, _current_task_messages = _split_current_task(context_messages)
+        history_blob = _serialize_history_messages(history_messages)
         summary_blob = await _summarize_history_blob(
             blob=history_blob,
             settings_obj=context_offloader.settings,

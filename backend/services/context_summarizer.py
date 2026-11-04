@@ -36,6 +36,13 @@
    每次都失败，日志只有 `empty body`）。所以 payload 保持
    `stream=True` / `incremental_output=True`，按 SSE 逐帧取
    `choices[].delta.content`，并且**只取非思考** phase 的正文。
+5. **摘要太短 = 失败**：源文本 > `MIN_SOURCE_CHARS_FOR_LENGTH_CHECK` 却只摘要出
+   < `MIN_SUMMARY_CHARS` 字符（生产实测出现过 `summary=2`），一律判失败回退截断 ——
+   把垃圾摘要塞进 prompt 等于把上下文清空。
+6. **摘要只吃「历史前缀」**：本模块只负责「把传进来的文本压成摘要」，切分口径由
+   调用方（`context_attachment_manager._split_current_task()` /
+   `_trim_current_task_from_blob()`）保证 —— 传进来的绝不能含本次提问，否则缓存
+   key 会随问题变化而永远 miss。
 """
 
 from __future__ import annotations
@@ -71,6 +78,18 @@ _BLOCK_HEADER_MARKER = "## Message "
 
 #: 摘要结果超长时的截断后缀。
 _TRIM_SUFFIX = "…"
+
+#: 摘要正文的**最短**合理长度。生产实测出现过 `summary=2`（只有 2 个字符）——
+#: 那不是摘要，是上游回了个噪声（或解析只捡到一个残片）。这种 blob 塞进 prompt
+#: 等于把上下文清空，必须判失败并回退硬截断。
+MIN_SUMMARY_CHARS = 20
+
+#: 「太短」判定只在**源文本足够长**时生效：短历史本来就该产出短摘要，用同一个
+#: 下限去卡会误杀正常结果。
+MIN_SOURCE_CHARS_FOR_LENGTH_CHECK = 1000
+
+#: 日志里摘要预览的字符数（`summary_preview='...'`）。
+SUMMARY_PREVIEW_CHARS = 80
 
 #: 从上游响应体里取正文时优先尝试的路径（Qwen 非流式 completions 是
 #: `data.messages[0].content`；OpenAI 兼容体是 `choices[0].message.content`）。
@@ -503,11 +522,12 @@ class ContextSummarizer:
         cached = self._cache_get(key)
         if cached is not None:
             log.info(
-                "[ContextSummary] ok original=%d summary=%d model=%s cached=true elapsed=%.1fs",
+                "[ContextSummary] ok original=%d summary=%d model=%s cached=true elapsed=%.1fs summary_preview=%s",
                 len(source_text),
                 len(cached),
                 model_name or "-",
                 0.0,
+                _preview(cached),
             )
             return cached
 
@@ -552,15 +572,29 @@ class ContextSummarizer:
             )
             return None
 
+        if len(summary) < MIN_SUMMARY_CHARS and len(source_text) > MIN_SOURCE_CHARS_FOR_LENGTH_CHECK:
+            # 源文本上千字符却只摘要出十几个字符：这是上游噪声，不是摘要。
+            # 塞进 prompt 等于把上下文清空 —— 宁可用硬截断的原文。
+            self.stats["failures"] += 1
+            log.warning(
+                "[ContextSummary] failed reason=summary too short summary=%d min=%d original=%d summary_preview=%s → fallback truncate",
+                len(summary),
+                MIN_SUMMARY_CHARS,
+                len(source_text),
+                _preview(summary),
+            )
+            return None
+
         if omitted > 0:
             summary = f"{OMITTED_NOTE_TEMPLATE.format(omitted=omitted)}\n{summary}"
         self._cache_set(key, summary)
         log.info(
-            "[ContextSummary] ok original=%d summary=%d model=%s cached=false elapsed=%.1fs",
+            "[ContextSummary] ok original=%d summary=%d model=%s cached=false elapsed=%.1fs summary_preview=%s",
             len(source_text),
             len(summary),
             model_name or "-",
             time.monotonic() - started,
+            _preview(summary),
         )
         return summary
 
@@ -685,6 +719,24 @@ def build_summary_prompt(text: str, *, target: int, omitted_messages: int = 0) -
     if omitted_messages > 0:
         body = f"{OMITTED_NOTE_TEMPLATE.format(omitted=omitted_messages)}\n{body}"
     return SUMMARY_PROMPT_TEMPLATE.format(target=int(target), body=body)
+
+
+def preview_text(text: str, limit: int = SUMMARY_PREVIEW_CHARS) -> str:
+    """把文本压成一行预览串（`repr` 形态，日志里带引号、看得见换行）。
+
+    Args:
+        text: 原始文本。
+        limit: 最多取多少字符。
+
+    Returns:
+        形如 `'要点 1…'` 的单行预览；空文本返回 `''`。
+    """
+    flat = " ".join(str(text or "").split())
+    return repr(flat[: max(0, int(limit))])
+
+
+#: 内部别名（日志里写起来短一点）。
+_preview = preview_text
 
 
 def trim_summary(text: str, target_chars: int) -> str:
