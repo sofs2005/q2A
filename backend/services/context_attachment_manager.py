@@ -9,9 +9,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from backend.core.config import resolve_model
 from backend.core.upstream_file_cache import UpstreamFileCacheEntry
 from backend.services.attachment_errors import InlineMediaTooLargeError
 from backend.services.client_profiles import user_role_system_text
+from backend.services.context_summarizer import count_history_messages, get_context_summarizer
 from backend.services.document_parse_breaker import get_document_parse_breaker
 from backend.services.inline_media_ref import (
     KIND_AUDIO,
@@ -295,6 +297,16 @@ _BLOCK_TRUNCATION_NOTE = "…（已截断，原消息 {original} 字符）"
 #: 纯文本附件注入块被字符预算截断时的提示（保留的是开头，与文件开头更关键一致）。
 _FILE_TRUNCATION_NOTE = "…（已截断，原文件 {original} 字符）"
 
+#: 两段式总结：历史超过多少字符才值得多花一次上游请求（与内联硬预算同源）。
+_DEFAULT_SUMMARY_THRESHOLD_CHARS = 8000
+#: 摘要失败回退截断时，临时借号的等待上限（秒）。比主请求的 60s 短：
+#: 摘要只是优化路径，不能为了它把已经降级的请求再拖一分钟。
+_SUMMARY_ACCOUNT_TIMEOUT_SECONDS = 15.0
+#: 摘要 blob 的头行（下游 prompt 里一眼能看出「这是摘要，不是原文」）。
+_SUMMARY_BLOB_HEADER = "【历史摘要】"
+#: 摘要 blob 的尾行（原始规模，让模型知道上下文被压缩过）。
+_SUMMARY_BLOB_NOTE = "（原始 {original} 字符 / {messages} 条消息）"
+
 #: 「预算 <= 0 → 不限制」的 WARNING 只打一次，避免每个请求刷屏。
 _inline_budget_warned = False
 
@@ -528,6 +540,129 @@ def _remaining_budget(budget: int | None, used: int) -> int | None:
     if budget is None:
         return None
     return max(0, budget - max(0, int(used)))
+
+
+def _summary_enabled(settings_obj: Any) -> bool:
+    """两段式总结总开关（`CONTEXT_SUMMARY_ENABLED`）。"""
+    raw = getattr(settings_obj, "CONTEXT_SUMMARY_ENABLED", True)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _summary_threshold(settings_obj: Any) -> int:
+    """历史超过多少字符才触发摘要（`CONTEXT_SUMMARY_THRESHOLD_CHARS`）。"""
+    try:
+        return int(getattr(settings_obj, "CONTEXT_SUMMARY_THRESHOLD_CHARS", _DEFAULT_SUMMARY_THRESHOLD_CHARS))
+    except (TypeError, ValueError):
+        return _DEFAULT_SUMMARY_THRESHOLD_CHARS
+
+
+def _summary_model_for(payload: Any, settings_obj: Any) -> str:
+    """决定摘要请求用哪个上游模型。
+
+    `CONTEXT_SUMMARY_MODEL` 为空时表示「跟主请求同模型」：这里取调用方请求的模型
+    并过一遍别名解析（`resolve_model`）。解析结果不是 qwen 家族（比如调用方用
+    `gpt-4.1` 这种网关别名）时，退回 `QWEN_PLUS_MODEL` —— 摘要只需要「便宜 + 会
+    归纳」，用最便宜的 plus 比把未知模型名丢给上游直接 400 更实用。
+    """
+    explicit = str(getattr(settings_obj, "CONTEXT_SUMMARY_MODEL", "") or "").strip()
+    if explicit:
+        return explicit
+    requested = str((payload or {}).get("model") or "") if isinstance(payload, dict) else ""
+    resolved = resolve_model(requested)
+    if resolved.lower().startswith("qwen"):
+        return resolved
+    fallback = str(getattr(settings_obj, "QWEN_PLUS_MODEL", "") or "").strip()
+    return fallback or resolved or "qwen-plus"
+
+
+async def _summarize_history_blob(
+    *,
+    blob: str,
+    settings_obj: Any,
+    app: Any = None,
+    payload: Any = None,
+    session_key: str = "",
+    summary_account: Any = None,
+) -> str | None:
+    """把完整历史正文换成摘要 blob（两段式总结的第一段）。
+
+    Args:
+        blob: 完整历史正文（`plan.summary_text`）。
+        settings_obj: 配置对象（`context_offloader.settings`）。
+        app: FastAPI app；用来取 `qwen_client` 与（必要时）借一个上游账号。
+        payload: 原始请求 payload（取 model 决定摘要模型）。
+        session_key: 仅用于日志定位。
+        summary_account: 调用方**已经持有**的上游账号（有就复用，避免多借一次号）。
+
+    Returns:
+        `【历史摘要】\\n<摘要>\\n（原始 N 字符 / M 条消息）`；未启用 / 未超阈值 /
+        没有可用账号 / 摘要失败时返回 `None`（调用方回退到硬截断）。
+    """
+    if not blob or not _summary_enabled(settings_obj):
+        return None
+    threshold = _summary_threshold(settings_obj)
+    if len(blob) <= threshold:
+        return None
+
+    state = getattr(app, "state", None) if app is not None else None
+    client = getattr(state, "qwen_client", None) if state is not None else None
+    if client is None:
+        # 精简 app / 单测替身没有客户端：直接走截断，不制造新的失败点。
+        log.info("[ContextSummary] skipped reason=no_client session_key=%s", session_key)
+        return None
+
+    summarizer = get_context_summarizer(settings_obj)
+    account = summary_account
+    pool = getattr(state, "account_pool", None) if state is not None else None
+    borrowed = False
+    if account is None and pool is not None:
+        try:
+            account = await pool.acquire_wait(timeout=_SUMMARY_ACCOUNT_TIMEOUT_SECONDS)
+            borrowed = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 借号失败等价于「没账号」
+            log.info(
+                "[ContextSummary] skipped reason=no_account error=%s session_key=%s",
+                f"{type(exc).__name__}: {str(exc)[:120]}",
+                session_key,
+            )
+            account = None
+    if account is None:
+        log.info("[ContextSummary] skipped reason=no_account session_key=%s", session_key)
+        return None
+
+    try:
+        summary = await summarizer.summarize(
+            text=blob,
+            model=_summary_model_for(payload, settings_obj),
+            account=account,
+            client=client,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 摘要永不 500
+        log.warning(
+            "[ContextSummary] failed reason=%s → fallback truncate session_key=%s",
+            f"{type(exc).__name__}: {str(exc)[:160]}",
+            session_key,
+        )
+        summary = None
+    finally:
+        if borrowed and pool is not None:
+            try:
+                pool.release(account)
+            except Exception:  # pragma: no cover - 归还失败不影响主流程
+                log.debug("[ContextSummary] release borrowed account failed", exc_info=True)
+
+    if not summary:
+        return None
+    return (
+        f"{_SUMMARY_BLOB_HEADER}\n{summary}\n"
+        f"{_SUMMARY_BLOB_NOTE.format(original=len(blob), messages=count_history_messages(blob))}"
+    )
 
 
 def _latest_user_text(messages: list[Any] | None) -> str:
@@ -810,7 +945,44 @@ def _generated_context_filename(ext: str) -> str:
     return f"{uuid.uuid4().hex}.{ext}"
 
 
-def _fallback_context_attachment_result(
+def _serialize_history_messages(messages: list[Any]) -> str:
+    """把消息序列化成与 `ContextOffloader.plan()` 同构的历史 blob。
+
+    只在「不走上下文卸载」的内联路径上用（那里 `plan.summary_text` 是空的），
+    格式必须和卸载路径一致，摘要器才能按 `## Message N [role]` 数消息条数、
+    按整条对齐裁剪。
+    """
+    parts: list[str] = []
+    for idx, message in enumerate(messages or [], 1):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "unknown")
+        text = _text_from_content(message.get("content", ""))
+        if not text.strip():
+            continue
+        parts.append(f"## Message {idx} [{role}]\n{text.strip()}\n")
+    return "\n".join(parts).strip()
+
+
+def _payload_with_history_summary(payload: dict[str, Any], summary_blob: str) -> dict[str, Any]:
+    """用摘要 blob 替换 payload 里的历史，**保留最后一条 user 消息及其之后的消息**。
+
+    最后一条 user 消息是「当前任务」，工具续跑的尾部（tool_result 等）也必须跟在
+    它后面，否则多轮工具调用会断链。摘要放在它们**前面**，避免被 prompt 构建当成
+    `CURRENT TASK - TOP PRIORITY`。
+    """
+    messages = [message for message in (payload.get("messages") or []) if isinstance(message, dict)]
+    last_user_index = max(
+        (index for index, message in enumerate(messages) if message.get("role") == "user"),
+        default=-1,
+    )
+    tail = messages[last_user_index:] if last_user_index >= 0 else []
+    rewritten = dict(payload)
+    rewritten["messages"] = [{"role": "user", "content": summary_blob}, *tail]
+    return rewritten
+
+
+async def _fallback_context_attachment_result(
     *,
     payload: dict[str, Any],
     session_key: str,
@@ -822,6 +994,8 @@ def _fallback_context_attachment_result(
     inline_text_tokens: int = 0,
     upstream_files: list[dict[str, Any]] | None = None,
     settings_obj: Any = None,
+    app: Any = None,
+    summary_account: Any = None,
 ) -> dict[str, Any]:
     """上传 / parse 不可用时的兜底：把历史正文当成一条 user 消息内联注入。
 
@@ -829,9 +1003,16 @@ def _fallback_context_attachment_result(
     也不丢上下文」。但上游对超大内联 prompt **直接拒绝**（x5sec punish 页 → 500），
     所以这里按 `ATTACHMENT_INLINE_TEXT_MAX_CHARS` 做**体积裁剪**：
 
+    0. **两段式总结优先**：历史超 `CONTEXT_SUMMARY_THRESHOLD_CHARS` 时先把它压成
+       要点摘要（摘要 blob 远小于原文，天然落在预算内）；摘要失败（超时 / 额度 /
+       无账号 / 无客户端）则原样往下走截断 —— 摘要永远不能变成 500；
     1. 历史 blob：按 `## Message N` 整条从**最早**开始丢弃（最新内容在最后面）；
     2. 附件文本：每块保留开头 + 结尾标注；
     3. 优先级：最新的用户消息（永不截断） > 用户附件文本 > 历史 blob。
+
+    Args:
+        app: FastAPI app（取 `qwen_client` / 需要时借号做摘要）；`None` 表示不做摘要。
+        summary_account: 调用方已持有的上游账号（避免为摘要多借一次号）。
     """
     budget = _inline_char_budget(settings_obj)
     fallback_payload = dict(payload)
@@ -840,7 +1021,22 @@ def _fallback_context_attachment_result(
     raw_history = str(plan.summary_text or "") if use_generated_context_files else ""
     original_history_chars = len(raw_history)
     history_text = raw_history
-    kept_history_chars = original_history_chars
+    summarized = False
+    if history_text:
+        summary_blob = await _summarize_history_blob(
+            blob=history_text,
+            settings_obj=settings_obj,
+            app=app,
+            payload=payload,
+            session_key=session_key,
+            summary_account=summary_account,
+        )
+        if summary_blob:
+            history_text = summary_blob
+            summarized = True
+    # 截断前的长度（摘要生效时是摘要 blob 的长度，不是原始历史）。
+    blob_before_truncate = len(history_text)
+    kept_history_chars = blob_before_truncate
     dropped_messages = 0
 
     latest_user_text = _latest_user_text(
@@ -853,10 +1049,10 @@ def _fallback_context_attachment_result(
     history_budget = _remaining_budget(attachment_budget, blocks_chars)
     truncated_history = False
     if history_text:
-        history_text, original_history_chars, kept_history_chars, dropped_messages = _truncate_history_blob(
+        history_text, _blob_chars, kept_history_chars, dropped_messages = _truncate_history_blob(
             history_text, history_budget
         )
-        truncated_history = kept_history_chars < original_history_chars
+        truncated_history = kept_history_chars < blob_before_truncate
 
     if history_text:
         summary_parts.append(history_text)
@@ -900,6 +1096,13 @@ def _fallback_context_attachment_result(
             original_history_chars,
             kept_history_chars,
             dropped_messages,
+        )
+    if summarized:
+        log.info(
+            "[ContextAttachment] inline fallback summarized original=%d blob=%d session_key=%s",
+            original_history_chars,
+            kept_history_chars,
+            session_key,
         )
     return {
         "payload": fallback_payload,
@@ -951,6 +1154,35 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
     inline_char_budget = _inline_char_budget(context_offloader.settings)
     use_generated_context_files = bool(plan.generated_files)
     if not use_generated_context_files and not manual_attachments:
+        # 正常内联路径：历史原样留在 payload 里。默认配置下这里的历史 ≤ 8k（卸载
+        # 阈值），无需处理；但把 `CONTEXT_INLINE_MAX_CHARS` 调大之后，这里会直接
+        # 内联十几 k 的原文 —— 正好踩上游 punish 阈值，所以同样过一遍摘要。
+        history_blob = _serialize_history_messages(context_messages)
+        summary_blob = await _summarize_history_blob(
+            blob=history_blob,
+            settings_obj=context_offloader.settings,
+            app=app,
+            payload=payload,
+            session_key=session_key,
+        )
+        if summary_blob:
+            log.info(
+                "[ContextSummary] injected inline payload session_key=%s original=%d blob=%d",
+                session_key,
+                len(history_blob),
+                len(summary_blob),
+            )
+            return {
+                "payload": _payload_with_history_summary(payload, summary_blob),
+                "session_key": session_key,
+                "context_mode": "summary",
+                "upstream_files": list(payload.get("upstream_files", []) or []),
+                "bound_account": None,
+                "bound_account_email": None,
+                "generated_local_files": [],
+                "context_attachment_tokens": 0,
+                "attachment_fallback": False,
+            }
         return {
             "payload": payload,
             "session_key": session_key,
@@ -1066,7 +1298,7 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                 surface,
                 breaker.remaining_seconds(),
             )
-            return _fallback_context_attachment_result(
+            return await _fallback_context_attachment_result(
                 payload=payload,
                 session_key=session_key,
                 plan=plan,
@@ -1080,6 +1312,7 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                 inline_text_tokens=inline_text_tokens,
                 upstream_files=upstream_files,
                 settings_obj=context_offloader.settings,
+                app=app,
             )
 
     requires_sticky_account = bool(manual_attachments or payload.get("upstream_files"))
@@ -1107,7 +1340,7 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
         if inline_too_large_errors:
             # 内联放不下 + 没有账号可上传 → 明确 4xx，绝不静默丢附件。
             raise inline_too_large_errors[0]
-        return _fallback_context_attachment_result(
+        return await _fallback_context_attachment_result(
             payload=payload,
             session_key=session_key,
             plan=plan,
@@ -1470,22 +1703,29 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                 [getattr(item, "ext", "") for item in getattr(plan, "generated_files", [])],
                 exc,
             )
-        account_pool.release(acc)
         if inline_too_large_errors:
             # 内联放不下 + 上传回退不可用 → 明确 4xx，绝不静默丢附件。
+            account_pool.release(acc)
             raise inline_too_large_errors[0] from exc
-        return _fallback_context_attachment_result(
-            payload=payload,
-            session_key=session_key,
-            plan=plan,
-            use_generated_context_files=use_generated_context_files,
-            manual_attachments=manual_attachments,
-            fallback_message="Attachment upload failed. Continue with the available inline context only.",
-            inline_text_blocks=inline_text_blocks,
-            inline_text_tokens=inline_text_tokens,
-            upstream_files=upstream_files,
-            settings_obj=context_offloader.settings,
-        )
+        # 摘要请求复用**仍然持有**的账号（acc 还没归还）：这里必须等兜底结果算完
+        # 才能 release，否则账号会被别的请求并发占用。
+        try:
+            return await _fallback_context_attachment_result(
+                payload=payload,
+                session_key=session_key,
+                plan=plan,
+                use_generated_context_files=use_generated_context_files,
+                manual_attachments=manual_attachments,
+                fallback_message="Attachment upload failed. Continue with the available inline context only.",
+                inline_text_blocks=inline_text_blocks,
+                inline_text_tokens=inline_text_tokens,
+                upstream_files=upstream_files,
+                settings_obj=context_offloader.settings,
+                app=app,
+                summary_account=acc,
+            )
+        finally:
+            account_pool.release(acc)
 
     rewritten = dict(payload)
     rewritten["messages"] = plan.inline_messages if use_generated_context_files else messages

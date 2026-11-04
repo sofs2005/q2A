@@ -338,8 +338,15 @@ Anthropic Messages（`POST /v1/messages`）：
 | `ATTACHMENT_INLINE_TEXT_ENABLED` | `true` | 纯文本类附件（txt/md/csv/json/…）由网关本地解码后直接注入 prompt，**零上游请求**（不调 `getstsToken` / 不 PUT / 不 parse）。 |
 | `ATTACHMENT_INLINE_TEXT_MAX_BYTES` | `131072` | 单个文本附件注入的字节上限（128KB）；超过即截断并标注 `…（已截断，原文件 N KB）`。 |
 | `ATTACHMENT_INLINE_TEXT_MAX_CHARS` | `8000` | 内联上下文**总字符预算**。上游对超大内联 prompt 直接返回 x5sec punish 页（8k 通过 / 12k 必挂），历史 blob 超预算时按整条消息从**最早**丢弃并标注 `…（已省略前 K 条历史消息，原始 N 字符，保留最近 M 字符）`；`<=0` 表示不限制。 |
-| `DOCUMENT_PARSE_MAX_FAILURES` | `2` | `files/parse` 连续失败多少次后熔断（撞 WAF 则一次即熔断）。 |
-| `DOCUMENT_PARSE_COOLDOWN_SECONDS` | `600` | 熔断冷却时长：期内文档类附件**直接跳过「上传 + parse」**走文本降级。 |
+| `CONTEXT_SUMMARY_ENABLED` | `true` | 两段式总结总开关。历史超阈值时先把它压成要点摘要再发请求，而不是直接丢历史。 |
+| `CONTEXT_SUMMARY_THRESHOLD_CHARS` | `8000` | 历史超过多少字符才触发摘要（≤ 阈值直接内联，零额外上游请求）。 |
+| `CONTEXT_SUMMARY_MAX_SOURCE_CHARS` | `24000` | 送去总结的历史上限；超过只把**最近**这么多字符拿去总结，更早的丢弃并标注「更早的 N 条消息已省略」。 |
+| `CONTEXT_SUMMARY_TARGET_CHARS` | `2000` | 摘要目标字数（写进 prompt 约束输出；超长按字符截断 + `…`）。 |
+| `CONTEXT_SUMMARY_TIMEOUT_SECONDS` | `60` | 单次摘要请求超时；超时即回退硬截断。 |
+| `CONTEXT_SUMMARY_MODEL` | 空 | 摘要用的上游模型。**留空 = 跟主请求同模型**（解析结果不是 qwen 家族时退回 `QWEN_PLUS_MODEL`）。 |
+| `CONTEXT_SUMMARY_CACHE_TTL_SECONDS` | `1800` | 摘要缓存 TTL。同一 session 历史不变时第二次直接命中（日志 `cached=true`），不再打上游。 |
+| `CONTEXT_SUMMARY_CACHE_MAX_ENTRIES` | `256` | 摘要缓存条目上限（内存 LRU，按最久未用淘汰）。 |
+| `DOCUMENT_PARSE_MAX_FAILURES` | `2` | `files/parse` 连续失败多少次后熔断（撞 WAF 则一次即熔断）。 || `DOCUMENT_PARSE_COOLDOWN_SECONDS` | `600` | 熔断冷却时长：期内文档类附件**直接跳过「上传 + parse」**走文本降级。 |
 | `MULTIMODAL_STRICT` | `true` | 模型不支持该模态时是否直接 400；`false` 时只丢弃并告警。 |
 | `MODEL_MODALITIES_OVERRIDE` | 空 | 模态矩阵覆盖（JSON），如 `{"qwen3.8-max":["text","image","video","audio"]}`。 |
 
@@ -383,6 +390,51 @@ Anthropic Messages（`POST /v1/messages`）：
   了就答非所问，所以先给它留预算，并用「检查 + 兜底补回」保证它 100% 在场）；
 - 预算内 → 行为完全不变（逐字节相同、不加任何标记）；配 `0` / 负数 → 不限制（旧行为，
   打一次 WARNING）。
+
+#### 两段式总结（`CONTEXT_SUMMARY_*`）
+
+硬截断能保证不撞 punish，但**会丢上下文**。历史超阈值时升级为两段式总结：
+
+```
+历史超阈值
+  ├─ 第一段请求：历史正文 + 「请总结以上对话要点」  → 摘要（进缓存）
+  └─ 第二段请求：摘要 + 本次用户消息（+工具上下文） → 最终回答
+```
+
+| 历史大小 | 处理 |
+|---|---|
+| ≤ `CONTEXT_SUMMARY_THRESHOLD_CHARS`（8k） | 直接内联（现状，零额外请求） |
+| 8k ~ 24k | 两段式总结，摘要进缓存 |
+| > 24k | 只把**最近** 24k 拿去总结，更早的丢弃并标注「更早的 N 条消息已省略」 |
+| 总结失败（超时 / 额度 / 异常 / 无可用账号） | 回退到硬截断，**不 500** |
+
+注入到 prompt 里的形状：
+
+```
+【历史摘要】
+<摘要正文>
+（原始 15555 字符 / 21 条消息）
+```
+
+实现要点：
+
+- 摘要器在 `backend/services/context_summarizer.py`；请求走
+  `QwenClient.complete_chat_once()`（非流式、`chat_transport=True`、复用当前账号），
+  单条纯文本消息 + `files=[]`，**天然不会二次触发**上下文卸载 / 附件预处理
+  （代码里另有保护性校验，防止将来被接回主管线造成递归）；
+- 超时用 `asyncio.wait_for`（`CONTEXT_SUMMARY_TIMEOUT_SECONDS`，默认 60s）；
+  任何异常都返回 `None`，调用方回退截断；
+- **摘要优先级高于截断，但摘要失败必须回退截断**：`_summarize_history_blob()` 返回
+  `None` 时原样走 `_truncate_history_blob()`；
+- 缓存 key = `sha256(历史正文 + model + target_chars)`，内存 LRU + TTL。同一 session
+  连续对话、历史不变时第二次**必然命中**（`[ContextSummary] ok … cached=true`）；
+  历史或模型变化则 key 变化，自然 miss；
+- 日志：
+  ```
+  [ContextSummary] ok original=15555 summary=1980 model=qwen-plus cached=false elapsed=6.2s
+  [ContextSummary] ok original=15555 summary=1980 model=qwen-plus cached=true elapsed=0.0s
+  [ContextSummary] failed reason=TimeoutError: → fallback truncate original=15555
+  ```
 
 #### 文档 parse 熔断（`DOCUMENT_PARSE_*`）
 

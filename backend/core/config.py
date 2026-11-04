@@ -175,6 +175,27 @@ class Settings(BaseSettings):
     # 附件正文合计超预算时按整条消息从**最早**开始丢弃（最新的在最后面），绝不按
     # 字符位置切。<=0 表示不限制（保持旧行为，启动后首次使用打一次 WARNING）。
     ATTACHMENT_INLINE_TEXT_MAX_CHARS: int = int(os.getenv("ATTACHMENT_INLINE_TEXT_MAX_CHARS", 8000))
+    # ---- 两段式总结（历史超阈值时先压成要点摘要，而不是直接丢历史）----
+    # 硬截断能保证不撞 punish，但会**丢上下文**。历史超阈值时改成两段式：
+    #   第一段：历史正文 + 「请总结以上对话要点」 → 摘要
+    #   第二段：摘要 + 本次用户消息（+工具上下文） → 最终回答
+    # 摘要失败（超时 / 额度 / 异常 / 无可用账号）一律回退到上面的硬截断，**不会 500**。
+    CONTEXT_SUMMARY_ENABLED: bool = os.getenv("CONTEXT_SUMMARY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    # 历史超过多少字符才触发摘要（默认与内联硬预算同为 8000：≤ 阈值直接内联，零额外请求）
+    CONTEXT_SUMMARY_THRESHOLD_CHARS: int = int(os.getenv("CONTEXT_SUMMARY_THRESHOLD_CHARS", 8000))
+    # 送去总结的历史正文上限：超过只把**最近**这么多字符拿去总结，更早的丢弃并标注
+    # 「更早的 N 条消息已省略」。24k 是「摘要输入本身也不会撞 punish」的经验上限。
+    CONTEXT_SUMMARY_MAX_SOURCE_CHARS: int = int(os.getenv("CONTEXT_SUMMARY_MAX_SOURCE_CHARS", 24000))
+    # 摘要目标字数（写进 prompt 约束输出，超长会按字符截断 + `…`）
+    CONTEXT_SUMMARY_TARGET_CHARS: int = int(os.getenv("CONTEXT_SUMMARY_TARGET_CHARS", 2000))
+    # 单次摘要请求超时（秒）。超时即回退截断。
+    CONTEXT_SUMMARY_TIMEOUT_SECONDS: float = float(os.getenv("CONTEXT_SUMMARY_TIMEOUT_SECONDS", 60))
+    # 摘要用的上游模型；**留空 = 跟主请求同模型**（解析结果不是 qwen 家族时退回 QWEN_PLUS_MODEL）
+    CONTEXT_SUMMARY_MODEL: str = os.getenv("CONTEXT_SUMMARY_MODEL", "").strip()
+    # 摘要缓存 TTL（秒）与条目上限（内存 LRU）。同一 session 历史不变时第二次直接命中，
+    # 不再打上游；key = sha256(历史正文 + model + target_chars)。
+    CONTEXT_SUMMARY_CACHE_TTL_SECONDS: float = float(os.getenv("CONTEXT_SUMMARY_CACHE_TTL_SECONDS", 1800))
+    CONTEXT_SUMMARY_CACHE_MAX_ENTRIES: int = int(os.getenv("CONTEXT_SUMMARY_CACHE_MAX_ENTRIES", 256))
     # ---- 文档 parse 熔断（`/api/v2/files/parse` 进程级冷却）----
     # 连续失败 `DOCUMENT_PARSE_MAX_FAILURES` 次（或直接撞 WAF）后，接下来
     # `DOCUMENT_PARSE_COOLDOWN_SECONDS` 秒内**跳过「上传 + parse」**直接走文本降级，
