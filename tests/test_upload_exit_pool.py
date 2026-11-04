@@ -509,13 +509,14 @@ class DegradeOrderTests(unittest.IsolatedAsyncioTestCase):
 
     def _attachment(self) -> tuple[NormalizedAttachment, str]:
         """文档附件：图片 / 音频 / 视频默认内联，只有文档才走上传降级链。"""
-        handle = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+        # .pdf：纯文本类附件（.txt）走网关本地解码注入，不经过上传降级链。
+        handle = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
         handle.write(b"user supplied document bytes")
         handle.close()
         attachment = NormalizedAttachment(
             file_id="local-doc",
-            filename="notes.txt",
-            content_type="text/plain",
+            filename="notes.pdf",
+            content_type="application/pdf",
             source="manual-upload",
             local_path=handle.name,
             sha256="sha-doc",

@@ -162,6 +162,19 @@ class Settings(BaseSettings):
     # 出网请求，存在 SSRF 风险（内网探测 / 云元数据凭证泄露），故默认 false；
     # 开启时也会做私网地址校验 + 每跳重定向复检。
     INLINE_ATTACHMENT_REMOTE_FETCH: bool = os.getenv("INLINE_ATTACHMENT_REMOTE_FETCH", "false").lower() in {"1", "true", "yes", "on"}
+    # ---- 纯文本类附件：网关本地解码后直接注入 prompt ----
+    # 上游 `/api/v2/files/parse` 已被阿里云 WAF 拦死（换出口无效），而文档类附件
+    # 必须先 PUT 再 parse 才能被模型读到。文本类附件（txt/md/csv/json/...）根本
+    # 不需要这条链路：网关自己读字节解码即可，**一次上游请求都不发**。
+    ATTACHMENT_INLINE_TEXT_ENABLED: bool = os.getenv("ATTACHMENT_INLINE_TEXT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    # 单文件注入字节上限（默认 128KB）。超过则截断并在结尾标注「已截断，原文件 N KB」。
+    ATTACHMENT_INLINE_TEXT_MAX_BYTES: int = int(os.getenv("ATTACHMENT_INLINE_TEXT_MAX_BYTES", 131072))
+    # ---- 文档 parse 熔断（`/api/v2/files/parse` 进程级冷却）----
+    # 连续失败 `DOCUMENT_PARSE_MAX_FAILURES` 次（或直接撞 WAF）后，接下来
+    # `DOCUMENT_PARSE_COOLDOWN_SECONDS` 秒内**跳过「上传 + parse」**直接走文本降级，
+    # 避免每个请求都白等一次 10~20s 的失败上传。图片 / 音频 / 视频 / 纯文本不受影响。
+    DOCUMENT_PARSE_MAX_FAILURES: int = int(os.getenv("DOCUMENT_PARSE_MAX_FAILURES", 2))
+    DOCUMENT_PARSE_COOLDOWN_SECONDS: int = int(os.getenv("DOCUMENT_PARSE_COOLDOWN_SECONDS", 600))
     # 模态门控：true=模型不支持该模态时直接 400；false=只丢弃该附件并 warn。
     MULTIMODAL_STRICT: bool = os.getenv("MULTIMODAL_STRICT", "true").lower() in {"1", "true", "yes", "on"}
     # 模型模态覆盖表（JSON，如 {"qwen3.8-max":["text","image","video","audio"]}）。

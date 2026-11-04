@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import calendar
 import json
 import logging
@@ -12,6 +13,7 @@ from urllib.parse import parse_qs, urlparse
 
 import oss2
 
+from backend.services.document_parse_breaker import get_document_parse_breaker
 from backend.services.exit_pool import ExitPool, exit_id_from_url
 from backend.services.sts_ref_builder import (
     build_remote_ref,
@@ -582,52 +584,7 @@ class UpstreamFileUploader:
         # 上游只对文档解析（`parsedFileTypes=[FILE]`）：图片 / 音频 / 视频直传即可，
         # 绝不能调 /files/parse（会报错或被当作文档处理）。
         if file_class == "document":
-            parse_resp = await self.client._request_json(
-                "POST",
-                "/api/v2/files/parse",
-                acc.token,
-                {"file_id": file_id},
-                timeout=20.0,
-                account=acc,
-            )
-            if parse_resp.get("status") != 200:
-                if looks_like_waf_challenge(str(parse_resp.get("body") or "")):
-                    raise UpstreamWafChallengeError(
-                        "waf_challenge: /api/v2/files/parse returned an Aliyun WAF challenge page"
-                    )
-                raise RuntimeError(f"files/parse failed: {parse_resp.get('status')} {parse_resp.get('body', '')[:200]}")
-            # 200 也可能返回 WAF 页面（阿里云验证码有时以 200 落地），统一走安全解析。
-            _parse_json_body(parse_resp, endpoint="/api/v2/files/parse")
-
-            deadline = time.time() + self.settings.CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS
-            parse_status = "pending"
-            while time.time() < deadline:
-                status_resp = await self.client._request_json(
-                    "POST",
-                    "/api/v2/files/parse/status",
-                    acc.token,
-                    {"file_id_list": [file_id]},
-                    timeout=20.0,
-                    account=acc,
-                )
-                if status_resp.get("status") != 200:
-                    if looks_like_waf_challenge(str(status_resp.get("body") or "")):
-                        raise UpstreamWafChallengeError(
-                            "waf_challenge: /api/v2/files/parse/status returned an Aliyun WAF challenge page"
-                        )
-                    raise RuntimeError(f"files/parse/status failed: {status_resp.get('status')} {status_resp.get('body', '')[:200]}")
-                status_data = _parse_json_body(status_resp, endpoint="/api/v2/files/parse/status")
-                rows = status_data.get("data") or []
-                row = rows[0] if isinstance(rows, list) and rows else {}
-                parse_status = row.get("status", "pending")
-                if parse_status == "success":
-                    break
-                if parse_status in ("failed", "error"):
-                    raise RuntimeError(f"file parse failed: {row}")
-                await __import__('asyncio').sleep(1.0)
-
-            if parse_status != "success":
-                raise RuntimeError(f"file parse timeout: {file_id}")
+            parse_status = await self._parse_document(acc, file_id)
 
         now = time.time()
         put_url = sts_file_url(payload, endpoint=upload_endpoint)
@@ -651,6 +608,88 @@ class UpstreamFileUploader:
             "url_expires_at": url_expires_at,
             "remote_ref": remote_ref,
         }
+
+    async def _parse_document(self, acc, file_id: str) -> str:
+        """文档类上传：调 `/files/parse` + 轮询 `/files/parse/status`。
+
+        parse 阶段的成败会记进进程级熔断（`document_parse_breaker`）：上游
+        `/api/v2/files/parse` 被阿里云 WAF 拦死（换出口也过不去），继续每个请求
+        都去撞一次只会白等 10~20s。熔断打开后由
+        `context_attachment_manager` 直接跳过「上传 + parse」走文本降级。
+
+        Args:
+            acc: 账号（parse 需要 `acc.token`）。
+            file_id: `getstsToken` 返回的 file_id。
+
+        Returns:
+            最终 parse 状态（成功时恒为 `success`）。
+
+        Raises:
+            UpstreamWafChallengeError: parse / parse-status 返回 WAF 验证页。
+            RuntimeError: 非 200、parse 失败或轮询超时。
+        """
+        breaker = get_document_parse_breaker(self.settings)
+        try:
+            parse_status = await self._request_parse(acc, file_id)
+        except UpstreamWafChallengeError:
+            # 撞 WAF 不必等累计阈值：一次就说明上游这条链路已经不可用。
+            breaker.record_failure("waf", immediate=True)
+            raise
+        except Exception as exc:
+            breaker.record_failure(type(exc).__name__)
+            raise
+        breaker.record_success()
+        return parse_status
+
+    async def _request_parse(self, acc, file_id: str) -> str:
+        """`/files/parse` + 轮询 `/files/parse/status` 的原始实现（不含熔断记账）。"""
+        parse_resp = await self.client._request_json(
+            "POST",
+            "/api/v2/files/parse",
+            acc.token,
+            {"file_id": file_id},
+            timeout=20.0,
+            account=acc,
+        )
+        if parse_resp.get("status") != 200:
+            if looks_like_waf_challenge(str(parse_resp.get("body") or "")):
+                raise UpstreamWafChallengeError(
+                    "waf_challenge: /api/v2/files/parse returned an Aliyun WAF challenge page"
+                )
+            raise RuntimeError(f"files/parse failed: {parse_resp.get('status')} {parse_resp.get('body', '')[:200]}")
+        # 200 也可能返回 WAF 页面（阿里云验证码有时以 200 落地），统一走安全解析。
+        _parse_json_body(parse_resp, endpoint="/api/v2/files/parse")
+
+        deadline = time.time() + self.settings.CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS
+        parse_status = "pending"
+        while time.time() < deadline:
+            status_resp = await self.client._request_json(
+                "POST",
+                "/api/v2/files/parse/status",
+                acc.token,
+                {"file_id_list": [file_id]},
+                timeout=20.0,
+                account=acc,
+            )
+            if status_resp.get("status") != 200:
+                if looks_like_waf_challenge(str(status_resp.get("body") or "")):
+                    raise UpstreamWafChallengeError(
+                        "waf_challenge: /api/v2/files/parse/status returned an Aliyun WAF challenge page"
+                    )
+                raise RuntimeError(f"files/parse/status failed: {status_resp.get('status')} {status_resp.get('body', '')[:200]}")
+            status_data = _parse_json_body(status_resp, endpoint="/api/v2/files/parse/status")
+            rows = status_data.get("data") or []
+            row = rows[0] if isinstance(rows, list) and rows else {}
+            parse_status = row.get("status", "pending")
+            if parse_status == "success":
+                break
+            if parse_status in ("failed", "error"):
+                raise RuntimeError(f"file parse failed: {row}")
+            await asyncio.sleep(1.0)
+
+        if parse_status != "success":
+            raise RuntimeError(f"file parse timeout: {file_id}")
+        return parse_status
 
     async def delete_remote_file(self, acc, remote_meta: dict[str, Any]) -> bool:
         # Qwen web upload delete API has not been fully confirmed yet.

@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock
 from backend.runtime.attachment_types import NormalizedAttachment
 from backend.services.client_profiles import OPENCLAW_OPENAI_PROFILE
 from backend.services.context_attachment_manager import derive_session_key, prepare_context_attachments
-from backend.services.upstream_file_uploader import FileUploadRateLimitedError
+from backend.services.upstream_file_uploader import FileUploadRateLimitedError, UpstreamWafChallengeError
 from backend.services.token_calc import count_tokens
 from backend.toolcore.context_offload import ContextOffloader, SYSTEM_CONTEXT_PROMPT_NOTE
 from backend.toolcore.prompt_builder import messages_to_prompt
@@ -431,31 +431,56 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(f"Human (CURRENT TASK - TOP PRIORITY): {SYSTEM_CONTEXT_PROMPT_NOTE}", prompt)
 
     async def test_generated_context_fallback_preserves_full_history_summary(self) -> None:
+        """`mode="file"` + 上传失败：兜底注入必须是**完整历史正文**，不截断。
+
+        历史构造 5 万字符（远超 CONTEXT_FORCE_FILE_MAX_CHARS=10000 → plan.mode
+        必为 "file"），上传撞 WAF 后断言最终 payload 里拿到全部 5 万字符。
+        """
+
+        async def save_text(filename, text, content_type, purpose):
+            return {
+                "id": filename,
+                "path": f"/tmp/{filename}",
+                "filename": filename,
+                "content_type": content_type,
+                "sha256": "sha-history",
+                "created_at": 1,
+            }
+
+        async def upload_local_file(_acc, _local_meta):
+            raise UpstreamWafChallengeError("waf_challenge: /api/v2/files/parse returned an Aliyun WAF challenge page")
+
         app = SimpleNamespace(state=SimpleNamespace(
             context_offloader=ContextOffloader(SimpleNamespace(
-                CONTEXT_INLINE_MAX_CHARS=80,
-                CONTEXT_FORCE_FILE_MAX_CHARS=160,
+                CONTEXT_INLINE_MAX_CHARS=4000,
+                CONTEXT_FORCE_FILE_MAX_CHARS=10000,
                 CONTEXT_ATTACHMENT_TTL_SECONDS=600,
             )),
             account_pool=SimpleNamespace(
-                acquire_wait=AsyncMock(return_value=None),
-                acquire_wait_preferred=AsyncMock(return_value=None),
+                acquire_wait=AsyncMock(return_value=SimpleNamespace(email="bot@example.com")),
+                acquire_wait_preferred=AsyncMock(return_value=SimpleNamespace(email="bot@example.com")),
                 release=lambda _acc: None,
+                mark_file_upload_limited=lambda *a, **k: None,
+                file_upload_blocked_emails=lambda: set(),
+                save=AsyncMock(),
             ),
-            file_store=SimpleNamespace(save_text=AsyncMock(), delete_path=AsyncMock()),
+            file_store=SimpleNamespace(save_text=save_text, delete_path=AsyncMock()),
             session_affinity=SimpleNamespace(
                 get=AsyncMock(return_value=None),
                 bind_account=AsyncMock(),
                 add_uploaded_file=AsyncMock(),
             ),
             upstream_file_cache=SimpleNamespace(get=AsyncMock(return_value=None), set=AsyncMock()),
-            upstream_file_uploader=SimpleNamespace(upload_local_file=AsyncMock()),
+            upstream_file_uploader=SimpleNamespace(upload_local_file=upload_local_file),
         ))
         tail_marker = "TAIL_MARKER_DO_NOT_DROP"
+        history_line = "0123456789abcdef" * 4
+        history = "\n".join(history_line for _ in range(781))  # ≈50000 字符
+        self.assertGreaterEqual(len(history), 50000)
         payload = {
             "model": "gpt-4.1",
             "messages": [
-                {"role": "user", "content": "A" * 1500},
+                {"role": "user", "content": history},
                 {"role": "assistant", "content": tail_marker},
                 {"role": "user", "content": "latest task"},
             ],
@@ -471,7 +496,11 @@ class ContextAttachmentPreparationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(result["attachment_fallback"])
-        self.assertIn(tail_marker, result["payload"]["messages"][0]["content"])
+        self.assertEqual(result["context_mode"], "inline")
+        joined = "\n".join(str(message.get("content", "")) for message in result["payload"]["messages"])
+        self.assertIn(tail_marker, joined)
+        # 完整历史：781 行一行不少（不是摘要、不是截断）。
+        self.assertGreaterEqual(joined.count(history_line), 781)
 
     async def test_generated_context_ignores_existing_affinity_when_selecting_upload_account(self) -> None:
         async def save_text(filename, text, content_type, purpose):
@@ -1132,13 +1161,15 @@ class BrowserUploadScopeTests(unittest.IsolatedAsyncioTestCase):
         }
 
     def _document_attachment(self) -> tuple[NormalizedAttachment, str]:
-        handle = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+        # 用 .pdf：纯文本类附件（.txt）现在由网关本地解码注入，不经过上传降级链，
+        # 这里要测的是「文档类」的上传链路。
+        handle = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
         handle.write(b"user supplied document bytes")
         handle.close()
         attachment = NormalizedAttachment(
             file_id="local-doc",
-            filename="notes.txt",
-            content_type="text/plain",
+            filename="notes.pdf",
+            content_type="application/pdf",
             source="manual-upload",
             local_path=handle.name,
             sha256="sha-doc",
@@ -1201,7 +1232,7 @@ class BrowserUploadScopeTests(unittest.IsolatedAsyncioTestCase):
             Path(local_path).unlink(missing_ok=True)
 
         self.assertEqual(len(browser_proxy.fetch_calls), 1)
-        self.assertEqual(browser_proxy.fetch_calls[0][1], "notes.txt")
+        self.assertEqual(browser_proxy.fetch_calls[0][1], "notes.pdf")
         uploader.put_bytes.assert_awaited()
         uploader.upload_local_file.assert_not_awaited()
         self.assertEqual(result["upstream_files"][0]["file_id"], "browser-doc")

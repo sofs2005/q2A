@@ -335,8 +335,46 @@ Anthropic Messages（`POST /v1/messages`）：
 | `INLINE_ATTACHMENT_MAX_BYTES` | `10485760` | 原始字节护栏（10MB），只用于防止超大 base64 打满内存；能否内联由 url 字符数决定。 |
 | `INLINE_ATTACHMENT_MAX_URL_CHARS` | `8192` | 上游 `files[].url` 字符上限（实测 `max_length=8192`）。实现里留 92 字符边距，实际生效 8100。 |
 | `INLINE_ATTACHMENT_REMOTE_FETCH` | `false` | 是否允许下载远程 http(s) 附件（**默认关闭**，见下方 SSRF 说明）。 |
+| `ATTACHMENT_INLINE_TEXT_ENABLED` | `true` | 纯文本类附件（txt/md/csv/json/…）由网关本地解码后直接注入 prompt，**零上游请求**（不调 `getstsToken` / 不 PUT / 不 parse）。 |
+| `ATTACHMENT_INLINE_TEXT_MAX_BYTES` | `131072` | 单个文本附件注入的字节上限（128KB）；超过即截断并标注 `…（已截断，原文件 N KB）`。 |
+| `DOCUMENT_PARSE_MAX_FAILURES` | `2` | `files/parse` 连续失败多少次后熔断（撞 WAF 则一次即熔断）。 |
+| `DOCUMENT_PARSE_COOLDOWN_SECONDS` | `600` | 熔断冷却时长：期内文档类附件**直接跳过「上传 + parse」**走文本降级。 |
 | `MULTIMODAL_STRICT` | `true` | 模型不支持该模态时是否直接 400；`false` 时只丢弃并告警。 |
 | `MODEL_MODALITIES_OVERRIDE` | 空 | 模态矩阵覆盖（JSON），如 `{"qwen3.8-max":["text","image","video","audio"]}`。 |
+
+#### 纯文本附件：本地解码注入（不烧上游请求）
+
+`/api/v2/files/parse` 被阿里云 WAF 拦死（实测换出口 g/j/l 与直连全部返回 WAF，
+而 `getstsToken` 走出口池是好的），因此**任何需要 parse 的附件现在必然失败**。
+纯文本类附件本来就不需要那条链路：
+
+- 命中条件：`text/plain`、`text/markdown`、`text/csv`、`application/json`、
+  `application/x-ndjson`，或扩展名 `.txt/.md/.markdown/.csv/.json/.jsonl/.log/.yaml/.yml/.xml/.ini/.conf`；
+- 读取本地字节 → 解码（`utf-8` → `utf-8-sig` → `gb18030` → `latin-1`）→ 拼成
+
+  ```
+  [附件: report.csv]
+  <正文>
+  ```
+
+  追加到**当前用户消息**末尾（不新增 role，避免被 prompt 构建当成 `CURRENT TASK`）；
+- 注入的字符数按 `count_tokens` 计入 `context_attachment_tokens`；
+- 超过 `ATTACHMENT_INLINE_TEXT_MAX_BYTES` 则截断 + 标注；前 4KB 有 NUL 字节
+  （二进制 sniff）则不当文本，回落到原上传路径。
+
+#### 文档 parse 熔断（`DOCUMENT_PARSE_*`）
+
+`files/parse` 连续失败 `DOCUMENT_PARSE_MAX_FAILURES` 次**或**返回 WAF 验证页之后，
+熔断打开，接下来 `DOCUMENT_PARSE_COOLDOWN_SECONDS` 秒内文档类附件**不再尝试
+「上传 + parse」**，直接走内联文本兜底，并打一行：
+
+```
+[ContextAttachment] document parse blocked (cooldown) → inline text fallback file=xx
+```
+
+收益：带 tools / 大上下文的请求（每次都会生成 `qwen2api_context_history.txt`）从
+「白等 10~20s 再降级」变成「直接降级」。冷却到期的第一次请求恢复尝试（探针）：
+失败立刻重新熔断，成功则清零。熔断只影响文档类，图片 / 音频 / 视频 / 纯文本不受影响。
 
 ### 内联容量：只装得下 ~6KB
 

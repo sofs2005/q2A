@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import hashlib
 import logging
 import uuid
@@ -10,6 +11,7 @@ from typing import Any
 from backend.core.upstream_file_cache import UpstreamFileCacheEntry
 from backend.services.attachment_errors import InlineMediaTooLargeError
 from backend.services.client_profiles import user_role_system_text
+from backend.services.document_parse_breaker import get_document_parse_breaker
 from backend.services.inline_media_ref import (
     KIND_AUDIO,
     KIND_IMAGE,
@@ -252,6 +254,262 @@ async def _inline_ref_for_attachment(
     return ref, None
 
 
+#: 纯文本类附件的 content_type 白名单（带 charset 参数时只看主类型）。
+_INLINE_TEXT_CONTENT_TYPES = frozenset({
+    "text/plain",
+    "text/markdown",
+    "text/x-markdown",
+    "text/csv",
+    "application/json",
+    "application/x-ndjson",
+    "application/jsonlines",
+    "application/jsonl",
+})
+#: 纯文本类附件的扩展名白名单（content_type 缺失 / 给成 octet-stream 时兜底）。
+_INLINE_TEXT_EXTENSIONS = frozenset({
+    "txt", "md", "markdown", "csv", "json", "jsonl", "ndjson",
+    "log", "yaml", "yml", "xml", "ini", "conf",
+})
+#: 解码顺序：utf-8 → utf-8-sig → gb18030 → latin-1（latin-1 永不失败，兜底）。
+_TEXT_DECODE_ORDER = ("utf-8", "utf-8-sig", "gb18030", "latin-1")
+#: 二进制 sniff 只看前 4KB：出现 NUL 字节就按二进制处理，不当文本注入。
+_BINARY_SNIFF_BYTES = 4096
+#: 单文件注入字节上限默认值（128KB）。
+_DEFAULT_INLINE_TEXT_MAX_BYTES = 128 * 1024
+
+
+def _is_inline_text_attachment(attachment: Any) -> bool:
+    """该附件是否可以「网关本地解码 → 直接注入 prompt」。
+
+    条件：还没有远程 ref（没上传过）、本地有字节、mime 或扩展名落在文本白名单里。
+    图片 / 音频 / 视频由 `_is_inline_media_attachment` 先行处理，不会走到这里。
+    """
+    if getattr(attachment, "remote_ref", None):
+        return False
+    if not getattr(attachment, "local_path", ""):
+        return False
+    content_type = str(getattr(attachment, "content_type", "") or "").strip().lower()
+    main_type = content_type.split(";", 1)[0].strip()
+    if main_type in _INLINE_TEXT_CONTENT_TYPES:
+        return True
+    ext = Path(str(getattr(attachment, "filename", "") or "")).suffix.lstrip(".").lower()
+    return ext in _INLINE_TEXT_EXTENSIONS
+
+
+def _looks_binary(head: bytes) -> bool:
+    """前 4KB 里出现 NUL 字节即认为二进制。"""
+    return b"\x00" in head[:_BINARY_SNIFF_BYTES]
+
+
+def _decode_text_head(raw: bytes, codec: str) -> str | None:
+    """按指定编码解码；截断点切在多字节字符中间时，丢尾部残缺字节再试一次。
+
+    Returns:
+        解码后的字符串；该编码不适用时返回 None（交给下一个候选编码）。
+    """
+    try:
+        return raw.decode(codec)
+    except LookupError:  # pragma: no cover - 运行环境缺该编码（极少见）
+        return None
+    except UnicodeDecodeError as exc:
+        # 只有「错在尾部」才可能是我们自己截断造成的，丢掉残字节重试。
+        if exc.start <= 0 or exc.start < len(raw) - 4:
+            return None
+        try:
+            return raw[: exc.start].decode(codec)
+        except UnicodeDecodeError:
+            return None
+
+
+def _decode_text_bytes(raw: bytes) -> tuple[str, str]:
+    """按 `utf-8 → utf-8-sig → gb18030 → latin-1` 顺序解码。
+
+    Returns:
+        `(text, codec)`；全部失败返回 `("", "")`（latin-1 兜底后基本不会发生）。
+    """
+    candidates: list[str] = []
+    if raw.startswith(codecs.BOM_UTF8):
+        candidates.append("utf-8-sig")
+    elif raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        candidates.append("utf-16")
+    for codec in dict.fromkeys([*candidates, *_TEXT_DECODE_ORDER]):
+        text = _decode_text_head(raw, codec)
+        if text is not None:
+            return text, codec
+    return "", ""
+
+
+def _format_inline_text_block(
+    filename: str,
+    text: str,
+    *,
+    truncated: bool,
+    original_bytes: int,
+) -> str:
+    """拼装注入块：`[附件: name]` + 正文（截断时附一行提示）。"""
+    body = text
+    if truncated:
+        original_kb = max(1, (int(original_bytes) + 1023) // 1024)
+        body = f"{body}\n\n…（已截断，原文件 {original_kb} KB）"
+    return f"[附件: {filename}]\n{body}"
+
+
+def _read_text_head(path: str, max_bytes: int) -> tuple[bytes, int]:
+    """读文件头部与真实大小（不把超大文件整读进内存）。
+
+    Args:
+        path: 本地路径。
+        max_bytes: 头部字节上限；<=0 表示不限（整读）。
+
+    Returns:
+        `(head_bytes, total_bytes)`。
+    """
+    total = Path(path).stat().st_size
+    with open(path, "rb") as handle:
+        head = handle.read(max_bytes) if max_bytes > 0 else handle.read()
+    return head, total
+
+
+async def _inline_text_block_for_attachment(
+    attachment: Any,
+    *,
+    settings_obj: Any,
+    session_key: str,
+) -> str:
+    """把纯文本类附件解码成可直接拼进 prompt 的注入块。
+
+    Returns:
+        注入块文本；不满足条件（开关关闭 / 读不到 / 空文件 / 二进制 sniff 命中）
+        返回空串，调用方回落到原上传路径。
+    """
+    if not bool(getattr(settings_obj, "ATTACHMENT_INLINE_TEXT_ENABLED", True)):
+        return ""
+    max_bytes = int(getattr(settings_obj, "ATTACHMENT_INLINE_TEXT_MAX_BYTES", _DEFAULT_INLINE_TEXT_MAX_BYTES) or 0)
+    filename = str(getattr(attachment, "filename", "") or "")
+    path = str(getattr(attachment, "local_path", "") or "")
+    if not path:
+        return ""
+    try:
+        raw, total_bytes = await asyncio.to_thread(_read_text_head, path, max_bytes)
+    except OSError as exc:
+        log.warning(
+            "[ContextAttachment] inline text read failed session_key=%s filename=%s error=%s",
+            session_key,
+            filename,
+            exc,
+        )
+        return ""
+    if not raw:
+        log.info(
+            "[ContextAttachment] inline text skipped (empty) session_key=%s filename=%s",
+            session_key,
+            filename,
+        )
+        return ""
+    if _looks_binary(raw):
+        # 声明成 text/* 但实际是二进制：不当文本注入，回落到原上传路径。
+        log.info(
+            "[ContextAttachment] inline text skipped (binary sniff) session_key=%s filename=%s",
+            session_key,
+            filename,
+        )
+        return ""
+    text, codec = _decode_text_bytes(raw)
+    if not text.strip():
+        log.info(
+            "[ContextAttachment] inline text skipped (empty after decode) session_key=%s filename=%s",
+            session_key,
+            filename,
+        )
+        return ""
+    truncated = max_bytes > 0 and total_bytes > max_bytes
+    block = _format_inline_text_block(
+        filename,
+        text,
+        truncated=truncated,
+        original_bytes=total_bytes,
+    )
+    log.info(
+        "[ContextAttachment] inline text injected session_key=%s filename=%s codec=%s chars=%s bytes=%s truncated=%s",
+        session_key,
+        filename,
+        codec,
+        len(text),
+        total_bytes,
+        truncated,
+    )
+    return block
+
+
+async def _collect_inline_text_blocks(
+    attachments: list[Any],
+    *,
+    file_store: Any,
+    settings_obj: Any,
+    session_key: str,
+) -> tuple[list[str], int, list[Any]]:
+    """批量处理纯文本类附件。
+
+    Returns:
+        `(blocks, tokens, leftovers)`：注入块列表、注入块的 token 数、
+        需要回落到原上传路径的附件。
+    """
+    blocks: list[str] = []
+    tokens = 0
+    leftovers: list[Any] = []
+    for attachment in attachments:
+        block = await _inline_text_block_for_attachment(
+            attachment,
+            settings_obj=settings_obj,
+            session_key=session_key,
+        )
+        if not block:
+            leftovers.append(attachment)
+            continue
+        blocks.append(block)
+        tokens += count_tokens(block)
+        # 正文已进 payload，本地副本不再需要（与内联媒体一致）。
+        delete_path = getattr(file_store, "delete_path", None)
+        if callable(delete_path):
+            try:
+                await delete_path(str(getattr(attachment, "local_path", "") or ""))
+            except Exception:  # pragma: no cover - 清理失败不影响注入结果
+                log.debug("[ContextAttachment] inline text cleanup failed", exc_info=True)
+    return blocks, tokens, leftovers
+
+
+def _inject_inline_text_blocks(payload: dict[str, Any], blocks: list[str]) -> dict[str, Any]:
+    """把注入块拼进最后一条 user 消息（保持角色交替，不新增 role）。
+
+    为什么要拼进「当前用户消息」而不是追加新消息：prompt 构建会把**最后一条
+    user 消息**渲染成 `Human (CURRENT TASK - TOP PRIORITY)`，追加一条用户消息会
+    把附件正文顶成「当前任务」，真实问题反而被降级。
+    """
+    if not blocks:
+        return payload
+    text = "\n\n".join(blocks)
+    rewritten = dict(payload)
+    messages: list[Any] = []
+    for message in payload.get("messages", []) or []:
+        messages.append(dict(message) if isinstance(message, dict) else message)
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            message["content"] = [*content, {"type": "text", "text": text}]
+        elif isinstance(content, str) and content.strip():
+            message["content"] = f"{content}\n\n{text}"
+        else:
+            message["content"] = text
+        rewritten["messages"] = messages
+        return rewritten
+    messages.append({"role": "user", "content": text})
+    rewritten["messages"] = messages
+    return rewritten
+
+
 def build_request_session_key(surface: str, request_id: str) -> str:
     return f"{surface}:{request_id}"
 
@@ -307,7 +565,16 @@ def _fallback_context_attachment_result(
     use_generated_context_files: bool,
     manual_attachments: list[Any],
     fallback_message: str,
+    inline_text_blocks: list[str] | None = None,
+    inline_text_tokens: int = 0,
+    upstream_files: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """上传 / parse 不可用时的兜底：把**完整历史正文**当成一条 user 消息注入。
+
+    这里刻意**不做任何截断**：`plan.summary_text` 就是完整历史正文（不是摘要），
+    注入它意味着「附件上传失败也不丢上下文」。只在日志里报 `inline fallback chars=N`
+    便于核对（截断会让 N 明显小于历史长度）。
+    """
     fallback_payload = dict(payload)
     summary_parts: list[str] = []
     if use_generated_context_files and plan.summary_text:
@@ -330,15 +597,23 @@ def _fallback_context_attachment_result(
     else:
         fallback_messages.extend(payload.get("messages", []) or [])
     fallback_payload["messages"] = fallback_messages
+    fallback_payload = _inject_inline_text_blocks(fallback_payload, list(inline_text_blocks or []))
+    log.info(
+        "[ContextAttachment] inline fallback chars=%s messages=%s session_key=%s text_attachment_tokens=%s truncated=false",
+        len(plan.summary_text or "") if use_generated_context_files else 0,
+        len(fallback_payload.get("messages") or []),
+        session_key,
+        inline_text_tokens,
+    )
     return {
         "payload": fallback_payload,
         "session_key": session_key,
         "context_mode": "inline",
-        "upstream_files": list(payload.get("upstream_files", []) or []),
+        "upstream_files": list(upstream_files if upstream_files is not None else (payload.get("upstream_files", []) or [])),
         "bound_account": None,
         "bound_account_email": None,
         "generated_local_files": [],
-        "context_attachment_tokens": 0,
+        "context_attachment_tokens": inline_text_tokens,
         "attachment_fallback": True,
     }
 
@@ -390,14 +665,36 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
             "attachment_fallback": False,
         }
 
-    # 图片 / 音频 / 视频不需要上游上传与解析，直接内联；文档仍走原 OSS 上传链路。
+    # 图片 / 音频 / 视频不需要上游上传与解析，直接内联；纯文本类附件在网关本地
+    # 解码后注入 prompt（也不发上游请求）；只有文档（pdf/docx/...）仍需 PUT + parse。
     inline_media_attachments: list[Any] = []
-    upload_attachments: list[Any] = []
+    upload_candidates: list[Any] = []
     for attachment in manual_attachments:
         if _is_inline_media_attachment(attachment):
             inline_media_attachments.append(attachment)
         else:
+            upload_candidates.append(attachment)
+
+    text_candidates: list[Any] = []
+    upload_attachments: list[Any] = []
+    for attachment in upload_candidates:
+        if _is_inline_text_attachment(attachment):
+            text_candidates.append(attachment)
+        else:
             upload_attachments.append(attachment)
+
+    # 纯文本类：本地读字节 → 解码 → 注入块。**零上游请求**（不调 getstsToken /
+    # 不 PUT / 不 parse）。二进制 sniff 命中的会退回 upload_attachments。
+    inline_text_blocks: list[str] = []
+    inline_text_tokens = 0
+    if text_candidates:
+        inline_text_blocks, inline_text_tokens, text_leftovers = await _collect_inline_text_blocks(
+            text_candidates,
+            file_store=file_store,
+            settings_obj=context_offloader.settings,
+            session_key=session_key,
+        )
+        upload_attachments.extend(text_leftovers)
 
     # 内联媒体不依赖上游账号：先处理，失败（读取失败 / 超限 / 开关关闭）才回退上传。
     upstream_files = list(payload.get("upstream_files", []) or [])
@@ -427,26 +724,60 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
         # 已内联进 payload，本地副本不再需要
         await file_store.delete_path(attachment.local_path)
 
-    # 纯内联媒体：不挑号、不绑号、不上传、不解析。
+    # 纯内联（媒体 + 文本）：不挑号、不绑号、不上传、不解析。
     if not upload_attachments and not fallback_uploads and not use_generated_context_files and not payload.get("upstream_files"):
         log.info(
-            "[ContextAttachment] inline media only session_key=%s surface=%s inline=%s total=%s",
+            "[ContextAttachment] inline only session_key=%s surface=%s inline_media=%s inline_text=%s total=%s",
             session_key,
             surface,
             inline_ok,
-            len(inline_media_attachments),
+            len(inline_text_blocks),
+            len(manual_attachments),
         )
         return {
-            "payload": payload,
+            "payload": _inject_inline_text_blocks(payload, inline_text_blocks),
             "session_key": session_key,
             "context_mode": "inline",
             "upstream_files": upstream_files,
             "bound_account": None,
             "bound_account_email": None,
             "generated_local_files": [],
-            "context_attachment_tokens": 0,
+            "context_attachment_tokens": inline_text_tokens,
             "attachment_fallback": bool(inline_media_attachments) and inline_ok == 0,
         }
+
+    # 文档 parse 熔断：上游 `/files/parse` 已被阿里云 WAF 拦死（换出口也过不去），
+    # 冷却期内**直接跳过「上传 + parse」**，省掉一次注定失败的 10~20s。
+    if upload_attachments or use_generated_context_files:
+        breaker = get_document_parse_breaker(context_offloader.settings)
+        if breaker.blocked():
+            pending_files = [str(getattr(att, "filename", "") or "") for att in upload_attachments]
+            pending_files.extend(
+                f"{SYSTEM_CONTEXT_FILE_PREFIX}_{getattr(item, 'ext', 'txt')}"
+                for item in getattr(plan, "generated_files", []) or []
+            )
+            log.info(
+                "[ContextAttachment] document parse blocked (cooldown) → inline text fallback file=%s "
+                "session_key=%s surface=%s remaining=%.0fs",
+                ",".join(name for name in pending_files if name) or "-",
+                session_key,
+                surface,
+                breaker.remaining_seconds(),
+            )
+            return _fallback_context_attachment_result(
+                payload=payload,
+                session_key=session_key,
+                plan=plan,
+                use_generated_context_files=use_generated_context_files,
+                manual_attachments=manual_attachments,
+                fallback_message=(
+                    "Document parsing is temporarily unavailable upstream. "
+                    "Continue with the available inline context only."
+                ),
+                inline_text_blocks=inline_text_blocks,
+                inline_text_tokens=inline_text_tokens,
+                upstream_files=upstream_files,
+            )
 
     requires_sticky_account = bool(manual_attachments or payload.get("upstream_files"))
     record = await affinity.get(session_key) if requires_sticky_account else None
@@ -483,6 +814,9 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
                 "No upstream account was available for attachment upload. "
                 "Continue with the available inline context only."
             ),
+            inline_text_blocks=inline_text_blocks,
+            inline_text_tokens=inline_text_tokens,
+            upstream_files=upstream_files,
         )
     await affinity.bind_account(session_key, surface, acc.email, context_offloader.settings.CONTEXT_ATTACHMENT_TTL_SECONDS)
 
@@ -843,10 +1177,15 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
             use_generated_context_files=use_generated_context_files,
             manual_attachments=manual_attachments,
             fallback_message="Attachment upload failed. Continue with the available inline context only.",
+            inline_text_blocks=inline_text_blocks,
+            inline_text_tokens=inline_text_tokens,
+            upstream_files=upstream_files,
         )
 
     rewritten = dict(payload)
     rewritten["messages"] = plan.inline_messages if use_generated_context_files else messages
+    # 纯文本类附件：正文拼进当前用户消息（已上传 / 已生成的文档不走这里）。
+    rewritten = _inject_inline_text_blocks(rewritten, inline_text_blocks)
     return {
         "payload": rewritten,
         "session_key": session_key,
@@ -855,6 +1194,6 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
         "bound_account": acc,
         "bound_account_email": acc.email,
         "generated_local_files": local_file_records,
-        "context_attachment_tokens": context_attachment_tokens,
+        "context_attachment_tokens": context_attachment_tokens + inline_text_tokens,
         "attachment_fallback": False,
     }
