@@ -21,7 +21,7 @@ DEFAULT_CONTEXT_SUMMARY_MODEL = "qwen3.8-omni-flash"
 # 0.2.91 反而返回 Bad_Request。此前"0.3.27 被判 401"的结论是因为当时用的是
 # 账号池里的长期 token —— 两个变量纠缠导致的误判。换版本号必须连同 token 类型
 # 一起实测（见 backend/services/token_provider.py 的模块说明）。
-DEFAULT_QWEN_WEB_VERSION = "0.3.33"
+DEFAULT_QWEN_WEB_VERSION = "0.3.38"
 DEFAULT_QWEN_BX_VERSION = "2.5.37"
 
 class Settings(BaseSettings):
