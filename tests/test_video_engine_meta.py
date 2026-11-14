@@ -1,10 +1,12 @@
 """视频引擎 / 规格字段（extra.meta.model + resolution + duration）相关单测。
 
-覆盖三件事：
+覆盖四件事：
 1. chat 级 model 的死模型修复（DEFAULT_VIDEO_MODEL / VIDEO_MODEL_MAP）
 2. resolution / duration 的宽松校验（非法值回落默认 + WARNING，绝不抛错）
 3. `extra.wanx.video_spec` 自检日志（字段名是否生效的唯一验证手段）
+4. 上游「仅会员可用」拒绝的识别与可读报错（400 + 明确 detail）
 """
+import json
 import sys
 import unittest
 
@@ -83,6 +85,46 @@ OLD_FORMAT_BODY = {
     "data": {
         "messages": [
             {"role": "assistant", "extra": {"wanx": {"task_id": "old-task-id"}}}
+        ]
+    }
+}
+
+#: 生产实测：免费号请求 1080P / 10s / 15s 时上游的拒绝响应（无 task_id）。
+MEMBER_ONLY_BODY = {
+    "success": True,
+    "data": {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "请求非法：当前视频规格仅会员可用，请开通或升级 Qwen 会员后重试。",
+                "extra": {"update_member": True, "quota_limit": True},
+            }
+        ]
+    }
+}
+
+#: 分段 content 形态（content: [{"text": "..."}]）。
+MEMBER_ONLY_SEGMENTED_BODY = {
+    "data": {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "当前视频规格仅会员可用"}],
+                "extra": {"update_member": True, "quota_limit": True},
+            }
+        ]
+    }
+}
+
+#: 额度耗尽但不是「规格问题」：不能误判成会员限制。
+QUOTA_EXHAUSTED_BODY = {
+    "data": {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "目前服务访问量较大，请稍后再试。",
+                "extra": {"quota_limit": True},
+            }
         ]
     }
 }
@@ -205,6 +247,144 @@ class VideoSpecLoggingTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIn(
             "video_spec missing (old task format)", "\n".join(captured.output)
+        )
+
+
+class _FakeAccount:
+    """_run_generation 只用到 email / token 两个属性。"""
+
+    def __init__(self, email: str = "demo@example.com") -> None:
+        self.email = email
+        self.token = "fake-token"
+
+
+class _FakeAccountPool:
+    """记录 release / mark_video_limited 调用，用于断言账号是否被误标限流。"""
+
+    def __init__(self) -> None:
+        self.released: list = []
+        self.video_limited: list = []
+
+    def release(self, acc) -> None:
+        self.released.append(acc)
+
+    def mark_video_limited(self, acc, error_message: str = "") -> None:
+        self.video_limited.append((acc, error_message))
+
+
+class _FakeClient:
+    """返回固定 completions body 的假 Qwen 客户端。"""
+
+    def __init__(self, body: str) -> None:
+        self._body = body
+        self.acc = _FakeAccount()
+        self.account_pool = _FakeAccountPool()
+        self.deleted_chats: list = []
+
+    async def complete_once_with_retry(
+        self, model, prompt, has_custom_tools=False, chat_type="", media_options=None
+    ) -> dict:
+        return {"acc": self.acc, "chat_id": "fake-chat-id", "body": self._body}
+
+    async def delete_chat(self, token, chat_id, account=None) -> bool:
+        self.deleted_chats.append(chat_id)
+        return True
+
+
+class VideoMemberOnlyDetectionTests(unittest.TestCase):
+    """`_find_member_only_rejection`：quota_limit 且 content 含会员字样才算命中。"""
+
+    def test_detects_captured_member_only_body(self) -> None:
+        text = videos._find_member_only_rejection(MEMBER_ONLY_BODY)
+        self.assertIsNotNone(text)
+        self.assertIn("会员", text)
+
+    def test_detects_segmented_content(self) -> None:
+        text = videos._find_member_only_rejection(MEMBER_ONLY_SEGMENTED_BODY)
+        self.assertIsNotNone(text)
+        self.assertIn("会员", text)
+
+    def test_quota_exhausted_without_member_wording_is_not_member_only(self) -> None:
+        self.assertIsNone(videos._find_member_only_rejection(QUOTA_EXHAUSTED_BODY))
+
+    def test_member_wording_without_quota_flag_is_not_member_only(self) -> None:
+        body = {
+            "data": {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "当前视频规格仅会员可用",
+                        "extra": {"update_member": True},
+                    }
+                ]
+            }
+        }
+        self.assertIsNone(videos._find_member_only_rejection(body))
+
+    def test_benign_bodies_are_not_member_only(self) -> None:
+        for payload in (None, {}, OLD_FORMAT_BODY, CAPTURED_VIDEO_SPEC_BODY, []):
+            with self.subTest(payload=payload):
+                self.assertIsNone(videos._find_member_only_rejection(payload))
+
+
+class VideoGenerationErrorMappingTests(unittest.IsolatedAsyncioTestCase):
+    """无 task_id 的两种成因要分开报：会员规格 → 400，其它 → 500。"""
+
+    async def test_member_only_spec_raises_400_with_readable_detail(self) -> None:
+        client = _FakeClient(json.dumps(MEMBER_ONLY_BODY, ensure_ascii=False))
+
+        with self.assertLogs("qwen2api.videos", level="WARNING") as captured:
+            with self.assertRaises(videos.HTTPException) as ctx:
+                await videos._run_generation(
+                    client, "qwen3.8-max", "一只猫", 1, 10, "16:9", {},
+                    resolution="1080P",
+                )
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(ctx.exception.detail, videos.MEMBER_ONLY_DETAIL)
+        self.assertIn("Qwen 会员", ctx.exception.detail)
+        self.assertIn("720P", ctx.exception.detail)
+
+        text = "\n".join(captured.output)
+        self.assertIn("member_only spec rejected", text)
+        self.assertIn("resolution=1080P", text)
+        self.assertIn("duration=10", text)
+        self.assertIn("account=demo@example.com", text)
+
+        # 规格问题不是账号额度问题：账号不能被标记为视频不可用
+        self.assertEqual(client.account_pool.video_limited, [])
+        # 会话仍要释放
+        self.assertEqual(client.account_pool.released, [client.acc])
+
+    async def test_other_missing_task_id_still_raises_500(self) -> None:
+        client = _FakeClient(json.dumps(QUOTA_EXHAUSTED_BODY, ensure_ascii=False))
+
+        with self.assertLogs("qwen2api.videos", level="WARNING") as captured:
+            with self.assertRaises(videos.HTTPException) as ctx:
+                await videos._run_generation(
+                    client, "qwen3.8-max", "一只猫", 1, 5, "16:9", {},
+                    resolution="720P",
+                )
+
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.assertEqual(
+            ctx.exception.detail, "Video generation returned no task_id"
+        )
+        self.assertIn("no task_id", "\n".join(captured.output))
+
+    async def test_other_failures_still_500(self) -> None:
+        client = _FakeClient("not-json-at-all")
+
+        with self.assertLogs("qwen2api.videos", level="WARNING"):
+            with self.assertRaises(videos.HTTPException) as ctx:
+                await videos._run_generation(
+                    client, "qwen3.8-max", "一只猫", 1, 5, "16:9", {},
+                    resolution="720P",
+                )
+
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.assertEqual(
+            ctx.exception.detail, "Video generation returned no task_id"
         )
 
 

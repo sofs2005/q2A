@@ -57,6 +57,15 @@ VALID_RESOLUTIONS = {"720P", "1080P"}
 DEFAULT_DURATION = 5
 VALID_DURATIONS = {5, 10, 15}
 
+# 上游免费号的规格限制：只有 720P + 5s 可用，其它组合会被拒绝并回
+# `extra.quota_limit=true` + content「请求非法：当前视频规格仅会员可用…」。
+# 命中该特征时回 400 + 可读 detail，而不是把上游话术埋进 500 的 body 摘要里。
+MEMBER_ONLY_KEYWORDS = ("会员", "member")
+MEMBER_ONLY_DETAIL = (
+    "该视频规格需要 Qwen 会员（1080P / 10s / 15s）。"
+    "免费账号只支持 720P + 5s。"
+)
+
 # 任务状态判定（大小写不敏感）
 TASK_STATUS_SUCCESS = {"completed", "success", "succeeded", "finished"}
 TASK_STATUS_FAILED = {"failed", "error", "cancelled", "canceled"}
@@ -125,6 +134,68 @@ def _find_video_url(obj) -> str | None:
         if _looks_like_video_url(u):
             return u
     return None
+
+
+def _message_text(content: Any) -> str:
+    """把上游 message.content 归一成纯文本（兼容 str 与分段列表）。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for seg in content:
+            if isinstance(seg, str):
+                parts.append(seg)
+            elif isinstance(seg, dict):
+                text = seg.get("text") or seg.get("content")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+        return " ".join(parts)
+    return ""
+
+
+def _find_member_only_rejection(obj) -> str | None:
+    """检测上游「该规格仅会员可用」拒绝，命中时返回上游 content 文本。
+
+    生产实测结构（免费号请求 1080P / 10s / 15s）::
+
+        {"data": {"messages": [{"content": "请求非法：当前视频规格仅会员可用…",
+                                "extra": {"update_member": true,
+                                          "quota_limit": true}}]}}
+
+    判定条件（两者同时成立才算，避免把普通额度耗尽误判成规格问题）：
+    1. `messages[].extra.quota_limit` 为真；
+    2. `messages[].content` 含「会员」相关字样。
+
+    Args:
+        obj: 已解析的 completions 响应体（可为 None / 任意结构）。
+
+    Returns:
+        命中的 message content；未命中返回 None。
+    """
+    hits: list[str] = []
+
+    def walk(o: Any) -> None:
+        if isinstance(o, dict):
+            messages = o.get("messages")
+            if isinstance(messages, list):
+                for msg in messages:
+                    if not isinstance(msg, dict):
+                        continue
+                    extra = msg.get("extra")
+                    if not isinstance(extra, dict) or not extra.get("quota_limit"):
+                        continue
+                    text = _message_text(msg.get("content")).strip()
+                    low = text.lower()
+                    if any(k in text or k in low for k in MEMBER_ONLY_KEYWORDS):
+                        hits.append(text)
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(obj)
+    return hits[0] if hits else None
 
 
 def _task_status_of(obj) -> str:
@@ -435,6 +506,20 @@ async def _run_generation(
         # 3) 轮询任务状态直到拿到视频 URL
         if not video_url:
             if not task_id:
+                # 免费号请求 1080P / 10s / 15s 时上游只回「仅会员可用」，
+                # 没有 task_id。这种情况是**规格问题而非账号额度耗尽**，
+                # 因此回 400 + 明确 detail，且不把账号标记为视频不可用。
+                member_only = (
+                    _find_member_only_rejection(obj) if obj is not None else None
+                )
+                if member_only is not None:
+                    log.warning(
+                        "[T2V] member_only spec rejected resolution=%s duration=%s account=%s",
+                        resolution,
+                        duration,
+                        getattr(acc, "email", "-"),
+                    )
+                    raise HTTPException(status_code=400, detail=MEMBER_ONLY_DETAIL)
                 log.warning(
                     "[T2V] no task_id in completions body. body_preview=%s",
                     body[:2000],

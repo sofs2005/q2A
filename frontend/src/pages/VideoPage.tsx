@@ -10,6 +10,10 @@ import { StatusBadge } from "../components/ui/badge"
 import { PageShell } from "../components/ui/page-shell"
 import { Lightbox } from "../components/ui/lightbox"
 
+// 后端会把 VIDEO_MODEL_MAP 里的别名映射到内部 chat 级模型（当前 qwen3.8-max），
+// 前端只传对外的稳定别名，避免内部模型名再被写死在页面里。
+const VIDEO_MODEL = "qwen-video"
+
 const ASPECT_RATIOS = [
   { label: "16:9", value: "16:9" },
   { label: "9:16", value: "9:16" },
@@ -18,13 +22,27 @@ const ASPECT_RATIOS = [
   { label: "3:4",  value: "3:4"  },
 ]
 
-const DURATIONS = [3, 5, 10]
+// 官网可选值：720P / 1080P；时长为 5 / 10 / 15 秒。
+const RESOLUTIONS = [
+  { label: "720P",  value: "720P"  },
+  { label: "1080P", value: "1080P" },
+]
+
+const DURATIONS = [5, 10, 15]
+
+const DEFAULT_RESOLUTION = "720P"
+const DEFAULT_DURATION = 5
+
+// 免费账号只有 720P + 5s 可用，其余组合上游会直接拒绝。
+const MEMBER_ONLY_HINT = "1080P / 10s / 15s 为 Qwen 会员专享，免费账号会失败"
 
 interface GeneratedVideo {
   url: string
   revised_prompt: string
   ratio: string
   duration: number
+  // 后端可能没回该字段（旧任务格式），有值才在结果卡片上展示
+  resolution?: string
 }
 
 // 读取 SSE 心跳流：忽略 `: heartbeat` 注释，返回首个 data 事件的 JSON
@@ -58,13 +76,18 @@ async function readSSEResult(res: Response): Promise<unknown> {
 export default function VideoPage() {
   const [prompt, setPrompt] = useState("")
   const [ratio, setRatio] = useState("16:9")
-  const [duration, setDuration] = useState(5)
+  const [resolution, setResolution] = useState<string>(DEFAULT_RESOLUTION)
+  const [duration, setDuration] = useState<number>(DEFAULT_DURATION)
   const [n, setN] = useState(1)
   const [loading, setLoading] = useState(false)
   const [videos, setVideos] = useState<GeneratedVideo[]>([])
   const [error, setError] = useState<string | null>(null)
   // null 表示未打开大图查看；数值是 videos 里的下标
   const [previewIndex, setPreviewIndex] = useState<number | null>(null)
+
+  // 当前选择是否越出免费额度（非 720P 或 非 5s）：越界时给出会员提示
+  const memberOnlySpec =
+    resolution !== DEFAULT_RESOLUTION || duration !== DEFAULT_DURATION
 
   const handleGenerate = async () => {
     if (!prompt.trim() || loading) return
@@ -76,11 +99,12 @@ export default function VideoPage() {
         method: "POST",
         headers: { "Content-Type": "application/json", ...getAuthHeader() },
         body: JSON.stringify({
-          model: "qwen3.6-plus",
+          model: VIDEO_MODEL,
           prompt: prompt.trim(),
           n,
           ratio,
           duration,
+          resolution,
         }),
       })
 
@@ -107,6 +131,7 @@ export default function VideoPage() {
         revised_prompt: item.revised_prompt || prompt,
         ratio: item.ratio || ratio,
         duration: item.duration || duration,
+        resolution: item.resolution || undefined,
       }))
 
       if (newVideos.length === 0) {
@@ -181,6 +206,13 @@ export default function VideoPage() {
               options={ASPECT_RATIOS}
             />
             <SegmentedGroup
+              label="分辨率"
+              value={resolution}
+              onChange={setResolution}
+              disabled={loading}
+              options={RESOLUTIONS}
+            />
+            <SegmentedGroup
               label="时长（秒）"
               value={String(duration)}
               onChange={value => setDuration(Number(value))}
@@ -206,6 +238,9 @@ export default function VideoPage() {
                   : <><Wand2 className="h-4 w-4" /> 生成视频</>
                 }
               </Button>
+              {memberOnlySpec && (
+                <p className="mt-2 text-center text-xs text-muted-foreground/80">{MEMBER_ONLY_HINT}</p>
+              )}
             </div>
 
             {error && <Notice tone="error">{error}</Notice>}
@@ -252,6 +287,9 @@ export default function VideoPage() {
                   <CardContent className="space-y-3 py-3">
                     <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                       <StatusBadge tone="neutral" className="font-mono">{vid.ratio}</StatusBadge>
+                      {vid.resolution && (
+                        <StatusBadge tone="neutral" className="font-mono">{vid.resolution}</StatusBadge>
+                      )}
                       <StatusBadge tone="neutral" className="font-mono">{vid.duration}s</StatusBadge>
                       <span className="min-w-0 truncate">{vid.revised_prompt.slice(0, 80)}</span>
                     </div>
@@ -280,7 +318,7 @@ export default function VideoPage() {
                 <div className="text-center">
                   <p className="font-medium text-foreground">还没有生成视频</p>
                   <p className="mt-1 text-sm text-muted-foreground">
-                    在左侧填写描述、比例与时长，点击「生成视频」开始创作。
+                    在左侧填写描述、比例、分辨率与时长，点击「生成视频」开始创作。
                   </p>
                 </div>
               </CardContent>

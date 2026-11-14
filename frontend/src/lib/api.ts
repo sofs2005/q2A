@@ -58,6 +58,7 @@ export interface VideoResponseItem {
   revised_prompt?: string
   ratio?: string
   duration?: number
+  resolution?: string
 }
 
 /** 媒体库条目（仅声明前端实际读取的字段）。 */
