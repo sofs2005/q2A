@@ -57,8 +57,12 @@ async def probe_browser_upload(request: Request):
     - `calibration`：当前使用的拖动标定（`a` / `b` / 来源 / 标定时的 `mode`）；
     - `local` 模式额外给 `platform` / `webgl`，用于判断容器里的指纹环境；
     - `exit_pool`：出口池（`getstsToken` 主路径）的状态
-      `{enabled, exits: [{id, state, failures, successes, cooldown_remaining, last_error}]}`。
+      `{enabled, exits: [{id, state, failures, successes, cooldown_remaining,
+      last_error, last_success_at, last_failure_at, avg_connect_ms}]}`。
       `state=cooldown` 表示该出口连续失败被临时剔除；`cooldown_remaining` 是剩余秒数。
+      `last_success_at` / `last_failure_at` 是 epoch 秒（最近一次成功 / 失败），
+      `avg_connect_ms` 是建连耗时滑动平均（毫秒）——`pick()` 会优先命中
+      `last_success_at` 最新的出口。
       出口 id 只有后缀（如 `Default.g`），**不含**代理凭据。
 
     探针**永不**返回 5xx：异常也折叠成 `connected=false` + `error`。

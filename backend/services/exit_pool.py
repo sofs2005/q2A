@@ -39,6 +39,8 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable
 from urllib.parse import unquote, urlparse
 
+from backend.core.http_timeout import connect_read_timeout
+
 log = logging.getLogger("qwen2api.exit_pool")
 
 #: 连续失败多少次进入冷却（可被 `UPLOAD_EXIT_MAX_FAILURES` 覆盖）
@@ -47,6 +49,11 @@ DEFAULT_MAX_FAILURES = 2
 DEFAULT_COOLDOWN_SECONDS = 600.0
 #: 单次健康探测超时（秒，可被 `UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS` 覆盖）
 DEFAULT_PROBE_TIMEOUT_SECONDS = 10.0
+#: 出口请求的**建连阶段**超时（秒，可被 `EXIT_CONNECT_TIMEOUT_SECONDS` 覆盖）。
+#: 只压建连、不压读取：大模型生成可能很慢，读超时压到 5s 会误杀正常请求。
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
+#: 启动探测的总耗时上限（秒，可被 `EXIT_PROBE_TOTAL_TIMEOUT_SECONDS` 覆盖）
+DEFAULT_PROBE_TOTAL_TIMEOUT_SECONDS = 15.0
 
 #: 出口状态
 STATE_READY = "ready"
@@ -156,6 +163,39 @@ def _as_int(value: Any, default: int) -> int:
     return parsed if parsed >= 1 else default
 
 
+#: `avg_connect_ms` 滑动平均的样本上限：超过后按指数衰减，让近期样本占主导
+_CONNECT_SAMPLE_CAP = 8
+
+
+def _accumulate_connect_ms(state: "_ExitState", connect_ms: float | None) -> None:
+    """把一次耗时样本并进 `avg_connect_ms`（简单滑动平均，样本上限后转指数衰减）。
+
+    Args:
+        state: 出口状态。
+        connect_ms: 本次耗时（毫秒）；None / 负数 / 非法值直接忽略。
+    """
+    if connect_ms is None:
+        return
+    try:
+        sample = float(connect_ms)
+    except (TypeError, ValueError):
+        return
+    if sample < 0:
+        return
+    state.connect_samples += 1
+    if state.connect_samples == 1:
+        # 首个样本直接作为初值，避免从 0 慢慢爬上来。
+        state.avg_connect_ms = sample
+        return
+    if state.connect_samples <= _CONNECT_SAMPLE_CAP:
+        # 样本未满：标准增量平均。
+        weight = 1.0 / float(state.connect_samples)
+    else:
+        # 样本已满：固定权重 1/(cap+1)，近 8 次占主导，老样本自然淡出。
+        weight = 1.0 / float(_CONNECT_SAMPLE_CAP + 1)
+    state.avg_connect_ms = state.avg_connect_ms + (sample - state.avg_connect_ms) * weight
+
+
 @dataclass
 class _ExitState:
     """单个出口的运行时状态。"""
@@ -167,6 +207,16 @@ class _ExitState:
     cooldown_until: float = 0.0
     last_error: str = ""
     last_used_at: float = 0.0
+    #: 最近一次成功的时间戳（`wall_clock`，默认 `time.time()` 的 epoch 秒）。
+    #: `pick()` 用它把「已证明可用」的出口排到最前面 —— 生产上出口一旦通了就
+    #: 该直接命中它，不要再从零试错。
+    last_success_at: float = 0.0
+    #: 最近一次失败的时间戳（epoch 秒，只用于观测）。
+    last_failure_at: float = 0.0
+    #: 建连耗时滑动平均（毫秒）；没测到过就是 0。
+    avg_connect_ms: float = 0.0
+    #: 已累计的建连耗时样本数（用于把滑动平均从「首个样本」平滑起算）。
+    connect_samples: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -185,7 +235,10 @@ class ExitPool:
         cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
         max_failures: int = DEFAULT_MAX_FAILURES,
         probe_timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
+        connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        prefer_last_success: bool = True,
         clock: Callable[[], float] | None = None,
+        wall_clock: Callable[[], float] | None = None,
         probe_fetch: Callable[[str, float], Awaitable[bool]] | None = None,
     ) -> None:
         """初始化出口池。
@@ -194,8 +247,13 @@ class ExitPool:
             exits: 代理 URL 列表（`socks5h://Default.g@host:port`）。
             cooldown_seconds: 冷却时长；连续失败达阈值后该出口暂停这么久。
             max_failures: 连续失败多少次进入冷却。
-            probe_timeout_seconds: 单次探测超时。
-            clock: 时钟函数（单测注入假时钟用），默认 `time.monotonic`。
+            probe_timeout_seconds: 单次探测的整体超时（读阶段）。
+            connect_timeout_seconds: 出口请求的**建连阶段**超时（只压 connect）。
+            prefer_last_success: `pick()` 是否优先返回最近成功的出口
+                （`EXIT_PICK_PREFER_LAST_SUCCESS`，默认开）。
+            clock: 单调时钟函数（冷却计算用），默认 `time.monotonic`。
+            wall_clock: 墙钟函数（`last_success_at` / `last_failure_at` 用，
+                给运维看的是 epoch 秒），默认 `time.time`。
             probe_fetch: 探测实现（单测注入假网络用）；签名
                 `async (proxy_url, timeout) -> bool`，为空时用真实 HTTP 探测。
         """
@@ -211,7 +269,10 @@ class ExitPool:
         self.cooldown_seconds = max(0.0, float(cooldown_seconds))
         self.max_failures = max(1, int(max_failures))
         self.probe_timeout_seconds = max(0.1, float(probe_timeout_seconds))
+        self.connect_timeout_seconds = max(0.0, float(connect_timeout_seconds))
+        self.prefer_last_success = bool(prefer_last_success)
         self._clock = clock or time.monotonic
+        self._wall_clock = wall_clock or time.time
         self._probe_fetch = probe_fetch
         self._lock: asyncio.Lock | None = None
 
@@ -276,6 +337,14 @@ class ExitPool:
                 getattr(settings_obj, "UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS", DEFAULT_PROBE_TIMEOUT_SECONDS),
                 DEFAULT_PROBE_TIMEOUT_SECONDS,
             ),
+            connect_timeout_seconds=_as_float(
+                getattr(settings_obj, "EXIT_CONNECT_TIMEOUT_SECONDS", DEFAULT_CONNECT_TIMEOUT_SECONDS),
+                DEFAULT_CONNECT_TIMEOUT_SECONDS,
+            ),
+            # 未显式配置时默认开启「优先最近成功的出口」。
+            prefer_last_success=bool(
+                getattr(settings_obj, "EXIT_PICK_PREFER_LAST_SUCCESS", True)
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -300,10 +369,16 @@ class ExitPool:
     # 选出口
     # ------------------------------------------------------------------
     def pick(self, exclude: set[str] | None = None) -> str | None:
-        """轮询挑一个可用出口，返回**代理 URL**；没有可用出口时返回 None。
+        """挑一个可用出口，返回**代理 URL**；没有可用出口时返回 None。
 
-        跳过：`exclude` 里的（本轮已试过的）、以及仍在冷却中的。冷却到期的
-        出口在这里顺手复位（失败计数清零，重新给满 N 次机会）。
+        排序（`prefer_last_success=True`，默认）：
+
+        1. 先排除 `exclude`（本轮已试过的）与冷却中的出口（冷却到期的顺手复位）；
+        2. 在剩下的出口里，**优先返回 `last_success_at` 最新的那个** —— 出口一旦
+           证明可用就直接命中它，不再从零试错（生产上 4 个死出口各等 10s 的浪费
+           就出在这里）。同样「最近成功」时退化为轮询，保证负载不会死盯一个出口；
+        3. 从来没过成功的出口（`last_success_at=0`）排在已证明可用的之后，按轮询
+           顺序取第一个 —— 探测还没跑完 / 全部不可用时行为与旧版一致。
 
         Args:
             exclude: 本轮要跳过的出口 id 集合。
@@ -316,6 +391,7 @@ class ExitPool:
         excluded = {str(item or "") for item in (exclude or set())}
         now = self._clock()
         total = len(self._order)
+        candidates: list[tuple[int, _ExitState]] = []
         for offset in range(total):
             index = (self._cursor + offset) % total
             exit_id = self._order[index]
@@ -328,16 +404,35 @@ class ExitPool:
                 # 冷却到期：清零计数，给这个出口一轮全新的机会。
                 state.cooldown_until = 0.0
                 state.failures = 0
-            self._cursor = (index + 1) % total
-            state.last_used_at = now
-            return state.url
-        return None
+            candidates.append((index, state))
+        if not candidates:
+            return None
+
+        chosen_index, chosen_state = candidates[0]
+        if self.prefer_last_success:
+            proven = [item for item in candidates if item[1].last_success_at > 0.0]
+            if proven:
+                # key：最近成功时间最大 → 优先；同时间再按「连续失败更少」→ 轮询。
+                chosen_index, chosen_state = max(
+                    proven,
+                    key=lambda item: (item[1].last_success_at, -item[1].failures),
+                )
+        self._cursor = (chosen_index + 1) % total
+        chosen_state.last_used_at = now
+        return chosen_state.url
 
     # ------------------------------------------------------------------
     # 记账
     # ------------------------------------------------------------------
-    def mark_success(self, exit_id: str) -> None:
-        """记一次成功：失败计数清零、解除冷却。"""
+    def mark_success(self, exit_id: str, *, connect_ms: float | None = None) -> None:
+        """记一次成功：失败计数清零、解除冷却、刷新 `last_success_at`。
+
+        Args:
+            exit_id: 出口 id（`Default.g` 这种后缀）。
+            connect_ms: 本次经该出口的耗时（毫秒，可选）。给了就并进
+                `avg_connect_ms` —— 只在轻量请求（探测 / getstsToken / 建会话）上
+                采样，不拿大模型生成的长耗时污染这个指标。
+        """
         state = self._states.get(str(exit_id or ""))
         if state is None:
             return
@@ -345,20 +440,31 @@ class ExitPool:
         state.cooldown_until = 0.0
         state.successes += 1
         state.last_error = ""
+        state.last_success_at = float(self._wall_clock())
+        _accumulate_connect_ms(state, connect_ms)
 
-    def mark_failure(self, exit_id: str, reason: str) -> None:
+    def mark_failure(
+        self,
+        exit_id: str,
+        reason: str,
+        *,
+        connect_ms: float | None = None,
+    ) -> None:
         """记一次失败；连续失败达 `max_failures` 时把该出口投入冷却。
 
         Args:
             exit_id: 出口 id（`Default.g` 这种后缀，不含凭据）。
             reason: 失败原因（`waf` / `http_403` / `connect_failed` ...），只用于
                 观测，不会被当作判断依据。
+            connect_ms: 失败前已经等掉的耗时（毫秒，可选），并进 `avg_connect_ms`。
         """
         state = self._states.get(str(exit_id or ""))
         if state is None:
             return
         state.failures += 1
         state.last_error = str(reason or "")[:200]
+        state.last_failure_at = float(self._wall_clock())
+        _accumulate_connect_ms(state, connect_ms)
         if state.failures >= self.max_failures:
             state.cooldown_until = self._clock() + self.cooldown_seconds
             log.warning(
@@ -384,6 +490,10 @@ class ExitPool:
                     "successes": state.successes,
                     "cooldown_remaining": round(remaining, 1),
                     "last_error": state.last_error,
+                    # 出口健康画像（epoch 秒 / 毫秒），运维据此判断该不该换出口。
+                    "last_success_at": round(state.last_success_at, 3),
+                    "last_failure_at": round(state.last_failure_at, 3),
+                    "avg_connect_ms": round(state.avg_connect_ms, 1),
                 }
             )
         return rows
@@ -428,23 +538,42 @@ class ExitPool:
                 log.warning("[UploadExit] probe failed exit=%s", state.exit_id)
             return bool(ok)
 
-    async def _do_probe(self, proxy_url: str, *, token: str, account: Any) -> bool:
+    async def _do_probe(
+        self,
+        proxy_url: str,
+        *,
+        token: str,
+        account: Any,
+        timeout: float | None = None,
+    ) -> bool:
         """执行一次探测：优先用注入的假实现（单测），否则发真实请求。"""
+        probe_timeout = (
+            float(timeout) if timeout is not None and timeout > 0 else self.probe_timeout_seconds
+        )
         if self._probe_fetch is not None:
-            return bool(await self._probe_fetch(proxy_url, self.probe_timeout_seconds))
-        return await self._http_probe(proxy_url, token=token, account=account)
+            return bool(await self._probe_fetch(proxy_url, probe_timeout))
+        return await self._http_probe(proxy_url, token=token, account=account, timeout=probe_timeout)
 
-    async def _http_probe(self, proxy_url: str, *, token: str, account: Any) -> bool:
+    async def _http_probe(
+        self,
+        proxy_url: str,
+        *,
+        token: str,
+        account: Any,
+        timeout: float | None = None,
+    ) -> bool:
         """真实探测：curl_cffi + 该出口代理 GET `/api/v2/users/status`。"""
         from curl_cffi.requests import AsyncSession
 
         from backend.core.browser_fingerprint import fingerprint_for_account
         from backend.services.auth_resolver import BASE_URL
 
+        read_timeout = float(timeout) if timeout is not None and timeout > 0 else self.probe_timeout_seconds
+        timeouts = connect_read_timeout(read_timeout, self.connect_timeout_seconds)
         fingerprint = fingerprint_for_account(account)
         session = AsyncSession(
             impersonate=fingerprint.impersonate,
-            timeout=self.probe_timeout_seconds,
+            timeout=timeouts,
             allow_redirects=True,
             proxies={"http": proxy_url, "https": proxy_url},
         )
@@ -459,7 +588,7 @@ class ExitPool:
             response = await session.get(
                 f"{BASE_URL}{_PROBE_PATH}",
                 headers=headers,
-                timeout=self.probe_timeout_seconds,
+                timeout=timeouts,
             )
             status = int(getattr(response, "status_code", 0) or 0)
             body = str(getattr(response, "text", "") or "")
@@ -469,3 +598,157 @@ class ExitPool:
                 await session.close()
             except Exception:  # pragma: no cover - 关闭失败不影响探测结论
                 log.debug("[UploadExit] probe session close failed", exc_info=True)
+
+    async def _probe_outcome(
+        self,
+        proxy_url: str,
+        *,
+        token: str,
+        account: Any,
+        timeout: float | None = None,
+    ) -> tuple[bool, str]:
+        """探测一次并给出 `(是否可用, 失败原因)`；**永不抛异常**。
+
+        Args:
+            proxy_url: 该出口的代理 URL。
+            token: 可选上游 token。
+            account: 可选账号（决定浏览器指纹）。
+            timeout: 单次探测超时（秒）。
+
+        Returns:
+            `(True, "")` 或 `(False, reason)`；reason ∈
+            `connect_failed` / `probe_failed`。
+        """
+        probe_timeout = (
+            float(timeout) if timeout is not None and timeout > 0 else self.probe_timeout_seconds
+        )
+        try:
+            ok = await asyncio.wait_for(
+                self._do_probe(proxy_url, token=token, account=account, timeout=probe_timeout),
+                timeout=probe_timeout,
+            )
+        except asyncio.TimeoutError:
+            return False, "connect_failed"
+        except Exception as exc:
+            log.debug(
+                "[UploadExit] probe error error=%s",
+                f"{type(exc).__name__}: {str(exc)[:120]}",
+            )
+            return False, "connect_failed"
+        return (True, "") if ok else (False, "probe_failed")
+
+    async def probe_all(
+        self,
+        *,
+        token: str = "",
+        account: Any = None,
+        limit_seconds: float = DEFAULT_PROBE_TOTAL_TIMEOUT_SECONDS,
+        only: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """**并发**探测所有出口，失败的立即 `mark_failure`（达阈值即进冷却）。
+
+        启动时调一次：把「已经连不上」的出口提前踢出轮转，后续请求就不会再挨个
+        试死出口（生产上 4 个死出口 × 10s ≈ 21s 的白等由此消失）。
+
+        - 并发：`asyncio.gather`，总耗时受 `limit_seconds` 约束（默认 15s）；
+        - 端点：轻量 GET（默认 `/api/v2/users/status`），**绝不打 chat/completions**
+          （会烧额度、招风控）；
+        - 失败即记 `connect_failed` → 连续失败达 `max_failures` 立刻冷却。
+
+        Args:
+            token: 可选上游 token。
+            account: 可选账号对象（决定浏览器指纹，与真实链路一致）。
+            limit_seconds: 整批探测的总耗时上限（秒）。
+            only: 只探测这些出口 id（None 表示全部）。
+
+        Returns:
+            每个出口一条结果：`{id, ok, reason, elapsed_seconds, state}`。
+        """
+        if not self._order:
+            return []
+        targets = [
+            exit_id
+            for exit_id in self._order
+            if only is None or exit_id in {str(item or "") for item in only}
+        ]
+        if not targets:
+            return []
+        budget = max(0.1, float(limit_seconds))
+        tasks = [
+            asyncio.ensure_future(self._probe_one(exit_id, token=token, account=account, budget=budget))
+            for exit_id in targets
+        ]
+        try:
+            gathered = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=budget)
+        except asyncio.TimeoutError:
+            # 总预算耗尽：把没跑完的探测取消，本轮结论按「不可用」处理。
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            log.warning(
+                "[ExitProbe] budget exhausted budget=%.0fs exits=%s",
+                budget,
+                len(targets),
+            )
+            gathered = [
+                {"id": exit_id, "ok": False, "reason": "probe_timeout", "elapsed_seconds": budget, "state": STATE_READY}
+                for exit_id in targets
+            ]
+        results: list[dict[str, Any]] = []
+        for item in gathered:
+            if isinstance(item, Exception):  # pragma: no cover - _probe_one 内部已兜住
+                log.debug("[ExitProbe] probe crashed error=%s", type(item).__name__)
+                continue
+            results.append(item)
+        return results
+
+    async def _probe_one(
+        self,
+        exit_id: str,
+        *,
+        token: str,
+        account: Any,
+        budget: float,
+    ) -> dict[str, Any]:
+        """探测单个出口并记账（`probe_all` 的 worker）。"""
+        state = self._states.get(str(exit_id or ""))
+        if state is None:
+            return {"id": str(exit_id or ""), "ok": False, "reason": "unknown_exit", "elapsed_seconds": 0.0, "state": STATE_READY}
+        started = time.monotonic()
+        ok, reason = await self._probe_outcome(
+            state.url,
+            token=token,
+            account=account,
+            timeout=min(self.probe_timeout_seconds, budget),
+        )
+        elapsed = max(0.0, time.monotonic() - started)
+        connect_ms = elapsed * 1000.0
+        if ok:
+            self.mark_success(state.exit_id, connect_ms=connect_ms)
+            log.info("[ExitProbe] ok exit=%s %.1fs", state.exit_id, elapsed)
+        else:
+            self.mark_failure(state.exit_id, reason, connect_ms=connect_ms)
+            cooling = state.cooldown_until > self._clock()
+            if cooling:
+                log.warning(
+                    "[ExitProbe] dead exit=%s reason=%s → cooldown %.0fs",
+                    state.exit_id,
+                    reason,
+                    self.cooldown_seconds,
+                )
+            else:
+                log.warning(
+                    "[ExitProbe] dead exit=%s reason=%s failures=%s/%s",
+                    state.exit_id,
+                    reason,
+                    state.failures,
+                    self.max_failures,
+                )
+        return {
+            "id": state.exit_id,
+            "ok": bool(ok),
+            "reason": reason,
+            "elapsed_seconds": round(elapsed, 3),
+            "state": STATE_COOLING if state.cooldown_until > self._clock() else STATE_READY,
+        }
+

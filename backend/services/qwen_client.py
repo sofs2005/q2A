@@ -12,6 +12,7 @@ import httpx
 from backend.core.account_pool import Account
 from backend.core.browser_fingerprint import fingerprint_for_account, get_session, new_session
 from backend.core.config import DEFAULT_QWEN_BX_VERSION, DEFAULT_QWEN_WEB_VERSION, settings
+from backend.core.http_timeout import connect_read_timeout
 from backend.services.auth_resolver import BASE_URL, AuthResolver
 from backend.services.chat_exit_binding import ChatExitBinding, ChatExitBindings, resolve_chat_exit_mode
 from backend.services.chat_id_pool import ChatIDPool
@@ -148,14 +149,28 @@ class QwenClient:
         return binding.proxy_url, binding.exit_id
 
     async def _open_exit_session(self, account: Account | None, timeout: float, proxy_url: str):
-        """经指定出口开会话（curl_cffi + 账号指纹；单测可注入假工厂）。"""
+        """经指定出口开会话（curl_cffi + 账号指纹；单测可注入假工厂）。
+
+        会话的默认超时按「建连收紧、读取不变」下发：出口连不上时 5s
+        （`EXIT_CONNECT_TIMEOUT_SECONDS`）就换下一个，而不是等满整体超时。
+        """
         factory = self._exit_session_factory
         if factory is not None:
             session = factory(proxy_url)
             if inspect.isawaitable(session):
                 session = await session
             return session
-        return new_session(fingerprint_for_account(account), timeout=timeout, proxy_url=proxy_url)
+        return new_session(
+            fingerprint_for_account(account),
+            timeout=timeout,
+            proxy_url=proxy_url,
+            connect_timeout=getattr(settings, "EXIT_CONNECT_TIMEOUT_SECONDS", 5),
+        )
+
+    @staticmethod
+    def exit_request_timeout(timeout: float) -> "float | tuple[float, float]":
+        """经出口发请求时用的超时值（建连 5s / 读取原值）。"""
+        return connect_read_timeout(timeout, getattr(settings, "EXIT_CONNECT_TIMEOUT_SECONDS", 5))
 
     @staticmethod
     async def _close_session(session) -> None:
@@ -441,6 +456,11 @@ class QwenClient:
             if hit is not None:
                 proxy_url, exit_id = hit
         dedicated = bool(proxy_url)
+        # 经出口的请求：建连阶段收紧到 EXIT_CONNECT_TIMEOUT_SECONDS（默认 5s），
+        # 读阶段保持原值。直连路径的 timeout 语义完全不变。
+        send_timeout: float | tuple[float, float] = (
+            self.exit_request_timeout(request_timeout) if dedicated else request_timeout
+        )
         if dedicated:
             session = await self._open_exit_session(account, request_timeout, proxy_url)
         else:
@@ -473,7 +493,7 @@ class QwenClient:
                     f"{BASE_URL}{path}",
                     headers=headers,
                     json=body,
-                    timeout=request_timeout,
+                    timeout=send_timeout,
                 )
                 return {
                     "status": resp.status_code,
@@ -937,13 +957,15 @@ class QwenClient:
                 retry_session = await self._open_exit_session(account, timeout, proxy_url)
             else:
                 retry_session = new_session(fingerprint_for_account(account), timeout=timeout)
+            # 经出口重试同样只压建连阶段（出口连不上就别等满整体超时）。
+            retry_timeout = self.exit_request_timeout(timeout) if proxy_url else timeout
             try:
                 async with retry_session.stream(
                     "POST",
                     f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
                     headers=retry_headers,
                     json=payload,
-                    timeout=timeout,
+                    timeout=retry_timeout,
                 ) as resp2:
                     if resp2.status_code != 200:
                         body_chunks2 = []
@@ -1081,6 +1103,9 @@ class QwenClient:
             session = new_session(fingerprint, timeout=timeout)
         else:
             session = await get_session(fingerprint)
+        # 经出口的流式请求：建连收紧（死出口 5s 就换），读取仍是原超时
+        # （大模型生成慢，绝不能把读超时压到 5s）。
+        stream_timeout = self.exit_request_timeout(timeout) if proxy_url else timeout
         log.info(
             "[QwenClient] stream_headers chat_id=%s dedicated_session=%s exit=%s diag=%s",
             chat_id,
@@ -1094,7 +1119,7 @@ class QwenClient:
                 f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
                 headers=headers,
                 json=payload,
-                timeout=timeout,
+                timeout=stream_timeout,
             ) as resp:
                 if resp.status_code != 200:
                     body_chunks = []

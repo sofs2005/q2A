@@ -177,6 +177,7 @@ def new_session(
     *,
     timeout: float | None = None,
     proxy_url: str | None = None,
+    connect_timeout: float | None = None,
 ) -> AsyncSession:
     """按指纹新建一个 curl_cffi 会话。
 
@@ -185,15 +186,19 @@ def new_session(
         timeout: 默认超时（秒）；None 时用 `QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS`。
         proxy_url: 指定出口代理（`socks5h://Default.g@host:port`）。非空时覆盖
             `UPSTREAM_PROXY` —— chat_id 出口亲和性靠它把请求钉在同一个出口上。
+        connect_timeout: **建连阶段**超时（秒）。只压 connect/首字节，读阶段仍用
+            `timeout`：走出口时出口可能连不上，不能让它等满整体超时。
 
     Returns:
         已配置好指纹与代理的 `AsyncSession`（调用方负责 close）。
     """
     from backend.core.config import settings
+    from backend.core.http_timeout import connect_read_timeout
 
+    read_timeout = timeout if timeout is not None else settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS
     kwargs: dict[str, Any] = dict(
         impersonate=fingerprint.impersonate,
-        timeout=timeout if timeout is not None else settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS,
+        timeout=connect_read_timeout(read_timeout, connect_timeout),
         allow_redirects=True,
     )
     proxy = str(proxy_url or "").strip() or getattr(settings, "UPSTREAM_PROXY", "")

@@ -280,6 +280,30 @@ class Settings(BaseSettings):
     UPLOAD_EXIT_MAX_FAILURES: int = int(os.getenv("UPLOAD_EXIT_MAX_FAILURES", 2))
     # 单次出口健康探测（GET /api/v2/users/status）超时（秒）
     UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS: float = float(os.getenv("UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS", 10))
+    # ---- 出口连接的「建连阶段」超时（2026-12 生产实测）----
+    # 出口随时有若干连不上：旧实现一个死出口要等满整体超时（~10s），`chats/new`
+    # 挨个试 4 个死出口就是 21s 白等。这里只压**建连 / 首字节**阶段，
+    # 读阶段仍用各自的原超时（大模型生成可能很慢，压到 5s 会误杀正常请求）。
+    # curl_cffi 支持 `timeout=(connect, read)` 元组时按元组下发；老版本退化成
+    # 整体超时收紧到该值。
+    EXIT_CONNECT_TIMEOUT_SECONDS: float = float(os.getenv("EXIT_CONNECT_TIMEOUT_SECONDS", 5))
+    # `ExitPool.pick()` 是否优先返回「最近成功」的出口（默认开）：出口一旦证明
+    # 可用就直接命中它，不再从零试错。设为 false 回到纯轮询（回滚开关）。
+    EXIT_PICK_PREFER_LAST_SUCCESS: bool = os.getenv("EXIT_PICK_PREFER_LAST_SUCCESS", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    # 启动后是否在**后台任务**里并发探测一遍出口（不阻塞 startup）
+    EXIT_PROBE_ON_STARTUP: bool = os.getenv("EXIT_PROBE_ON_STARTUP", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    # 启动探测的总耗时上限（秒）：并发探测所有出口，超预算的按不可用处理
+    EXIT_PROBE_TOTAL_TIMEOUT_SECONDS: float = float(os.getenv("EXIT_PROBE_TOTAL_TIMEOUT_SECONDS", 15))
     # ---- 建会话（chats/new）走出口池（复用上面的 UPLOAD_EXIT_POOL 出口列表）----
     # 生产故障（2026-12）：出口 IP 被 WAF 记分后 chats/new 返回拼图挑战页，整个网关
     # 变成「No available accounts in pool」。上游会话与出口 IP 绑定，所以建会话用哪个

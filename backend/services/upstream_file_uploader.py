@@ -384,7 +384,7 @@ class UpstreamFileUploader:
                 # 只记异常类型：curl 的错误串可能带 host / 凭据，绝不落日志。
                 reason = f"connect_failed:{type(exc).__name__}"
                 last_reason = reason
-                pool.mark_failure(exit_id, reason)
+                pool.mark_failure(exit_id, reason, connect_ms=(time.monotonic() - started) * 1000.0)
                 log.warning("[UploadExit] exit=%s blocked reason=%s → next", exit_id, reason)
                 continue
 
@@ -429,7 +429,7 @@ class UpstreamFileUploader:
                 log.warning("[UploadExit] exit=%s blocked reason=%s → next", exit_id, last_reason)
                 continue
 
-            pool.mark_success(exit_id)
+            pool.mark_success(exit_id, connect_ms=(time.monotonic() - started) * 1000.0)
             log.info(
                 "[UploadExit] sts ok exit=%s elapsed=%.1fs file=%s size=%s",
                 exit_id,
@@ -464,9 +464,16 @@ class UpstreamFileUploader:
         """
         from curl_cffi.requests import AsyncSession
 
+        from backend.core.http_timeout import connect_read_timeout
         from backend.services.auth_resolver import BASE_URL
 
         headers = self._sts_headers(acc)
+        # 经出口取 STS：建连阶段收紧到 EXIT_CONNECT_TIMEOUT_SECONDS（默认 5s），
+        # 读阶段仍是 UPLOAD_STS_REQUEST_TIMEOUT_SECONDS —— 死出口 5s 就让位给下一个。
+        timeouts = connect_read_timeout(
+            _STS_REQUEST_TIMEOUT_SECONDS,
+            getattr(self.settings, "EXIT_CONNECT_TIMEOUT_SECONDS", 5),
+        )
         if self._exit_session_factory is not None:
             session = await self._exit_session_factory(proxy_url)
         else:
@@ -475,7 +482,7 @@ class UpstreamFileUploader:
             fingerprint = fingerprint_for_account(acc)
             session = AsyncSession(
                 impersonate=fingerprint.impersonate,
-                timeout=_STS_REQUEST_TIMEOUT_SECONDS,
+                timeout=timeouts,
                 allow_redirects=True,
                 proxies={"http": proxy_url, "https": proxy_url},
             )
@@ -484,7 +491,7 @@ class UpstreamFileUploader:
                 f"{BASE_URL}/api/v2/files/getstsToken",
                 headers=headers,
                 json=body,
-                timeout=_STS_REQUEST_TIMEOUT_SECONDS,
+                timeout=timeouts,
             )
             return {
                 "status": int(getattr(response, "status_code", 0) or 0),

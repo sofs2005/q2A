@@ -42,6 +42,7 @@ import backend.api.models as models
 from backend.api import admin, v1_chat, responses_api, probes, anthropic, gemini, embeddings, images, videos, media, files_api
 from backend.services.garbage_collector import garbage_collect_chats
 from backend.services.context_cleanup import context_cleanup_loop
+from backend.services.exit_probe import startup_exit_probe_task
 
 configure_logging(getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
 install_stack_dump_handler(
@@ -165,6 +166,9 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(context_cleanup_loop(app))
         app.state.chat_id_pool_task = asyncio.create_task(chat_id_pool_loop(app))
         app.state.token_refresh_task = asyncio.create_task(token_refresh_loop(app))
+        # 出口健康探测：**后台任务**，不阻塞 startup（探测最坏也就 15s，但绝不能
+        # 让启动等它）。探测失败的出口立刻进冷却，后续请求不再挨个试死出口。
+        app.state.exit_probe_task = asyncio.create_task(startup_exit_probe_task(app))
 
         app.state.event_loop_watchdog_stop = asyncio.Event()
         app.state.event_loop_watchdog_task = None
@@ -214,6 +218,13 @@ async def lifespan(app: FastAPI):
         chat_pool = getattr(getattr(app.state, "qwen_client", None), "chat_id_pool", None)
         if chat_pool is not None:
             await chat_pool.cleanup(delete_all=True)
+        exit_probe_task = getattr(app.state, "exit_probe_task", None)
+        if exit_probe_task is not None:
+            exit_probe_task.cancel()
+            try:
+                await exit_probe_task
+            except asyncio.CancelledError:
+                pass
         browser_proxy = getattr(app.state, "browser_upload_proxy", None)
         if browser_proxy is not None:
             try:

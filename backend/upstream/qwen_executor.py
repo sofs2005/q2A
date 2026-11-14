@@ -226,16 +226,23 @@ class QwenExecutor:
                 chat_id = await self._post_new_chat(account, token, body, request_fn, proxy_url=proxy_url)
             except _ChatExitRotatable as exc:
                 last_reason = exc.reason
-                self._mark_exit_failure(pool, exit_id, exc.reason)
-                log.warning("[ChatExit] exit=%s blocked reason=%s → next", exit_id, exc.reason)
+                elapsed_ms = (time.monotonic() - started) * 1000.0
+                self._mark_exit_failure(pool, exit_id, exc.reason, connect_ms=elapsed_ms)
+                log.warning(
+                    "[ChatExit] exit=%s blocked reason=%s elapsed=%.1fs → next",
+                    exit_id,
+                    exc.reason,
+                    elapsed_ms / 1000.0,
+                )
                 continue
-            self._mark_exit_success(pool, exit_id)
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            self._mark_exit_success(pool, exit_id, connect_ms=elapsed_ms)
             self._bind_chat_exit(chat_id, exit_id, proxy_url)
             log.info(
                 "[ChatExit] create ok chat_id=%s exit=%s elapsed=%.1fs",
                 chat_id,
                 exit_id,
-                time.monotonic() - started,
+                elapsed_ms / 1000.0,
             )
             return chat_id
 
@@ -275,18 +282,28 @@ class QwenExecutor:
         return pool
 
     @staticmethod
-    def _mark_exit_failure(pool, exit_id: str, reason: str) -> None:
+    def _mark_exit_failure(pool, exit_id: str, reason: str, connect_ms: float | None = None) -> None:
         """记一次出口失败（记账异常不影响主链路）。"""
         try:
-            pool.mark_failure(exit_id, reason)
+            pool.mark_failure(exit_id, reason, connect_ms=connect_ms)
+        except TypeError:  # pragma: no cover - 替身池只实现 mark_failure(exit_id, reason)
+            try:
+                pool.mark_failure(exit_id, reason)
+            except Exception:
+                log.debug("[ChatExit] mark_failure failed exit=%s", exit_id, exc_info=True)
         except Exception:  # pragma: no cover - 单测替身可能只实现 pick/mark_failure
             log.debug("[ChatExit] mark_failure failed exit=%s", exit_id, exc_info=True)
 
     @staticmethod
-    def _mark_exit_success(pool, exit_id: str) -> None:
-        """记一次出口成功（失败计数清零）。"""
+    def _mark_exit_success(pool, exit_id: str, connect_ms: float | None = None) -> None:
+        """记一次出口成功（失败计数清零 + 采样一次耗时而平均进去）。"""
         try:
-            pool.mark_success(exit_id)
+            pool.mark_success(exit_id, connect_ms=connect_ms)
+        except TypeError:  # pragma: no cover - 替身池只实现 mark_success(exit_id)
+            try:
+                pool.mark_success(exit_id)
+            except Exception:
+                log.debug("[ChatExit] mark_success failed exit=%s", exit_id, exc_info=True)
         except Exception:  # pragma: no cover
             log.debug("[ChatExit] mark_success failed exit=%s", exit_id, exc_info=True)
 
