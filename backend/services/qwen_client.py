@@ -934,8 +934,13 @@ class QwenClient:
         files: list[dict] | None = None,
         chat_type: str = "t2v",
         media_options: dict | None = None,
+        exclude: set | None = None,
     ) -> dict:
-        """非流式一次性 completions + 重试（用于视频 t2v）。返回 {chat_id, acc, body}。"""
+        """非流式一次性 completions + 重试（用于视频 t2v）。返回 {chat_id, acc, body}。
+
+        Args:
+            exclude: 调用方预置的「本次不可用」账号邮箱集合，见执行器同名参数。
+        """
         return await self.executor.complete_once_with_retry(
             model,
             content,
@@ -943,4 +948,5 @@ class QwenClient:
             files=files,
             chat_type=chat_type,
             media_options=media_options,
+            exclude=exclude,
         )

@@ -602,17 +602,37 @@ class QwenExecutor:
         files: list[dict] | None = None,
         chat_type: str = "t2v",
         media_options: dict | None = None,
+        exclude: set | None = None,
     ) -> dict:
         """非流式一次性 completions + 账号重试（用于视频 t2v）。
 
         成功返回 {"chat_id", "acc", "body"}；body 为完整 JSON 文本。
         account 的 release 由调用方负责（与流式成功路径一致）。
+
+        Args:
+            model: chat 级模型名（视频场景只用于触发 t2v 通道）。
+            content: 用户 prompt 文本。
+            has_custom_tools: 是否带自定义工具（视频场景恒为 False）。
+            files: 附件列表（视频场景为 None）。
+            chat_type: 上游 chat 类型，视频为 "t2v"。
+            media_options: 下发给 extra.meta 的视频规格等参数。
+            exclude: 调用方预置的「本次不可用」账号邮箱集合（如视频额度已耗尽、
+                正在冷却的账号）。只读取，不会被就地修改；执行器内部的失败账号
+                会累加到一份副本里。这让调用方（如视频接口）能在跨多次调用的
+                重试中持续排除同一个账号。
+
+        Returns:
+            {"chat_id": str, "acc": Account, "body": str}
+
+        Raises:
+            Exception: 无可用账号、或 MAX_RETRIES 次尝试全部失败。
         """
         complete_fn = getattr(self.engine, "complete_chat_once", None)
         if complete_fn is None:
             raise Exception("non-stream transport unavailable")
 
-        exclude: set = set()
+        # 复制一份：既能让调用方预置的排除集生效，又不会反向污染调用方的集合。
+        exclude: set = set(exclude or ())
         for attempt in range(settings.MAX_RETRIES):
             update_request_context(upstream_attempt=attempt + 1)
             acc = await self.account_pool.acquire_wait(timeout=60, exclude=exclude)

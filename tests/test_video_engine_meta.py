@@ -4,7 +4,10 @@
 1. chat 级 model 的死模型修复（DEFAULT_VIDEO_MODEL / VIDEO_MODEL_MAP）
 2. resolution / duration 的宽松校验（非法值回落默认 + WARNING，绝不抛错）
 3. `extra.wanx.video_spec` 自检日志（字段名是否生效的唯一验证手段）
-4. 上游「仅会员可用」拒绝的识别与可读报错（400 + 明确 detail）
+4. 上游「仅会员可用」拒绝的识别与可读报错：
+   - 会员规格（1080P / 10s / 15s）→ 400，且不换号、不标限流
+   - 免费规格（720P + 5s）→ 该号当天免费额度用完 → 标限流 + 换号重试，
+     全部用完回 429；冷却期内的账号不再被选中
 """
 import json
 import sys
@@ -280,10 +283,13 @@ class _FakeClient:
         self.acc = _FakeAccount()
         self.account_pool = _FakeAccountPool()
         self.deleted_chats: list = []
+        self.received_excludes: list = []
 
     async def complete_once_with_retry(
-        self, model, prompt, has_custom_tools=False, chat_type="", media_options=None
+        self, model, prompt, has_custom_tools=False, chat_type="", media_options=None,
+        exclude=None,
     ) -> dict:
+        self.received_excludes.append(set(exclude or ()))
         return {"acc": self.acc, "chat_id": "fake-chat-id", "body": self._body}
 
     async def delete_chat(self, token, chat_id, account=None) -> bool:
@@ -386,6 +392,247 @@ class VideoGenerationErrorMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             ctx.exception.detail, "Video generation returned no task_id"
         )
+
+
+# ---------------------------------------------------------------------------
+# 免费规格被打回 = 该号当天视频额度用完 → 换号重试（而不是打挂整个请求）
+# ---------------------------------------------------------------------------
+
+#: 免费规格成功返回：body 里直接带视频 URL，无需轮询任务状态。
+SUCCESS_BODY = {
+    "data": {
+        "messages": [
+            {"role": "assistant", "content": "https://cdn.example.com/v/ok.mp4"}
+        ]
+    }
+}
+
+#: 免费规格成功返回的视频 URL（便于断言）
+SUCCESS_VIDEO_URL = "https://cdn.example.com/v/ok.mp4"
+
+
+class _PoolRecorder:
+    """带视频冷却集的账号池替身：记录 release / mark_video_limited 调用。
+
+    `mark_video_limited` 会同步把账号加进冷却集，模拟真实池的行为
+    （真实池里该字段是 `video_blocked_until`，冷却期内不再被选中）。
+    """
+
+    def __init__(self, blocked: set | None = None) -> None:
+        self.blocked = set(blocked or ())
+        self.released: list = []
+        self.video_limited: list = []
+
+    def release(self, acc) -> None:
+        self.released.append(getattr(acc, "email", ""))
+
+    def mark_video_limited(self, acc, error_message: str = "") -> None:
+        self.video_limited.append(getattr(acc, "email", ""))
+        self.blocked.add(getattr(acc, "email", ""))
+
+    def video_blocked_emails(self) -> set:
+        return set(self.blocked)
+
+
+class _PooledClient:
+    """带账号池语义的假客户端：每次调用挑第一个未被 `exclude` 的账号。
+
+    真实执行器（`complete_once_with_retry`）就是这样用 `exclude` 换号的，
+    这个替身让「换号是否真的发生」可以被断言。
+    """
+
+    def __init__(
+        self,
+        emails: list,
+        bodies: dict | None = None,
+        blocked: set | None = None,
+    ) -> None:
+        self.emails = list(emails)
+        self.bodies = dict(bodies or {})
+        self.account_pool = _PoolRecorder(blocked)
+        self.selected: list = []
+        self.received_excludes: list = []
+        self.deleted_chats: list = []
+
+    async def complete_once_with_retry(
+        self, model, prompt, has_custom_tools=False, chat_type="", media_options=None,
+        exclude=None,
+    ) -> dict:
+        excluded = set(exclude or ())
+        self.received_excludes.append(set(excluded))
+        for email in self.emails:
+            if email in excluded:
+                continue
+            self.selected.append(email)
+            body = self.bodies.get(email, SUCCESS_BODY)
+            return {
+                "acc": _FakeAccount(email),
+                "chat_id": f"chat-{email}",
+                "body": json.dumps(body, ensure_ascii=False),
+            }
+        raise Exception("No available accounts in pool (all busy or rate limited)")
+
+    async def delete_chat(self, token, chat_id, account=None) -> bool:
+        self.deleted_chats.append(chat_id)
+        return True
+
+
+class FreeSpecDetectionTests(unittest.TestCase):
+    """`_is_free_video_spec`：只有 720P + 5s 才算免费规格。"""
+
+    def test_720p_5s_is_free_spec(self) -> None:
+        self.assertTrue(videos._is_free_video_spec("720P", 5))
+
+    def test_member_specs_are_not_free(self) -> None:
+        for resolution, duration in (
+            ("1080P", 5),
+            ("720P", 10),
+            ("1080P", 10),
+            ("720P", 15),
+            ("1080P", 15),
+        ):
+            with self.subTest(resolution=resolution, duration=duration):
+                self.assertFalse(videos._is_free_video_spec(resolution, duration))
+
+    def test_garbage_duration_is_not_free(self) -> None:
+        self.assertFalse(videos._is_free_video_spec("720P", "abc"))
+        self.assertFalse(videos._is_free_video_spec("720P", None))
+
+    def test_video_blocked_emails_handles_pool_without_method(self) -> None:
+        self.assertEqual(videos._video_blocked_emails(None), set())
+        self.assertEqual(videos._video_blocked_emails(object()), set())
+
+
+class FreeSpecQuotaRetryTests(unittest.IsolatedAsyncioTestCase):
+    """免费规格被打回 → 换号重试；会员规格被打回 → 直接 400 不换号。"""
+
+    async def test_quota_limited_account_switches_and_succeeds(self) -> None:
+        client = _PooledClient(
+            ["a@example.com", "b@example.com"],
+            bodies={"a@example.com": MEMBER_ONLY_BODY},
+        )
+
+        with self.assertLogs("qwen2api.videos", level="WARNING") as captured:
+            result = await videos._run_generation(
+                client, "qwen3.8-max", "一只猫", 1, 5, "16:9", {},
+                resolution="720P",
+            )
+
+        # 1) 账号 A 被打回后自动换号，B 成功 → 200 语义
+        self.assertEqual(client.selected, ["a@example.com", "b@example.com"])
+        self.assertEqual(result["data"][0]["url"], SUCCESS_VIDEO_URL)
+        self.assertEqual(result["data"][0]["resolution"], "720P")
+
+        # 2) 账号 A 被标记视频限流（当天免费额度用完），并进入 exclude
+        self.assertEqual(client.account_pool.video_limited, ["a@example.com"])
+        self.assertIn("a@example.com", client.received_excludes[1])
+        self.assertIn("a@example.com", client.account_pool.blocked)
+
+        # 3) 两个号各释放一次，不重复释放
+        self.assertEqual(
+            client.account_pool.released, ["a@example.com", "b@example.com"]
+        )
+
+        text = "\n".join(captured.output)
+        self.assertIn("account video quota exhausted", text)
+        self.assertIn("account=a@example.com", text)
+        self.assertIn("retry with another account", text)
+
+    async def test_all_accounts_quota_limited_returns_429(self) -> None:
+        emails = ["a@example.com", "b@example.com", "c@example.com"]
+        client = _PooledClient(
+            emails, bodies={email: MEMBER_ONLY_BODY for email in emails}
+        )
+
+        with self.assertLogs("qwen2api.videos", level="WARNING"):
+            with self.assertRaises(videos.HTTPException) as ctx:
+                await videos._run_generation(
+                    client, "qwen3.8-max", "一只猫", 1, 5, "16:9", {},
+                    resolution="720P",
+                )
+
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertEqual(
+            ctx.exception.detail, videos.VIDEO_QUOTA_EXHAUSTED_DETAIL
+        )
+        self.assertIn("免费视频额度已用完", ctx.exception.detail)
+        self.assertIn("1 个/天", ctx.exception.detail)
+
+        # 每个号只试一次（exclude 累积生效），上限 = VIDEO_QUOTA_RETRY_ATTEMPTS
+        self.assertEqual(client.selected, emails)
+        self.assertEqual(len(client.selected), videos.VIDEO_QUOTA_RETRY_ATTEMPTS)
+        self.assertEqual(len(set(client.selected)), len(client.selected))
+        # 每个号都被标记限流且各释放一次
+        self.assertEqual(client.account_pool.video_limited, emails)
+        self.assertEqual(client.account_pool.released, emails)
+
+    async def test_member_spec_returns_400_without_switching_accounts(self) -> None:
+        for resolution, duration in (("1080P", 5), ("720P", 10), ("1080P", 15)):
+            with self.subTest(resolution=resolution, duration=duration):
+                emails = ["a@example.com", "b@example.com"]
+                client = _PooledClient(
+                    emails, bodies={email: MEMBER_ONLY_BODY for email in emails}
+                )
+
+                with self.assertLogs("qwen2api.videos", level="WARNING") as captured:
+                    with self.assertRaises(videos.HTTPException) as ctx:
+                        await videos._run_generation(
+                            client, "qwen3.8-max", "一只猫", 1, duration, "16:9", {},
+                            resolution=resolution,
+                        )
+
+                self.assertEqual(ctx.exception.status_code, 400)
+                self.assertEqual(
+                    ctx.exception.detail, videos.MEMBER_ONLY_DETAIL
+                )
+                # 只请求一次：规格问题换号无用，不白烧账号池
+                self.assertEqual(client.selected, ["a@example.com"])
+                self.assertEqual(len(client.received_excludes), 1)
+                # 不误标账号限流，且该号仍被正常释放
+                self.assertEqual(client.account_pool.video_limited, [])
+                self.assertEqual(client.account_pool.released, ["a@example.com"])
+                self.assertIn(
+                    "member_only spec rejected", "\n".join(captured.output)
+                )
+
+    async def test_blocked_accounts_are_skipped_while_cooling(self) -> None:
+        client = _PooledClient(
+            ["a@example.com", "b@example.com"],
+            blocked={"a@example.com"},
+        )
+
+        result = await videos._run_generation(
+            client, "qwen3.8-max", "一只猫", 1, 5, "16:9", {},
+            resolution="720P",
+        )
+
+        # 冷却期内的 A 一开始就被排除，直接选 B
+        self.assertEqual(client.selected, ["b@example.com"])
+        self.assertIn("a@example.com", client.received_excludes[0])
+        self.assertEqual(result["data"][0]["url"], SUCCESS_VIDEO_URL)
+        self.assertEqual(client.account_pool.released, ["b@example.com"])
+        self.assertEqual(client.account_pool.video_limited, [])
+
+    async def test_all_accounts_cooling_returns_429(self) -> None:
+        client = _PooledClient(
+            ["a@example.com", "b@example.com"],
+            blocked={"a@example.com", "b@example.com"},
+        )
+
+        with self.assertLogs("qwen2api.videos", level="WARNING"):
+            with self.assertRaises(videos.HTTPException) as ctx:
+                await videos._run_generation(
+                    client, "qwen3.8-max", "一只猫", 1, 5, "16:9", {},
+                    resolution="720P",
+                )
+
+        # 池子里只剩冷却号 → 语义上同样是「额度都用完了」
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertEqual(
+            ctx.exception.detail, videos.VIDEO_QUOTA_EXHAUSTED_DETAIL
+        )
+        self.assertEqual(client.selected, [])
+        self.assertEqual(client.account_pool.released, [])
 
 
 if __name__ == "__main__":

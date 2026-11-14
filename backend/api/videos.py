@@ -67,11 +67,29 @@ VALID_DURATIONS = {5, 10, 15}
 
 # 上游免费号的规格限制：只有 720P + 5s 可用，其它组合会被拒绝并回
 # `extra.quota_limit=true` + content「请求非法：当前视频规格仅会员可用…」。
-# 命中该特征时回 400 + 可读 detail，而不是把上游话术埋进 500 的 body 摘要里。
 MEMBER_ONLY_KEYWORDS = ("会员", "member")
 MEMBER_ONLY_DETAIL = (
     "该视频规格需要 Qwen 会员（1080P / 10s / 15s）。"
     "免费账号只支持 720P + 5s。"
+)
+
+# 关键区分：「仅会员可用」这条上游话术有**两种**成因，处理方式完全相反。
+#   1) 真的请求了会员规格（1080P / 10s / 15s）→ 规格问题，重试任何免费号都
+#      必然失败，必须立即 400，绝不能拿 25 个号去白烧。
+#   2) 请求的是免费规格（720P + 5s）却仍被打回 → 该账号**当天的免费视频额度
+#      已用完**（免费号 1 个/天）→ 纯粹是账号额度问题，换号即可成功。
+# 生产实证（2026-09）：
+#   [T2V] member_only spec rejected resolution=720P duration=5 account=qw6@suzhou.gq
+# 旧实现把两者混为一谈，一律 400 且不换号 —— 一个号额度用完整个请求就废了。
+FREE_SPEC_RESOLUTION = "720P"
+FREE_SPEC_DURATION = 5
+
+# 免费规格被打回时最多换几个号（含首次）。全都不行再回 429。
+VIDEO_QUOTA_RETRY_ATTEMPTS = 3
+
+# 全部账号免费额度都用完时回 429：让调用方能区分「换号也没用」与「规格不对」。
+VIDEO_QUOTA_EXHAUSTED_DETAIL = (
+    "当前所有账号的免费视频额度已用完（免费额度 1 个/天），请稍后再试或升级会员。"
 )
 
 # 任务状态判定（大小写不敏感）
@@ -516,6 +534,68 @@ async def _poll_until_ready(client: QwenClient, acc, chat_id: str,
 # 核心生成流程（自带账号释放与会话清理）
 # ---------------------------------------------------------------------------
 
+def _is_free_video_spec(resolution: str, duration: int) -> bool:
+    """本次请求是否为免费号可用规格（720P + 5s）。
+
+    这是「上游回『仅会员可用』」两种成因的唯一判别依据：
+    免费规格被打回 ⇒ 账号当天额度用完（可换号重试）；
+    会员规格被打回 ⇒ 规格问题（直接 400）。
+
+    Args:
+        resolution: 归一后的分辨率（如 "720P" / "1080P"）。
+        duration: 归一后的时长（秒）。
+
+    Returns:
+        免费规格返回 True，否则 False。
+    """
+    try:
+        seconds = int(duration)
+    except (TypeError, ValueError):
+        return False
+    return str(resolution).strip().upper() == FREE_SPEC_RESOLUTION and seconds == FREE_SPEC_DURATION
+
+
+def _video_blocked_emails(pool: Any) -> set:
+    """取账号池中处于视频冷却期（`video_blocked_until`）的邮箱集合。
+
+    这些账号当天的免费视频额度已用完，冷却期内不该再被选中，直接作为
+    `exclude` 预置给执行器。fake pool（单测替身）可能没有该方法，做安全兜底。
+
+    Args:
+        pool: 账号池对象（可为 None）。
+
+    Returns:
+        处于视频冷却期的账号邮箱集合（永不为 None）。
+    """
+    getter = getattr(pool, "video_blocked_emails", None)
+    if not callable(getter):
+        return set()
+    try:
+        return set(getter() or ())
+    except Exception as exc:  # 兜底：诊断能力不能反过来打断主流程
+        log.warning("[T2V] collect video_blocked_emails failed: %s", exc)
+        return set()
+
+
+def _release_video_session(client: QwenClient, acc: Any, chat_id: str | None) -> None:
+    """释放账号并异步清理上游会话（视频额度用完换号前调用）。
+
+    Args:
+        client: Qwen 客户端（用于拿到 account_pool 并发起会话清理）。
+        acc: 待释放账号；为 None 时直接返回。
+        chat_id: 上游会话 id；为空则跳过清理。
+    """
+    from backend.core.config import settings
+
+    if acc is None:
+        return
+    pool = getattr(client, "account_pool", None)
+    if pool is not None:
+        pool.release(acc)
+    if chat_id and settings.UPSTREAM_AUTO_DELETE_ENABLED:
+        asyncio.create_task(client.delete_chat(acc.token, chat_id, account=acc))
+
+
 async def _run_generation(
     client: QwenClient, model: str, prompt: str, n: int, duration: int,
     ratio: str, media_options: dict, file_store: Any = None,
@@ -528,55 +608,116 @@ async def _run_generation(
     owns_release = False  # 成功路径由本调用方负责唯一一次 release
     try:
         prompt_text = _build_video_prompt(prompt, duration, ratio)
-        # 视频为异步任务：用非流式 completions 一次性取回响应体，
-        # 从 messages[0].extra.wanx.task_id 解析 task_id 后再轮询任务状态。
-        res = await client.complete_once_with_retry(
-            model, prompt_text, has_custom_tools=False,
-            chat_type="t2v", media_options=media_options,
-        )
-        # 执行器在成功路径不会 release，调用方接管
-        owns_release = True
-        acc = res.get("acc")
-        chat_id = res.get("chat_id")
-        body = res.get("body", "")
+        # 免费规格被打回 = 该号当天免费额度用完 → 换号重试；
+        # 会员规格被打回 = 真的规格问题 → 立即 400，一个号都不多试。
+        is_free_spec = _is_free_video_spec(resolution, duration)
+        max_attempts = VIDEO_QUOTA_RETRY_ATTEMPTS if is_free_spec else 1
+        pool = getattr(client, "account_pool", None)
+        # 冷却期内（video_blocked_until）的账号本次直接排除，避免撞同一个死号。
+        excluded: set = _video_blocked_emails(pool)
 
-        if acc is None or chat_id is None:
-            raise HTTPException(status_code=500, detail="Video generation session was not created")
-
-        obj = _parse_json(body)
-        # 0) 自检：把上游回显的 video_spec 打出来（字段名是否生效的唯一验证手段）
-        _log_video_spec(
-            obj,
-            expected_resolution=resolution,
-            expected_duration=duration,
-        )
-        # 1) 响应体里可能已有直接 URL（少见）
-        video_url = _find_video_url(obj) if obj is not None else None
-        # 2) 解析 task_id（嵌套 extra.wanx.task_id）
-        task_id = _find_task_id(obj) if obj is not None else None
-        log.info(f"[T2V] completions done: url={bool(video_url)} task_id={task_id or '-'} body_len={len(body)}")
-
-        # 3) 轮询任务状态直到拿到视频 URL
-        if not video_url:
-            if not task_id:
-                # 免费号请求 1080P / 10s / 15s 时上游只回「仅会员可用」，
-                # 没有 task_id。这种情况是**规格问题而非账号额度耗尽**，
-                # 因此回 400 + 明确 detail，且不把账号标记为视频不可用。
-                member_only = (
-                    _find_member_only_rejection(obj) if obj is not None else None
+        obj = None
+        body = ""
+        video_url = None
+        task_id = None
+        for attempt in range(1, max_attempts + 1):
+            # 视频为异步任务：用非流式 completions 一次性取回响应体，
+            # 从 messages[0].extra.wanx.task_id 解析 task_id 后再轮询任务状态。
+            # exclude 会把本轮已判定「额度用完」的账号带给执行器，实现换号。
+            try:
+                res = await client.complete_once_with_retry(
+                    model, prompt_text, has_custom_tools=False,
+                    chat_type="t2v", media_options=media_options,
+                    exclude=excluded or None,
                 )
-                if member_only is not None:
+            except HTTPException:
+                raise
+            except Exception as exc:
+                # 池子里只剩被视频冷却排除的账号 → 语义上就是「额度都用完了」
+                if excluded and "no available accounts" in str(exc).lower():
                     log.warning(
-                        "[T2V] member_only spec rejected resolution=%s duration=%s account=%s",
-                        resolution,
-                        duration,
-                        getattr(acc, "email", "-"),
+                        "[T2V] no account left after excluding video-quota accounts "
+                        "excluded=%s", sorted(excluded),
                     )
-                    raise HTTPException(status_code=400, detail=MEMBER_ONLY_DETAIL)
+                    raise HTTPException(
+                        status_code=429, detail=VIDEO_QUOTA_EXHAUSTED_DETAIL,
+                    )
+                raise
+            # 执行器在成功路径不会 release，调用方接管
+            owns_release = True
+            acc = res.get("acc")
+            chat_id = res.get("chat_id")
+            body = res.get("body", "")
+
+            if acc is None or chat_id is None:
+                raise HTTPException(status_code=500, detail="Video generation session was not created")
+
+            obj = _parse_json(body)
+            # 0) 自检：把上游回显的 video_spec 打出来（字段名是否生效的唯一验证手段）
+            _log_video_spec(
+                obj,
+                expected_resolution=resolution,
+                expected_duration=duration,
+            )
+            # 1) 响应体里可能已有直接 URL（少见）
+            video_url = _find_video_url(obj) if obj is not None else None
+            # 2) 解析 task_id（嵌套 extra.wanx.task_id）
+            task_id = _find_task_id(obj) if obj is not None else None
+            log.info(f"[T2V] completions done: url={bool(video_url)} task_id={task_id or '-'} body_len={len(body)}")
+
+            if video_url or task_id:
+                break
+
+            # 3) 没有 URL 也没有 task_id：先判断是不是「仅会员可用」拒绝
+            member_only = (
+                _find_member_only_rejection(obj) if obj is not None else None
+            )
+            if member_only is None:
                 log.warning(
                     "[T2V] no task_id in completions body. body_preview=%s",
                     body[:2000],
                 )
+                raise HTTPException(status_code=500, detail="Video generation returned no task_id")
+
+            if not is_free_spec:
+                # 会员规格：确实是规格问题，直接 400，不换号（避免白烧整个账号池）
+                log.warning(
+                    "[T2V] member_only spec rejected resolution=%s duration=%s account=%s",
+                    resolution,
+                    duration,
+                    getattr(acc, "email", "-"),
+                )
+                raise HTTPException(status_code=400, detail=MEMBER_ONLY_DETAIL)
+
+            # 免费规格还被打回 → 该号当天免费视频额度用完，标记冷却并换号重试
+            log.warning(
+                "[T2V] account video quota exhausted account=%s resolution=%s duration=%s "
+                "attempt=%s/%s → retry with another account",
+                getattr(acc, "email", "-"),
+                resolution,
+                duration,
+                attempt,
+                max_attempts,
+            )
+            if pool is not None:
+                # 复用现有视频限流标记（accounts.json 的 video_blocked_until，
+                # 默认冷却 3600s）：冷却期内该号不再被视频请求选中。
+                pool.mark_video_limited(acc, error_message=member_only)
+            excluded.add(getattr(acc, "email", ""))
+            # 先手动释放本轮账号与会话，再把 acc/chat_id 置空避免 finally 二次释放
+            finished_acc, finished_chat = acc, chat_id
+            owns_release = False
+            acc = None
+            chat_id = None
+            _release_video_session(client, finished_acc, finished_chat)
+            if attempt >= max_attempts:
+                raise HTTPException(
+                    status_code=429, detail=VIDEO_QUOTA_EXHAUSTED_DETAIL,
+                )
+
+        # 3) 轮询任务状态直到拿到视频 URL
+        if not video_url:
+            if not task_id:
                 raise HTTPException(status_code=500, detail="Video generation returned no task_id")
             video_url = await _poll_until_ready(client, acc, chat_id, task_id)
 
