@@ -237,6 +237,7 @@ qwen2API 同时提供 OpenAI Videos 风格的视频生成能力（底层走千�
 
 - 接口：`POST /v1/videos/generations`（同义路径 `/videos/generations`）
 - **模型与引擎是两件事**：chat 级 `model`（`qwen3.8-max`，`qwen3.6-plus` / `qwen3.6-plus-video` / `qwen-video` / `sora` 等别名全部映射到它）**只负责触发上游 t2v 通道**；真正出视频的引擎由 `messages[0].extra.meta.model` 决定，取值来自 `VIDEO_GENERATION_META_MODEL`（默认 `happyhorse-1.1`，可选 `happyhorse-1.1` / `happyhorse-1.0` / `wan-2.7`；留空则不发送该键，退回上游默认引擎）
+- **`model` 也可以直接写引擎名**：`{"model": "happyhorse-1.1"}` / `happyhorse-1.0` / `wan-2.7` 会被识别为引擎，chat 级 model 自动用 `qwen3.8-max`，引擎按请求值下发（**覆盖** `VIDEO_GENERATION_META_MODEL`）。也就是说 `model` 填 `qwen-video` / `sora` （映射到 `qwen3.8-max`，引擎用配置默认）或直接填 `happyhorse-1.1` / `happyhorse-1.0` / `wan-2.7` 指定引擎，两种写法都支持
 - 分辨率 / 时长：`resolution` ∈ `720P` / `1080P`（默认 `720P`），`duration` ∈ `5` / `10` / `15` 秒（默认 `5`）。非法值**回落默认值并打 WARNING**，不返回 400（避免打挂现存客户端）
 - 自检日志：解析响应时会打印上游回显的规格 —— `[T2V] video_spec model=... resolution=... duration=... ratio=... watermark=...`；旧任务格式无该字段时打 `[T2V] video_spec missing (old task format)`。**这是验证 resolution/duration 字段名是否生效的唯一手段**（回显与请求不一致时另打 `mismatch` WARNING）
 - 异步任务：聊天流只产出 `task_id`，服务端轮询 `GET /api/v1/tasks/status/{task_id}` 直到完成，最长约 7 分钟

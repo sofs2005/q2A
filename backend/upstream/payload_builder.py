@@ -210,11 +210,15 @@ def build_chat_payload(
         }
         # 视频引擎：chat 级 model 只负责触发 t2v 通道，**真正出视频的引擎由
         # extra.meta.model 决定**（官网 2026-09 抓包：传 happyhorse-1.1 时上游
-        # 回显 video_spec.model=happyhorse-1.1-t2v）。留空则不发送该键，
-        # 视频引擎退回上游默认（不可控）。
-        video_model = str(getattr(settings, "VIDEO_GENERATION_META_MODEL", "") or "").strip()
-        if video_model:
-            message_meta["model"] = video_model
+        # 回显 video_spec.model=happyhorse-1.1-t2v）。调用方可通过
+        # media_options["engine"] 显式指定引擎（请求里 model 直接写引擎名时走这条），
+        # 其优先级高于配置默认值 VIDEO_GENERATION_META_MODEL；两者都为空则不发送
+        # 该键，视频引擎退回上游默认（不可控）。
+        engine = str((media_options or {}).get("engine") or "").strip()
+        if not engine:
+            engine = str(getattr(settings, "VIDEO_GENERATION_META_MODEL", "") or "").strip()
+        if engine:
+            message_meta["model"] = engine
     elif is_image:
         # 生图走原生 t2i 通道（2026-09 官网抓包），替代此前的 t2t + 提示词诱导。
         t2i_size = normalize_t2i_size(media_options)

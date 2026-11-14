@@ -13,8 +13,10 @@ GET /api/v1/tasks/status/{task_id}，直到任务完成才能取到视频 URL。
 - 视频 URL: 状态响应的 content / video_url / url（含 .mp4/.mov/.webm）
 
 引擎与规格：chat 级 model 只负责触发 t2v 通道，真正的视频引擎由
-`messages[0].extra.meta.model`（配置 VIDEO_GENERATION_META_MODEL，默认
-happyhorse-1.1）决定；分辨率/时长取自请求的 resolution/duration，随
+`messages[0].extra.meta.model` 决定（默认取配置 VIDEO_GENERATION_META_MODEL，
+默认 happyhorse-1.1）；若请求的 `model` 直接写了引擎名（见 VIDEO_ENGINE_IDS），
+则 chat 级 model 用 DEFAULT_VIDEO_MODEL 且引擎按请求值下发（别名优先）。
+分辨率/时长取自请求的 resolution/duration，随
 `extra.meta` 下发。响应里的 `extra.wanx.video_spec` 会被打成 `[T2V] video_spec ...`
 自检日志，用于确认上述字段名是否真的被上游接受。
 """
@@ -47,6 +49,12 @@ VIDEO_MODEL_MAP = {
     "qwen-video": "qwen3.8-max",
     "sora": "qwen3.8-max",
 }
+
+# 视频引擎 ID：允许客户端把 `model` 直接写成引擎名（更直观），此时 chat 级
+# model 仍取 DEFAULT_VIDEO_MODEL 触发 t2v 通道，引擎则通过
+# `messages[0].extra.meta.model` 显式下发（覆盖配置默认值）。
+# 取值与 VIDEO_GENERATION_META_MODEL 的合法值保持一致。
+VIDEO_ENGINE_IDS = {"happyhorse-1.1", "happyhorse-1.0", "wan-2.7"}
 
 VALID_RATIOS = {"16:9", "9:16", "1:1", "4:3", "3:4"}
 
@@ -333,10 +341,55 @@ def _log_video_spec(
     return spec
 
 
+def _resolve_video_model_and_engine(requested: str | None) -> tuple[str, str | None]:
+    """解析请求里的 `model`，返回 (chat 级 model, 引擎覆盖值)。
+
+    Args:
+        requested: 请求体的 `model` 字段，可能是 chat 级模型别名、引擎名或空。
+
+    Returns:
+        二元组 ``(chat_model, engine_override)``：
+
+        - `model` 命中 `VIDEO_ENGINE_IDS`（引擎名）→ chat 级 model 用默认值
+          `DEFAULT_VIDEO_MODEL`，引擎覆盖值 = 请求的引擎名（别名优先于配置默认）。
+        - 其它情况（含未知模型 / 空值）→ chat 级 model 走 `VIDEO_MODEL_MAP`
+          解析（未知回落默认），引擎覆盖值 `None`（跟随配置默认）。
+    """
+    name = str(requested or "").strip()
+    if name in VIDEO_ENGINE_IDS:
+        return DEFAULT_VIDEO_MODEL, name
+    return VIDEO_MODEL_MAP.get(name, DEFAULT_VIDEO_MODEL), None
+
+
 def _resolve_video_model(requested: str | None) -> str:
-    if not requested:
-        return DEFAULT_VIDEO_MODEL
-    return VIDEO_MODEL_MAP.get(requested, DEFAULT_VIDEO_MODEL)
+    """只取 chat 级 model（保留旧签名，兼容既有调用方与单测）。"""
+    return _resolve_video_model_and_engine(requested)[0]
+
+
+def _build_video_media_options(
+    ratio: str, duration: int, resolution: str, engine: str | None = None,
+) -> dict:
+    """组装下发给 payload_builder 的媒体参数。
+
+    Args:
+        ratio: 宽高比（16:9 等）。
+        duration: 时长（秒）。
+        resolution: 分辨率（720P / 1080P）。
+        engine: 引擎覆盖值；为空时**不放入** `engine` 键（跟随配置默认）。
+
+    Returns:
+        媒体参数字典（`engine` 键仅在显式指定引擎时出现）。
+    """
+    options: dict[str, Any] = {
+        "ratio": ratio,
+        "size": ratio,
+        "duration": duration,
+        "resolution": resolution,
+    }
+    engine_name = str(engine or "").strip()
+    if engine_name:
+        options["engine"] = engine_name
+    return options
 
 
 def _get_token(request: Request) -> str:
@@ -623,17 +676,12 @@ async def create_video(request: Request):
     duration: int = _normalize_duration(body.get("duration", DEFAULT_DURATION))
     resolution: str = _normalize_resolution(body.get("resolution"))
     ratio = _normalize_ratio(body.get("ratio") or body.get("aspect_ratio") or body.get("size"))
-    model = _resolve_video_model(body.get("model"))
-    media_options = {
-        "ratio": ratio,
-        "size": ratio,
-        "duration": duration,
-        "resolution": resolution,
-    }
+    model, engine_override = _resolve_video_model_and_engine(body.get("model"))
+    media_options = _build_video_media_options(ratio, duration, resolution, engine_override)
 
     log.info(
-        f"[T2V] model={model}, n={n}, ratio={ratio}, resolution={resolution}, "
-        f"duration={duration}, prompt={prompt[:80]!r}"
+        "[T2V] model=%s, n=%s, engine=%s, ratio=%s, resolution=%s, duration=%s, prompt=%r",
+        model, n, engine_override or "-", ratio, resolution, duration, prompt[:80],
     )
 
     heartbeat_interval = settings.STREAM_HEARTBEAT_INTERVAL_SECONDS
