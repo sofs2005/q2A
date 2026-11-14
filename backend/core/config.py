@@ -150,6 +150,12 @@ class Settings(BaseSettings):
     # 默认 qwen-image-3.0-pro（官网抓包值）：留空会让上游按 chat 级 model 自行
     # 路由，出图模型不可控，故给一个明确的默认值。
     IMAGE_GENERATION_META_MODEL: str = os.getenv("IMAGE_GENERATION_META_MODEL", "qwen-image-3.0-pro").strip()
+    # t2v 请求 messages[].extra.meta.model 的取值，即**真正出视频的引擎**
+    # （官网视频引擎由该字段决定，chat 级 model 只负责触发 t2v 通道）。
+    # 官网前端 bundle 可选值：happyhorse-1.1（默认）/ happyhorse-1.0 / wan-2.7；
+    # 上游回显会把它展开成 happyhorse-1.1-t2v 这类引擎 id。
+    # 留空 = 不发送该键，跟随上游默认引擎（不可控，故给了明确默认值）。
+    VIDEO_GENERATION_META_MODEL: str = os.getenv("VIDEO_GENERATION_META_MODEL", "happyhorse-1.1").strip()
     CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS: int = int(os.getenv("CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS", 60))
     # 多模态附件：图片 / 音频 / 视频默认走 data URI 内联（实测上游 files[i].url 直接吃
     # data URI，且 /api/v2/files/getstsToken 已被阿里云 WAF 拼图验证码拦住）。

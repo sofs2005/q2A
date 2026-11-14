@@ -11,6 +11,12 @@ GET /api/v1/tasks/status/{task_id}，直到任务完成才能取到视频 URL。
 - 轮询端点: GET https://chat.qwen.ai/api/v1/tasks/status/{task_id}
 - 状态字段: task_status | status；成功 completed/success/succeeded
 - 视频 URL: 状态响应的 content / video_url / url（含 .mp4/.mov/.webm）
+
+引擎与规格：chat 级 model 只负责触发 t2v 通道，真正的视频引擎由
+`messages[0].extra.meta.model`（配置 VIDEO_GENERATION_META_MODEL，默认
+happyhorse-1.1）决定；分辨率/时长取自请求的 resolution/duration，随
+`extra.meta` 下发。响应里的 `extra.wanx.video_spec` 会被打成 `[T2V] video_spec ...`
+自检日志，用于确认上述字段名是否真的被上游接受。
 """
 import re
 import time
@@ -29,16 +35,27 @@ from backend.services.qwen_client import QwenClient
 log = logging.getLogger("qwen2api.videos")
 router = APIRouter()
 
-DEFAULT_VIDEO_MODEL = "qwen3.6-plus"
+DEFAULT_VIDEO_MODEL = "qwen3.8-max"
 
+# 注意：这里的 chat 级 model **只负责触发上游 t2v 通道**，真正出视频的引擎由
+# `messages[0].extra.meta.model`（配置项 VIDEO_GENERATION_META_MODEL）决定。
+# 历史遗留的死模型（qwen3.6-plus 上游已删除，返回 Not_Found）统一改指 qwen3.8-max。
 VIDEO_MODEL_MAP = {
-    "qwen3.6-plus": "qwen3.6-plus",
-    "qwen3.6-plus-video": "qwen3.6-plus",
-    "qwen-video": "qwen3.6-plus",
-    "sora": "qwen3.6-plus",
+    "qwen3.8-max": "qwen3.8-max",
+    "qwen3.6-plus": "qwen3.8-max",
+    "qwen3.6-plus-video": "qwen3.8-max",
+    "qwen-video": "qwen3.8-max",
+    "sora": "qwen3.8-max",
 }
 
 VALID_RATIOS = {"16:9", "9:16", "1:1", "4:3", "3:4"}
+
+# 官网前端可选值（2026-09 bundle）：resolutions 默认 720P、durations 默认 5 秒。
+# 非法值一律回落默认并发 WARNING，**不报 400**，避免把现有客户端打挂。
+DEFAULT_RESOLUTION = "720P"
+VALID_RESOLUTIONS = {"720P", "1080P"}
+DEFAULT_DURATION = 5
+VALID_DURATIONS = {5, 10, 15}
 
 # 任务状态判定（大小写不敏感）
 TASK_STATUS_SUCCESS = {"completed", "success", "succeeded", "finished"}
@@ -127,6 +144,124 @@ def _normalize_ratio(value: str | None) -> str:
     return candidate if candidate in VALID_RATIOS else "16:9"
 
 
+def _normalize_resolution(value: Any) -> str:
+    """校验并归一 t2v 分辨率；非法/缺失回落 720P 并打 WARNING（不抛 400）。"""
+    raw = value
+    candidate = str(raw or "").strip().upper()
+    if not candidate:
+        return DEFAULT_RESOLUTION
+    if candidate in VALID_RESOLUTIONS:
+        return candidate
+    log.warning(
+        "[T2V] invalid resolution=%r, fallback to %s (valid: %s)",
+        raw, DEFAULT_RESOLUTION, sorted(VALID_RESOLUTIONS),
+    )
+    return DEFAULT_RESOLUTION
+
+
+def _normalize_duration(value: Any) -> int:
+    """校验并归一 t2v 时长；非法/缺失回落 5 秒并打 WARNING（不抛 400）。"""
+    raw = value
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_DURATION
+    try:
+        candidate = int(str(raw).strip())
+    except (TypeError, ValueError):
+        log.warning(
+            "[T2V] invalid duration=%r, fallback to %ss (valid: %s)",
+            raw, DEFAULT_DURATION, sorted(VALID_DURATIONS),
+        )
+        return DEFAULT_DURATION
+    if candidate in VALID_DURATIONS:
+        return candidate
+    log.warning(
+        "[T2V] invalid duration=%r, fallback to %ss (valid: %s)",
+        raw, DEFAULT_DURATION, sorted(VALID_DURATIONS),
+    )
+    return DEFAULT_DURATION
+
+
+def _extract_video_spec(obj: Any) -> dict | None:
+    """从响应体里取 `extra.wanx.video_spec`（官网 2026-09 回显的上游视频规格）。"""
+    found: list[dict] = []
+
+    def walk(o: Any) -> None:
+        if isinstance(o, dict):
+            wanx = o.get("wanx")
+            if isinstance(wanx, dict):
+                spec = wanx.get("video_spec")
+                if isinstance(spec, dict):
+                    found.append(spec)
+            spec = o.get("video_spec")
+            if isinstance(spec, dict):
+                found.append(spec)
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(obj)
+    return found[0] if found else None
+
+
+def _log_video_spec(
+    obj: Any,
+    *,
+    expected_resolution: str = "",
+    expected_duration: int | None = None,
+) -> dict | None:
+    """打印上游回显的 video_spec，用于验证 resolution/duration 字段名是否生效。
+
+    这是当前**唯一的验证手段**：等有额度时生成一次视频，看回显的
+    resolution/duration 是否等于我们传的值，即可确认字段名正确。
+    旧任务格式没有该字段，只打一条 missing 日志，绝不报错。
+
+    Args:
+        obj: 已解析的 completions 响应体（可为 None / 任意结构）。
+        expected_resolution: 本次请求的分辨率，用于比对并给出告警。
+        expected_duration: 本次请求的时长（秒），用于比对并给出告警。
+
+    Returns:
+        命中的 video_spec，缺失时返回 None。
+    """
+    spec = _extract_video_spec(obj)
+    if spec is None:
+        log.info("[T2V] video_spec missing (old task format)")
+        return None
+
+    log.info(
+        "[T2V] video_spec model=%s resolution=%s duration=%s ratio=%s watermark=%s",
+        spec.get("model", "-"),
+        spec.get("resolution", "-"),
+        spec.get("duration", "-"),
+        spec.get("ratio") or spec.get("size") or "-",
+        spec.get("watermark", "-"),
+    )
+
+    # 字段名是推断值：回显若与请求不一致，说明键名不对，打 WARNING 便于定位。
+    actual_resolution = str(spec.get("resolution") or "").strip().upper()
+    if expected_resolution and actual_resolution and actual_resolution != expected_resolution:
+        log.warning(
+            "[T2V] video_spec resolution mismatch: requested=%s actual=%s",
+            expected_resolution, actual_resolution,
+        )
+    actual_duration = str(spec.get("duration") or "").strip()
+    if expected_duration is not None and actual_duration:
+        try:
+            if int(actual_duration) != int(expected_duration):
+                log.warning(
+                    "[T2V] video_spec duration mismatch: requested=%s actual=%s",
+                    expected_duration, actual_duration,
+                )
+        except (TypeError, ValueError):
+            log.warning(
+                "[T2V] video_spec duration unparsable: requested=%s actual=%r",
+                expected_duration, actual_duration,
+            )
+    return spec
+
+
 def _resolve_video_model(requested: str | None) -> str:
     if not requested:
         return DEFAULT_VIDEO_MODEL
@@ -174,6 +309,7 @@ async def _rehost_video(
     ratio: str,
     duration: int,
     model: str = "",
+    resolution: str = "",
 ) -> str:
     """回源下载上游视频并落盘，返回同源 `/v1/videos/content/{id}`。
 
@@ -204,7 +340,13 @@ async def _rehost_video(
             content_type,
             raw,
             GENERATED_VIDEO_PURPOSE,
-            extra={"prompt": prompt, "ratio": ratio, "duration": duration, "model": model},
+            extra={
+                "prompt": prompt,
+                "ratio": ratio,
+                "duration": duration,
+                "model": model,
+                "resolution": resolution,
+            },
         )
         log.info("[T2V] rehosted url -> file_id=%s size=%s", meta.get("id"), meta.get("size"))
         return f"/v1/videos/content/{meta['id']}"
@@ -253,6 +395,7 @@ async def _poll_until_ready(client: QwenClient, acc, chat_id: str,
 async def _run_generation(
     client: QwenClient, model: str, prompt: str, n: int, duration: int,
     ratio: str, media_options: dict, file_store: Any = None,
+    resolution: str = DEFAULT_RESOLUTION,
 ) -> dict:
     from backend.core.config import settings
 
@@ -277,6 +420,12 @@ async def _run_generation(
             raise HTTPException(status_code=500, detail="Video generation session was not created")
 
         obj = _parse_json(body)
+        # 0) 自检：把上游回显的 video_spec 打出来（字段名是否生效的唯一验证手段）
+        _log_video_spec(
+            obj,
+            expected_resolution=resolution,
+            expected_duration=duration,
+        )
         # 1) 响应体里可能已有直接 URL（少见）
         video_url = _find_video_url(obj) if obj is not None else None
         # 2) 解析 task_id（嵌套 extra.wanx.task_id）
@@ -301,6 +450,7 @@ async def _run_generation(
         video_url = await _rehost_video(
             file_store, client, acc, video_url,
             prompt=prompt, ratio=ratio, duration=duration, model=model,
+            resolution=resolution,
         )
         # Qwen 单任务生成单个视频；n>1 时返回同一 URL 以兼容契约
         data = [
@@ -310,6 +460,7 @@ async def _run_generation(
                 "ratio": ratio,
                 "size": ratio,
                 "duration": duration,
+                "resolution": resolution,
             }
             for _ in range(n)
         ]
@@ -382,12 +533,23 @@ async def create_video(request: Request):
         raise HTTPException(400, "prompt is required")
 
     n: int = min(max(int(body.get("n", 1)), 1), 2)
-    duration: int = min(max(int(body.get("duration", 5)), 1), 10)
+    # 非法 duration / resolution 一律回落默认值（5 秒 / 720P）并发 WARNING，
+    # 不返回 400——现有客户端可能仍在传任意秒数，不能被我们打挂。
+    duration: int = _normalize_duration(body.get("duration", DEFAULT_DURATION))
+    resolution: str = _normalize_resolution(body.get("resolution"))
     ratio = _normalize_ratio(body.get("ratio") or body.get("aspect_ratio") or body.get("size"))
     model = _resolve_video_model(body.get("model"))
-    media_options = {"ratio": ratio, "size": ratio, "duration": duration}
+    media_options = {
+        "ratio": ratio,
+        "size": ratio,
+        "duration": duration,
+        "resolution": resolution,
+    }
 
-    log.info(f"[T2V] model={model}, n={n}, ratio={ratio}, duration={duration}, prompt={prompt[:80]!r}")
+    log.info(
+        f"[T2V] model={model}, n={n}, ratio={ratio}, resolution={resolution}, "
+        f"duration={duration}, prompt={prompt[:80]!r}"
+    )
 
     heartbeat_interval = settings.STREAM_HEARTBEAT_INTERVAL_SECONDS
 
@@ -396,6 +558,7 @@ async def create_video(request: Request):
             _run_generation(
                 client, model, prompt, n, duration, ratio, media_options,
                 file_store=getattr(request.app.state, "file_store", None),
+                resolution=resolution,
             )
         )
         try:

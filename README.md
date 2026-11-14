@@ -236,6 +236,9 @@ curl http://127.0.0.1:7860/v1/images/generations \
 qwen2API 同时提供 OpenAI Videos 风格的视频生成能力（底层走千问网页的 `t2v` 通道）。
 
 - 接口：`POST /v1/videos/generations`（同义路径 `/videos/generations`）
+- **模型与引擎是两件事**：chat 级 `model`（`qwen3.8-max`，`qwen3.6-plus` / `qwen3.6-plus-video` / `qwen-video` / `sora` 等别名全部映射到它）**只负责触发上游 t2v 通道**；真正出视频的引擎由 `messages[0].extra.meta.model` 决定，取值来自 `VIDEO_GENERATION_META_MODEL`（默认 `happyhorse-1.1`，可选 `happyhorse-1.1` / `happyhorse-1.0` / `wan-2.7`；留空则不发送该键，退回上游默认引擎）
+- 分辨率 / 时长：`resolution` ∈ `720P` / `1080P`（默认 `720P`），`duration` ∈ `5` / `10` / `15` 秒（默认 `5`）。非法值**回落默认值并打 WARNING**，不返回 400（避免打挂现存客户端）
+- 自检日志：解析响应时会打印上游回显的规格 —— `[T2V] video_spec model=... resolution=... duration=... ratio=... watermark=...`；旧任务格式无该字段时打 `[T2V] video_spec missing (old task format)`。**这是验证 resolution/duration 字段名是否生效的唯一手段**（回显与请求不一致时另打 `mismatch` WARNING）
 - 异步任务：聊天流只产出 `task_id`，服务端轮询 `GET /api/v1/tasks/status/{task_id}` 直到完成，最长约 7 分钟
 - **视频回源落盘**：上游 CDN 直链带签名会过期，因此拿到 URL 后会回源下载并转存到本地，对外返回同源 `/v1/videos/content/{id}`（`n>1` 时多条结果复用同一个落盘文件）
   - 回源失败（下载异常 / 空响应 / 超出 `GENERATED_VIDEO_MAX_BYTES`）时**不会让生成失败**，自动退回原始 CDN 直链
@@ -822,6 +825,7 @@ python start.py
 | `GENERATED_IMAGE_TTL_SECONDS` | `3600` | 生图本地缓存 TTL（秒）。已弃用：生成物清理改由 `GENERATED_MEDIA_TTL_SECONDS` 统一控制。 |
 | `GENERATED_MEDIA_TTL_SECONDS` | `0` | 生成物（图片/视频）保留秒数。`0` = 永久保留（媒体库语义），由后台清理任务按用途逐个清理。 |
 | `GENERATED_VIDEO_MAX_BYTES` | `268435456` | 视频回源下载体积上限（字节，默认 256MB）。超限不落盘、退回 CDN 直链，避免打爆内存。 |
+| `VIDEO_GENERATION_META_MODEL` | `happyhorse-1.1` | 生视频请求 `extra.meta.model`，即**真正出视频的引擎**（chat 级 `model` 只负责触发 t2v 通道）。官网可选 `happyhorse-1.1` / `happyhorse-1.0` / `wan-2.7`，上游回显成 `happyhorse-1.1-t2v` 这类引擎 id。留空则不发送该键，跟随上游默认引擎。 |
 
 > 多模态附件相关变量（`INLINE_ATTACHMENT_ENABLED` / `INLINE_ATTACHMENT_MAX_BYTES` /
 > `INLINE_ATTACHMENT_MAX_URL_CHARS` / `INLINE_ATTACHMENT_REMOTE_FETCH` / `MULTIMODAL_STRICT` /

@@ -1,7 +1,10 @@
+import logging
 import time
 import uuid
 
 from backend.core.config import settings
+
+log = logging.getLogger("qwen2api.payload_builder")
 
 
 CUSTOM_TOOL_COMPAT_FEATURE_CONFIG = {
@@ -24,6 +27,15 @@ CUSTOM_TOOL_LOW_LATENCY_OVERRIDES = {
 # 媒体生成（视频）默认宽高比，参考上游 t2v feature_config
 _DEFAULT_MEDIA_RATIO = "16:9"
 _VALID_MEDIA_RATIOS = {"16:9", "9:16", "1:1", "4:3", "3:4"}
+
+# 视频（t2v）分辨率 / 时长，取自官网前端 bundle：
+# resolutions = ["720P", "1080P"]（默认 720P）、durations = [5, 10, 15]（默认 5）。
+# 这两个键名是**推断**的（随 extra.meta 一起下发），是否被上游接受要靠
+# videos.py 里 `[T2V] video_spec ...` 的回显日志验证。
+_DEFAULT_T2V_RESOLUTION = "720P"
+_VALID_T2V_RESOLUTIONS = {"720P", "1080P"}
+_DEFAULT_T2V_DURATION = 5
+_VALID_T2V_DURATIONS = {5, 10, 15}
 
 # 生图（t2i）feature_config，对齐 2026-09 官网 t2i 抓包
 T2I_FEATURE_CONFIG = {
@@ -95,6 +107,63 @@ def normalize_t2i_size(media_options: dict | None) -> str:
     return _DEFAULT_T2I_SIZE
 
 
+def normalize_t2v_resolution(media_options: dict | None) -> str:
+    """把调用方给的 t2v 分辨率归一到上游取值，非法/缺失回落 "720P"。
+
+    Args:
+        media_options: 调用方媒体参数，可能含 ``resolution``（大小写不敏感）。
+
+    Returns:
+        "720P" 或 "1080P"。
+
+    Note:
+        非法值只打 WARNING 并回落默认值，**绝不抛错**——避免把现存客户端打挂。
+    """
+    raw = (media_options or {}).get("resolution")
+    candidate = str(raw or "").strip().upper()
+    if not candidate:
+        return _DEFAULT_T2V_RESOLUTION
+    if candidate in _VALID_T2V_RESOLUTIONS:
+        return candidate
+    log.warning(
+        "[T2V] invalid resolution=%r, fallback to %s (valid: %s)",
+        raw, _DEFAULT_T2V_RESOLUTION, sorted(_VALID_T2V_RESOLUTIONS),
+    )
+    return _DEFAULT_T2V_RESOLUTION
+
+
+def normalize_t2v_duration(media_options: dict | None) -> int:
+    """把调用方给的 t2v 时长归一到上游取值（5 / 10 / 15），非法/缺失回落 5。
+
+    Args:
+        media_options: 调用方媒体参数，可能含 ``duration``（数字或数字字符串）。
+
+    Returns:
+        5、10 或 15。
+
+    Note:
+        非法值只打 WARNING 并回落默认值，**绝不抛错**。
+    """
+    raw = (media_options or {}).get("duration")
+    if raw is None or str(raw).strip() == "":
+        return _DEFAULT_T2V_DURATION
+    try:
+        candidate = int(str(raw).strip())
+    except (TypeError, ValueError):
+        log.warning(
+            "[T2V] invalid duration=%r, fallback to %ss (valid: %s)",
+            raw, _DEFAULT_T2V_DURATION, sorted(_VALID_T2V_DURATIONS),
+        )
+        return _DEFAULT_T2V_DURATION
+    if candidate in _VALID_T2V_DURATIONS:
+        return candidate
+    log.warning(
+        "[T2V] invalid duration=%r, fallback to %ss (valid: %s)",
+        raw, _DEFAULT_T2V_DURATION, sorted(_VALID_T2V_DURATIONS),
+    )
+    return _DEFAULT_T2V_DURATION
+
+
 def build_chat_payload(
     chat_id: str,
     model: str,
@@ -115,6 +184,8 @@ def build_chat_payload(
 
     if is_video:
         ratio = _normalize_media_ratio(media_options)
+        resolution = normalize_t2v_resolution(media_options)
+        duration = normalize_t2v_duration(media_options)
         feature_config = {
             "thinking_enabled": False,
             "output_schema": "phase",
@@ -133,7 +204,17 @@ def build_chat_payload(
             "mode": "video_generation",
             "aspectRatio": ratio,
             "size": ratio,
+            # 分辨率 / 时长（官网前端可选值 720P|1080P、5|10|15 秒）
+            "resolution": resolution,
+            "duration": duration,
         }
+        # 视频引擎：chat 级 model 只负责触发 t2v 通道，**真正出视频的引擎由
+        # extra.meta.model 决定**（官网 2026-09 抓包：传 happyhorse-1.1 时上游
+        # 回显 video_spec.model=happyhorse-1.1-t2v）。留空则不发送该键，
+        # 视频引擎退回上游默认（不可控）。
+        video_model = str(getattr(settings, "VIDEO_GENERATION_META_MODEL", "") or "").strip()
+        if video_model:
+            message_meta["model"] = video_model
     elif is_image:
         # 生图走原生 t2i 通道（2026-09 官网抓包），替代此前的 t2t + 提示词诱导。
         t2i_size = normalize_t2i_size(media_options)

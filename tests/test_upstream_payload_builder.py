@@ -122,6 +122,78 @@ class UpstreamPayloadBuilderTests(unittest.TestCase):
                 payload["messages"][0]["extra"]["meta"]["model"], "qwen-image-3.0-pro"
             )
 
+    def test_t2v_meta_carries_engine_model_resolution_duration(self) -> None:
+        """t2v 的 extra.meta 必须带引擎 model + resolution + duration。"""
+        from backend.core.config import settings
+
+        with patch.object(settings, "VIDEO_GENERATION_META_MODEL", "happyhorse-1.1"):
+            payload = build_chat_payload(
+                "chat-1",
+                "qwen3.8-max",
+                "一只猫在跑",
+                chat_type="t2v",
+                media_options={"ratio": "9:16", "duration": 10, "resolution": "1080P"},
+            )
+
+        message = payload["messages"][0]
+        meta = message["extra"]["meta"]
+
+        self.assertEqual(meta["model"], "happyhorse-1.1")
+        self.assertEqual(meta["resolution"], "1080P")
+        self.assertEqual(meta["duration"], 10)
+        self.assertEqual(meta["aspectRatio"], "9:16")
+        self.assertEqual(meta["size"], "9:16")
+        self.assertEqual(meta["subChatType"], "t2v")
+        self.assertEqual(message["chat_type"], "t2v")
+        self.assertEqual(message["sub_chat_type"], "t2v")
+        # 视频仍是异步任务：非流式
+        self.assertFalse(payload["stream"])
+        self.assertFalse(payload["incremental_output"])
+        self.assertEqual(payload["size"], "9:16")
+
+    def test_t2v_meta_model_omitted_when_setting_empty(self) -> None:
+        """留空 = 不发 model 键（跟随上游默认引擎），但 resolution/duration 照发。"""
+        from backend.core.config import settings
+
+        with patch.object(settings, "VIDEO_GENERATION_META_MODEL", ""):
+            payload = build_chat_payload(
+                "chat-1", "qwen3.8-max", "一只猫", chat_type="t2v",
+            )
+        meta = payload["messages"][0]["extra"]["meta"]
+
+        self.assertNotIn("model", meta)
+        self.assertEqual(meta["resolution"], "720P")
+        self.assertEqual(meta["duration"], 5)
+
+    def test_t2v_invalid_resolution_and_duration_fall_back(self) -> None:
+        """非法 resolution / duration 回落默认值且绝不抛异常。"""
+        payload = build_chat_payload(
+            "chat-1",
+            "qwen3.8-max",
+            "一只猫",
+            chat_type="t2v",
+            media_options={"resolution": "4K", "duration": 7},
+        )
+        meta = payload["messages"][0]["extra"]["meta"]
+
+        self.assertEqual(meta["resolution"], "720P")
+        self.assertEqual(meta["duration"], 5)
+
+    def test_t2v_duration_accepts_numeric_string(self) -> None:
+        """HTTP body 里 duration 可能是字符串，仍应解析为 int。"""
+        payload = build_chat_payload(
+            "chat-1",
+            "qwen3.8-max",
+            "一只猫",
+            chat_type="t2v",
+            media_options={"duration": "15", "resolution": "1080p"},
+        )
+        meta = payload["messages"][0]["extra"]["meta"]
+
+        self.assertEqual(meta["duration"], 15)
+        # resolution 大小写不敏感
+        self.assertEqual(meta["resolution"], "1080P")
+
 
 if __name__ == "__main__":
     unittest.main()
