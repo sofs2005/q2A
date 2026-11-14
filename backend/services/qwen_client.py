@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import time
@@ -12,7 +13,9 @@ from backend.core.account_pool import Account
 from backend.core.browser_fingerprint import fingerprint_for_account, get_session, new_session
 from backend.core.config import DEFAULT_QWEN_BX_VERSION, DEFAULT_QWEN_WEB_VERSION, settings
 from backend.services.auth_resolver import BASE_URL, AuthResolver
+from backend.services.chat_exit_binding import ChatExitBinding, ChatExitBindings, resolve_chat_exit_mode
 from backend.services.chat_id_pool import ChatIDPool
+from backend.services.exit_pool import ExitPool
 from backend.services.waf_cookie_manager import WafCookieManager, collect_waf_cookies
 from backend.services.captcha_solver import CaptchaSolver, extract_punish_url
 from backend.upstream.payload_builder import build_chat_payload
@@ -22,14 +25,148 @@ log = logging.getLogger("qwen2api.client")
 
 
 class QwenClient:
-    def __init__(self, account_pool):
+    def __init__(
+        self,
+        account_pool,
+        *,
+        chat_exit_pool: "ExitPool | None" = None,
+        chat_bindings: ChatExitBindings | None = None,
+        exit_session_factory=None,
+    ):
+        """构造客户端。
+
+        Args:
+            account_pool: 账号池（可为 None / 单测替身）。
+            chat_exit_pool: 建会话用出口池；为空时按 `CHAT_VIA_EXIT_POOL` +
+                `UPLOAD_EXIT_POOL` 惰性构造（未配置则整条链路不碰代理）。
+            chat_bindings: chat_id → 出口绑定表；为空时按配置新建。
+            exit_session_factory: 可选会话工厂，签名 `(proxy_url) -> session`
+                （可为协程）；单测注入假代理层用，生产走 curl_cffi。
+        """
         self.account_pool = account_pool
         self.auth_resolver = AuthResolver(account_pool) if account_pool is not None else None
         self.chat_id_pool = ChatIDPool(self, account_pool) if account_pool is not None else None
+        self.chat_bindings = chat_bindings if chat_bindings is not None else ChatExitBindings.from_settings(settings)
+        self._chat_exit_pool = chat_exit_pool
+        self._chat_exit_pool_resolved = chat_exit_pool is not None
+        self._exit_session_factory = exit_session_factory
         self.executor = None
         from backend.upstream.qwen_executor import QwenExecutor
 
         self.executor = QwenExecutor(self, account_pool)
+
+    # ------------------------------------------------------------------
+    # 建会话出口池（chats/new + 同 chat 后续请求的出口亲和性）
+    # ------------------------------------------------------------------
+    @property
+    def chat_exit_pool(self) -> "ExitPool | None":
+        """建会话用出口池；未配置 / 显式关闭时为 None（调用方据此直连）。
+
+        惰性构造：第一次访问时才解析 `CHAT_VIA_EXIT_POOL` + `UPLOAD_EXIT_POOL`，
+        避免在 import 期读环境变量；解析结果（含 None）缓存，后续不再重复解析。
+        """
+        if not getattr(self, "_chat_exit_pool_resolved", False):
+            self._chat_exit_pool = ExitPool.from_chat_settings(settings)
+            self._chat_exit_pool_resolved = True
+            if self._chat_exit_pool is not None:
+                log.info(
+                    "[ChatExit] chat exit pool enabled exits=%s cooldown=%ss ttl=%ss max_entries=%s",
+                    len(self._chat_exit_pool.exit_ids),
+                    int(self._chat_exit_pool.cooldown_seconds),
+                    int(self.chat_bindings.ttl_seconds),
+                    self.chat_bindings.max_entries,
+                )
+            else:
+                log.info(
+                    "[ChatExit] chat exit pool disabled mode=%s (chats/new 走直连)",
+                    resolve_chat_exit_mode(settings),
+                )
+        return self._chat_exit_pool
+
+    @chat_exit_pool.setter
+    def chat_exit_pool(self, pool: "ExitPool | None") -> None:
+        """注入 / 清除出口池（单测与运维手动切换用）。"""
+        self._chat_exit_pool = pool
+        self._chat_exit_pool_resolved = True
+
+    def chat_exit_binding(self, chat_id: str) -> ChatExitBinding | None:
+        """chat_id → 有效出口绑定；未绑定 / 已过期 / 池关闭时返回 None。"""
+        if self.chat_exit_pool is None:
+            return None
+        return self.chat_bindings.resolve(chat_id)
+
+    def bind_chat_exit(self, chat_id: str, exit_id: str, proxy_url: str) -> ChatExitBinding | None:
+        """登记 chat_id → 出口绑定（建会话成功后由 executor 调用）。"""
+        if self.chat_exit_pool is None:
+            return None
+        return self.chat_bindings.bind(chat_id, exit_id, proxy_url)
+
+    def forget_chat_exit(self, chat_id: str) -> bool:
+        """丢弃一条绑定（出口判死 / 会话重建时调用）。"""
+        return self.chat_bindings.drop(chat_id)
+
+    def note_chat_exit_failure(self, chat_id: str, reason: str, *, drop_binding: bool = True) -> None:
+        """把一次可归因于出口的失败记到出口池，并按需丢弃绑定。
+
+        `mark_failure` 达到阈值后该出口进入冷却，`ExitPool.pick` 会自动跳过它，
+        于是下一次 :meth:`QwenExecutor.create_chat` 自然换到别的出口重建会话。
+        **永不抛异常**：记账失败不能影响主请求的错误传递。
+
+        Args:
+            chat_id: 出事的上游会话 id（可为空，空则只做日志）。
+            reason: `waf` / `connect_failed` / `http_502` ...，仅用于观测。
+            drop_binding: 是否同时丢弃绑定。True（默认）表示这条会话基本废了；
+                False 用于「同一会话内还有自愈机会」的场景（如 punish 滑块重试）。
+        """
+        try:
+            binding = self.chat_bindings.resolve(chat_id) if chat_id else None
+            pool = self.chat_exit_pool
+            if binding is None:
+                return
+            if pool is not None:
+                pool.mark_failure(binding.exit_id, reason)
+            if drop_binding:
+                self.chat_bindings.drop(binding.chat_id)
+            log.warning(
+                "[ChatExit] exit=%s blocked reason=%s chat_id=%s → next",
+                binding.exit_id,
+                reason,
+                binding.chat_id,
+            )
+        except Exception:  # pragma: no cover - 记账不允许打断主链路
+            log.debug("[ChatExit] note_chat_exit_failure failed", exc_info=True)
+
+    def chat_exit_proxy(self, chat_id: str) -> tuple[str, str] | None:
+        """chat_id → `(proxy_url, exit_id)`；无绑定 / 池关闭时返回 None。
+
+        命中会打 `[ChatExit] binding hit` 日志（只含出口后缀，不含凭据）。
+        """
+        binding = self.chat_exit_binding(chat_id)
+        if binding is None:
+            return None
+        log.info("[ChatExit] binding hit chat_id=%s exit=%s", binding.chat_id, binding.exit_id)
+        return binding.proxy_url, binding.exit_id
+
+    async def _open_exit_session(self, account: Account | None, timeout: float, proxy_url: str):
+        """经指定出口开会话（curl_cffi + 账号指纹；单测可注入假工厂）。"""
+        factory = self._exit_session_factory
+        if factory is not None:
+            session = factory(proxy_url)
+            if inspect.isawaitable(session):
+                session = await session
+            return session
+        return new_session(fingerprint_for_account(account), timeout=timeout, proxy_url=proxy_url)
+
+    @staticmethod
+    async def _close_session(session) -> None:
+        """尽力关闭会话：关闭失败不影响请求结论。"""
+        close = getattr(session, "close", None)
+        if close is None:
+            return
+        try:
+            await close()
+        except Exception:  # pragma: no cover - 关闭异常仅记 debug
+            log.debug("[ChatExit] exit session close failed", exc_info=True)
 
     @staticmethod
     def _web_client_headers() -> dict[str, str]:
@@ -275,9 +412,57 @@ class QwenClient:
         chat_transport: bool = False,
         referer: str | None = None,
         retry_waf: bool = False,
+        chat_id: str | None = None,
+        proxy_url: str | None = None,
     ) -> dict:
+        """发一次 JSON 请求（默认直连）。
+
+        Args:
+            method: HTTP 方法。
+            path: 上游路径（含 query）。
+            token: 上游 bearer。
+            body: JSON body。
+            timeout: 超时秒数。
+            account: 账号对象（指纹 / WAF cookie）。
+            chat_transport: 用官网 chat 抓包口径的请求头。
+            referer: Referer。
+            retry_waf: 撞 WAF 挑战页时刷新 acw_tc 并重试一次。
+            chat_id: 该请求所属的上游会话。**非空时按绑定表查出口**：建会话用哪个
+                出口，后续同一 chat_id 的请求就回到哪个出口（上游会话与出口 IP 绑定）。
+            proxy_url: 显式指定出口代理，优先于 `chat_id` 查表（建会话链路用）。
+
+        Returns:
+            `{status, body, acw_tc, waf_cookies}`；传输层异常折叠成 `status=0`。
+        """
         request_timeout = timeout if timeout is not None else settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS
-        session = await get_session(fingerprint_for_account(account))
+        exit_id = ""
+        if proxy_url is None and chat_id:
+            hit = self.chat_exit_proxy(chat_id)
+            if hit is not None:
+                proxy_url, exit_id = hit
+        dedicated = bool(proxy_url)
+        if dedicated:
+            session = await self._open_exit_session(account, request_timeout, proxy_url)
+        else:
+            session = await get_session(fingerprint_for_account(account))
+
+        def _note_exit_failure(reason: str) -> None:
+            """经出口的请求被判死时，把失败记到出口池并丢弃绑定。"""
+            if not dedicated or not chat_id:
+                return
+            self.note_chat_exit_failure(chat_id, reason)
+
+        def _note_exit_success() -> None:
+            """经出口的请求通了：清掉该出口的连续失败计数（避免误冷却好出口）。"""
+            if not dedicated or not exit_id:
+                return
+            pool = self.chat_exit_pool
+            if pool is None:
+                return
+            try:
+                pool.mark_success(exit_id)
+            except Exception:  # pragma: no cover - 记账不允许打断主链路
+                log.debug("[ChatExit] mark_success failed exit=%s", exit_id, exc_info=True)
 
         async def _send_once() -> dict:
             headers = self._build_chat_transport_headers(account=account, token=token, referer=referer) if chat_transport else self._build_headers(account=account, token=token, referer=referer)
@@ -299,25 +484,42 @@ class QwenClient:
             except Exception as e:
                 return {"status": 0, "body": str(e)}
 
-        if retry_waf and account is not None:
-            try:
-                await WafCookieManager.get_instance().get_cookies(account)
-            except Exception as waf_err:
-                log.warning("[QwenClient] WAF cookie refresh failed path=%s email=%s error=%s", path, getattr(account, "email", ""), waf_err)
-
-        res = await _send_once()
-        if not (retry_waf and account is not None and self._looks_like_waf_challenge(res["status"], res["body"])):
-            return res
-
-        log.warning("[QwenClient] WAF challenge detected path=%s email=%s, refreshing cookie and retrying once", path, getattr(account, "email", ""))
-        waf_mgr = WafCookieManager.get_instance()
         try:
-            waf_mgr.mark_expired(account)
-            await waf_mgr.get_cookies(account)
-        except Exception as waf_err:
-            log.warning("[QwenClient] WAF retry refresh failed path=%s email=%s error=%s", path, getattr(account, "email", ""), waf_err)
-            return res
-        return await _send_once()
+            if retry_waf and account is not None:
+                try:
+                    await WafCookieManager.get_instance().get_cookies(account)
+                except Exception as waf_err:
+                    log.warning("[QwenClient] WAF cookie refresh failed path=%s email=%s error=%s", path, getattr(account, "email", ""), waf_err)
+
+            res = await _send_once()
+            if not (retry_waf and account is not None and self._looks_like_waf_challenge(res["status"], res["body"])):
+                # 直连/出口两种路径都要识别出口级失败：WAF 挑战页、连不上（status=0）、
+                # 代理网关层面的 5xx。判死即丢绑定 → 下次建会话换出口。
+                if self._looks_like_waf_challenge(res["status"], res["body"]):
+                    _note_exit_failure("waf")
+                elif res["status"] == 0:
+                    _note_exit_failure("connect_failed")
+                elif res["status"] in (502, 503, 504):
+                    _note_exit_failure(f"http_{res['status']}")
+                elif res["status"] == 200:
+                    _note_exit_success()
+                return res
+
+            log.warning("[QwenClient] WAF challenge detected path=%s email=%s, refreshing cookie and retrying once", path, getattr(account, "email", ""))
+            waf_mgr = WafCookieManager.get_instance()
+            try:
+                waf_mgr.mark_expired(account)
+                await waf_mgr.get_cookies(account)
+            except Exception as waf_err:
+                log.warning("[QwenClient] WAF retry refresh failed path=%s email=%s error=%s", path, getattr(account, "email", ""), waf_err)
+                return res
+            retried = await _send_once()
+            if self._looks_like_waf_challenge(retried["status"], retried["body"]) or retried["status"] == 0:
+                _note_exit_failure("waf" if retried["status"] else "connect_failed")
+            return retried
+        finally:
+            if dedicated:
+                await self._close_session(session)
 
     async def clear_all_chats(self, account) -> dict:
         email = getattr(account, "email", "")
@@ -452,8 +654,18 @@ class QwenClient:
     async def delete_chat(self, token: str, chat_id: str, account: Account | None = None):
         if not token or not chat_id:
             return
-        res = await self._request_json("DELETE", f"/api/v2/chats/{chat_id}", token, timeout=20.0, account=account, retry_waf=True)
+        res = await self._request_json(
+            "DELETE",
+            f"/api/v2/chats/{chat_id}",
+            token,
+            timeout=20.0,
+            account=account,
+            retry_waf=True,
+            chat_id=chat_id,
+        )
         if res["status"] in (200, 204) and not self._looks_like_waf_challenge(res["status"], res["body"]):
+            # 会话已删：绑定随之失效，避免表里留下永远用不到的表项。
+            self.forget_chat_exit(chat_id)
             return
         log.warning("[delete_chat] failed email=%s chat_id=%s status=%s body=%s", getattr(account, "email", ""), chat_id, res["status"], res["body"][:120])
         raise RuntimeError(f"HTTP {res['status']}: {res['body'][:120]}")
@@ -568,6 +780,9 @@ class QwenClient:
 
         视频任务的 task_id 嵌在响应体 messages[0].extra.wanx.task_id，SSE 流不会下发，
         故必须用 stream:false 的一次性 POST 取回整个响应体。
+
+        必须带 `chat_id` 走出口绑定：上游会话与出口 IP 绑定，换出口会被风控当成
+        异地会话并加重惩罚。
         """
         request_timeout = timeout if timeout is not None else settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS
         return await self._request_json(
@@ -578,6 +793,7 @@ class QwenClient:
             timeout=request_timeout,
             account=account,
             chat_transport=True,
+            chat_id=chat_id,
         )
 
     async def get_vision_task_status(self, token: str, task_id: str, account: Account | None = None, timeout: float = 30.0) -> dict:
@@ -679,10 +895,15 @@ class QwenClient:
         account: Account | None,
         body_text: str,
         timeout: float,
+        proxy_url: str = "",
     ) -> AsyncIterator[dict]:
         """检测到 x5sec punish 后尝试滑块突破并重试 HTTP completions。
 
         成功则 yield 重试后的正常响应；失败则标记账号冷却 1800s 并 yield 403。
+
+        Args:
+            proxy_url: 该 chat 绑定的出口。非空时重试也必须走同一出口 —— 刚解完
+                滑块的 cookie 是与「该出口 IP」一起被放行的，换出口等于白解。
         """
         punish_url = extract_punish_url(body_text)
         log.warning(
@@ -712,7 +933,10 @@ class QwenClient:
             )
             # 重试必须沿用主流式的 curl_cffi + 浏览器 TLS 指纹：刚解完滑块证明自己
             # 是人，紧接着用无指纹的裸 httpx 再打一次，几乎必然二次命中并吃满冷却。
-            retry_session = new_session(fingerprint_for_account(account), timeout=timeout)
+            if proxy_url:
+                retry_session = await self._open_exit_session(account, timeout, proxy_url)
+            else:
+                retry_session = new_session(fingerprint_for_account(account), timeout=timeout)
             try:
                 async with retry_session.stream(
                     "POST",
@@ -783,7 +1007,12 @@ class QwenClient:
             account=account, token=token, accept="application/json",
             referer=f"{BASE_URL}/c/{chat_id}",
         )
-        if bool(getattr(settings, "QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP", False)):
+        # 出口亲和性：建会话用的哪个出口，completions 就必须回到哪个出口。
+        exit_hit = self.chat_exit_proxy(chat_id)
+        proxy_url = exit_hit[0] if exit_hit is not None else ""
+        if bool(getattr(settings, "QWEN_CHAT_TRANSPORT_GO_LIKE_HTTP", False)) and not proxy_url:
+            # httpx 分支不支持 socks5h 出口（需要 httpx[socks] 且行为与 curl 不一致），
+            # 一旦有出口绑定就退回 curl_cffi 主流式，保证 TLS 指纹与出口都对得上。
             log.info(
                 "[QwenClient] stream_headers chat_id=%s dedicated_session=%s diag=%s",
                 chat_id,
@@ -844,12 +1073,19 @@ class QwenClient:
             return
 
         fingerprint = fingerprint_for_account(account)
-        dedicated_session = bool(getattr(settings, "QWEN_UPSTREAM_STREAM_DEDICATED_SESSION", True))
-        session = new_session(fingerprint, timeout=timeout) if dedicated_session else await get_session(fingerprint)
+        dedicated_session = bool(getattr(settings, "QWEN_UPSTREAM_STREAM_DEDICATED_SESSION", True)) or bool(proxy_url)
+        if proxy_url:
+            # 绑定了出口：必须用「该出口 + 账号指纹」的独立会话，不能被共享会话复用。
+            session = await self._open_exit_session(account, timeout, proxy_url)
+        elif dedicated_session:
+            session = new_session(fingerprint, timeout=timeout)
+        else:
+            session = await get_session(fingerprint)
         log.info(
-            "[QwenClient] stream_headers chat_id=%s dedicated_session=%s diag=%s",
+            "[QwenClient] stream_headers chat_id=%s dedicated_session=%s exit=%s diag=%s",
             chat_id,
             dedicated_session,
+            exit_hit[1] if exit_hit is not None else "",
             self._header_diagnostics(account=account, headers=headers),
         )
         try:
@@ -865,6 +1101,13 @@ class QwenClient:
                     async for chunk in resp.aiter_content():
                         body_chunks.append(chunk)
                     body_text = b"".join(body_chunks).decode(errors="replace")[:2000]
+                    if proxy_url:
+                        # 经出口拿到非 200：WAF 挑战页 / 出口连不上都算出口失败，
+                        # 记账后下一次建会话会自动换出口。
+                        if self._looks_like_waf_challenge(resp.status_code, body_text):
+                            self.note_chat_exit_failure(chat_id, "waf")
+                        elif resp.status_code in (502, 503, 504):
+                            self.note_chat_exit_failure(chat_id, f"http_{resp.status_code}")
                     yield {"status": resp.status_code, "body": body_text}
                     return
 
@@ -878,12 +1121,16 @@ class QwenClient:
                             break
 
                 if self._is_punish_response(200, first_chunk):
+                    if proxy_url:
+                        # punish = 出口已被点名：把出口投入冷却（后续建会话换出口），
+                        # 但**保留**绑定 —— 同一次请求内还会用同一出口做滑块重试。
+                        self.note_chat_exit_failure(chat_id, "waf_punish", drop_binding=False)
                     remaining = []
                     async for chunk in resp.aiter_content():
                         remaining.append(chunk)
                     full_body = first_chunk + b"".join(remaining).decode("utf-8", errors="replace")
                     async for item in self._handle_punish_and_retry(
-                        token, chat_id, payload, account, full_body, timeout,
+                        token, chat_id, payload, account, full_body, timeout, proxy_url=proxy_url,
                     ):
                         yield item
                     return
@@ -898,12 +1145,13 @@ class QwenClient:
                 yield {"status": "streamed"}
         except Exception as e:
             log.error(f"[QwenClient] stream_chat_once error: {e}")
+            if proxy_url:
+                # 传输层异常（超时 / socks 连不上 / 连接被重置）同样归因到出口。
+                self.note_chat_exit_failure(chat_id, "connect_failed")
             yield {"status": 0, "body": str(e)}
         finally:
             if dedicated_session:
-                close = getattr(session, "close", None)
-                if close is not None:
-                    await close()
+                await self._close_session(session)
 
     async def chat_stream_events_with_retry(
         self,

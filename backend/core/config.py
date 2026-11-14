@@ -280,6 +280,18 @@ class Settings(BaseSettings):
     UPLOAD_EXIT_MAX_FAILURES: int = int(os.getenv("UPLOAD_EXIT_MAX_FAILURES", 2))
     # 单次出口健康探测（GET /api/v2/users/status）超时（秒）
     UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS: float = float(os.getenv("UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS", 10))
+    # ---- 建会话（chats/new）走出口池（复用上面的 UPLOAD_EXIT_POOL 出口列表）----
+    # 生产故障（2026-12）：出口 IP 被 WAF 记分后 chats/new 返回拼图挑战页，整个网关
+    # 变成「No available accounts in pool」。上游会话与出口 IP 绑定，所以建会话用哪个
+    # 出口，后续该 chat_id 的 completions 就必须回到同一个出口。
+    # auto   = 出口池非空即启用（默认）
+    # always = 同上，显式表达「一定要走出口池」
+    # never  = 建会话链路不碰代理（回流到原直连行为）
+    CHAT_VIA_EXIT_POOL: str = os.getenv("CHAT_VIA_EXIT_POOL", "auto").strip().lower() or "auto"
+    # chat_id → 出口绑定的存活时长（秒）：过期后不再复用旧出口，改为重建会话
+    CHAT_EXIT_BINDING_TTL_SECONDS: float = float(os.getenv("CHAT_EXIT_BINDING_TTL_SECONDS", 1800))
+    # chat_id → 出口绑定表的容量上限（LRU 淘汰），防止长跑进程内存膨胀
+    CHAT_EXIT_BINDING_MAX_ENTRIES: int = int(os.getenv("CHAT_EXIT_BINDING_MAX_ENTRIES", 512))
     CONTEXT_GENERATED_DIR: str = os.getenv("CONTEXT_GENERATED_DIR", str(DATA_DIR / "context_files"))
     CONTEXT_CACHE_FILE: str = os.getenv("CONTEXT_CACHE_FILE", str(DATA_DIR / "context_cache.json"))
     UPLOADED_FILES_FILE: str = os.getenv("UPLOADED_FILES_FILE", str(DATA_DIR / "uploaded_files.json"))

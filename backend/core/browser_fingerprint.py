@@ -172,7 +172,23 @@ def fingerprint_for_account(account: Any | None) -> BrowserFingerprint:
     return fingerprint_for_email(str(getattr(account, "email", "") or ""))
 
 
-def new_session(fingerprint: BrowserFingerprint, *, timeout: float | None = None) -> AsyncSession:
+def new_session(
+    fingerprint: BrowserFingerprint,
+    *,
+    timeout: float | None = None,
+    proxy_url: str | None = None,
+) -> AsyncSession:
+    """按指纹新建一个 curl_cffi 会话。
+
+    Args:
+        fingerprint: 浏览器指纹（决定 TLS impersonate / UA）。
+        timeout: 默认超时（秒）；None 时用 `QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS`。
+        proxy_url: 指定出口代理（`socks5h://Default.g@host:port`）。非空时覆盖
+            `UPSTREAM_PROXY` —— chat_id 出口亲和性靠它把请求钉在同一个出口上。
+
+    Returns:
+        已配置好指纹与代理的 `AsyncSession`（调用方负责 close）。
+    """
     from backend.core.config import settings
 
     kwargs: dict[str, Any] = dict(
@@ -180,7 +196,7 @@ def new_session(fingerprint: BrowserFingerprint, *, timeout: float | None = None
         timeout=timeout if timeout is not None else settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS,
         allow_redirects=True,
     )
-    proxy = getattr(settings, "UPSTREAM_PROXY", "")
+    proxy = str(proxy_url or "").strip() or getattr(settings, "UPSTREAM_PROXY", "")
     if proxy:
         # curl_cffi 基于 libcurl，仅做 TCP 隧道，本地 TLS 指纹伪装不受影响
         kwargs["proxies"] = {"http": proxy, "https": proxy}

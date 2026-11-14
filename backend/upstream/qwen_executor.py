@@ -10,10 +10,24 @@ import time
 from backend.core.config import settings
 from backend.core.request_logging import update_request_context
 from backend.services.auth_resolver import BASE_URL, AuthResolver
+from backend.services.exit_pool import exit_id_from_url
 from backend.upstream.payload_builder import build_chat_payload
 from backend.upstream.sse_consumer import parse_sse_chunk
 
 log = logging.getLogger("qwen2api.executor")
+
+
+class _ChatExitRotatable(Exception):
+    """经出口建会话失败，且失败可归因于**出口**（换一个出口值得重试）。
+
+    只在 `proxy_url` 非空时抛出：直连路径仍然抛原始 `Exception`，保证「没配出口池
+    的部署」异常文案与重试语义一字不变。
+    """
+
+    def __init__(self, reason: str, cause: BaseException) -> None:
+        self.reason = str(reason or "unknown")
+        self.cause = cause
+        super().__init__(f"{self.reason}: {cause}")
 
 
 def _has_textual_tool_contract_marker(prompt: str) -> bool:
@@ -160,13 +174,84 @@ class QwenExecutor:
         log.info(f"[Executor] {getattr(account, 'email', '')} waf cookie 预热刷新 keys={sorted(payload)}")
 
     async def create_chat(self, account_or_token, model: str, chat_type: str = "t2t") -> str:
+        """建一个上游会话，**经出口池挑出口**（未启用则直连）。
+
+        为什么建会话要挑出口：出口 IP 被阿里云 WAF 记分后，`chats/new` 会返回拼图
+        挑战页（`waf_blocked: create_chat returned WAF page`），而惩罚是出口级的 ——
+        换一个干净出口就能正常建会话。上游会话又与出口 IP 绑定，所以建成功后必须
+        把 `chat_id → 出口` 记进绑定表（`QwenClient.chat_bindings`），后续 completions
+        原路回到同一个出口。
+
+        失败轮转：连不上 / WAF / 代理层 5xx 视为「这个出口不行」→ `mark_failure`
+        → 换下一个出口。账号级错误（401/403/429）不烧出口，直接按原语义抛出。
+
+        Args:
+            account_or_token: 账号对象或裸 token。
+            model: 上游模型名。
+            chat_type: `t2t` / `t2i` / `t2v`。
+
+        Returns:
+            上游 chat_id。
+
+        Raises:
+            Exception: 未启用出口池时就是原有异常；启用时若所有出口都失败，回落
+                直连后仍失败则抛直连异常（保持「没有代理的部署」原有行为）。
+        """
         account, token = self._resolve_account_context(account_or_token)
         request_fn = getattr(self.engine, "_request_json", None) or getattr(self.engine, "api_call", None)
         if request_fn is None:
             raise Exception("request transport unavailable")
 
-        ts = int(time.time() * 1000)
-        body = {
+        body = self._build_new_chat_body(model, chat_type)
+        pool = self._chat_exit_pool()
+        if pool is None:
+            # 出口池未配置 / 显式关闭：一行代理都不碰，保持现状。
+            return await self._post_new_chat(account, token, body, request_fn)
+
+        tried: set[str] = set()
+        last_reason = ""
+        while True:
+            proxy_url = pool.pick(exclude=tried)
+            if not proxy_url:
+                break
+            exit_id = exit_id_from_url(proxy_url)
+            if not exit_id or exit_id in tried:
+                # 解析不出出口 id 说明配置有问题：不要空转，直接走直连。
+                if exit_id:
+                    tried.add(exit_id)
+                break
+            tried.add(exit_id)
+            started = time.monotonic()
+            try:
+                chat_id = await self._post_new_chat(account, token, body, request_fn, proxy_url=proxy_url)
+            except _ChatExitRotatable as exc:
+                last_reason = exc.reason
+                self._mark_exit_failure(pool, exit_id, exc.reason)
+                log.warning("[ChatExit] exit=%s blocked reason=%s → next", exit_id, exc.reason)
+                continue
+            self._mark_exit_success(pool, exit_id)
+            self._bind_chat_exit(chat_id, exit_id, proxy_url)
+            log.info(
+                "[ChatExit] create ok chat_id=%s exit=%s elapsed=%.1fs",
+                chat_id,
+                exit_id,
+                time.monotonic() - started,
+            )
+            return chat_id
+
+        # 没有可用出口（全在冷却）或全部失败 → 回落直连。宁可慢一点，也不能因为
+        # 出口池全挂而让整个网关不可用（这正是本功能要修的故障）。
+        log.warning(
+            "[ChatExit] no usable exit tried=%s last_reason=%s → direct",
+            sorted(tried),
+            last_reason or "none",
+        )
+        return await self._post_new_chat(account, token, body, request_fn)
+
+    @staticmethod
+    def _build_new_chat_body(model: str, chat_type: str) -> dict:
+        """构造 `POST /api/v2/chats/new` 的请求体（官网抓包口径）。"""
+        return {
             # 官网建会话不带 title（由服务端/前端后续生成）。此前发 "api_<毫秒>" 会
             # 永久留在账号会话列表里，是辨识度极高的批量注册特征（抓包已在列表里
             # 看到 api_1790058422946 这类标题，就是我们自己造的）。
@@ -176,30 +261,117 @@ class QwenExecutor:
             "models": [model],
             "chat_mode": "normal",
             "chat_type": chat_type,
-            "timestamp": ts,
+            "timestamp": int(time.time() * 1000),
             "project_id": "",
         }
 
-        if getattr(self.engine, "_request_json", None) is not None:
-            r = await request_fn(
-                "POST",
-                "/api/v2/chats/new",
-                token,
-                body,
-                timeout=settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS,
-                account=account,
-                chat_transport=True,
-                referer=f"{BASE_URL}/c/new-chat",
+    def _chat_exit_pool(self):
+        """取建会话用出口池；引擎不支持 / 未启用 / 池为空时返回 None。"""
+        pool = getattr(self.engine, "chat_exit_pool", None)
+        if pool is None:
+            return None
+        if not bool(getattr(pool, "enabled", True)):
+            return None
+        return pool
+
+    @staticmethod
+    def _mark_exit_failure(pool, exit_id: str, reason: str) -> None:
+        """记一次出口失败（记账异常不影响主链路）。"""
+        try:
+            pool.mark_failure(exit_id, reason)
+        except Exception:  # pragma: no cover - 单测替身可能只实现 pick/mark_failure
+            log.debug("[ChatExit] mark_failure failed exit=%s", exit_id, exc_info=True)
+
+    @staticmethod
+    def _mark_exit_success(pool, exit_id: str) -> None:
+        """记一次出口成功（失败计数清零）。"""
+        try:
+            pool.mark_success(exit_id)
+        except Exception:  # pragma: no cover
+            log.debug("[ChatExit] mark_success failed exit=%s", exit_id, exc_info=True)
+
+    def _bind_chat_exit(self, chat_id: str, exit_id: str, proxy_url: str) -> None:
+        """把 chat_id → 出口写进绑定表（引擎没有该能力时静默跳过）。"""
+        binder = getattr(self.engine, "bind_chat_exit", None)
+        if not callable(binder):
+            return
+        try:
+            binder(chat_id, exit_id, proxy_url)
+        except Exception:  # pragma: no cover - 绑定失败只影响亲和性，不影响本次会话
+            log.warning("[ChatExit] bind failed chat_id=%s exit=%s", chat_id, exit_id, exc_info=True)
+
+    def _chat_binding_missing(self, chat_id: str) -> bool:
+        """出口池启用时，判断 chat_id 是否**缺**有效出口绑定。
+
+        预热池里的 chat_id 可能是在功能上线前建的（没有绑定），也可能绑定已过期
+        （TTL）或被 LRU 淘汰。此时直接拿它发 completions 等于「在 A 出口建的会话
+        从 B 出口继续用」，必然吃风控 —— 必须重建会话。
+        """
+        if not chat_id:
+            return False
+        if self._chat_exit_pool() is None:
+            return False
+        resolver = getattr(self.engine, "chat_exit_binding", None)
+        if not callable(resolver):
+            return False
+        try:
+            return resolver(chat_id) is None
+        except Exception:  # pragma: no cover
+            log.debug("[ChatExit] binding lookup failed chat_id=%s", chat_id, exc_info=True)
+            return False
+
+    async def _post_new_chat(self, account, token: str, body: dict, request_fn, *, proxy_url: str | None = None) -> str:
+        """发一次 `POST /api/v2/chats/new`（**不做出口轮转**）。
+
+        Args:
+            account: 账号对象（可为 None）。
+            token: 上游 bearer。
+            body: 请求体（`:meth:`_build_new_chat_body`）。
+            request_fn: 传输函数（`QwenClient._request_json` 或旧的 `api_call`）。
+            proxy_url: 指定出口代理；为空即直连。
+
+        Returns:
+            上游 chat_id。
+
+        Raises:
+            _ChatExitRotatable: 经出口请求时，失败可归因于出口（换出口值得重试）。
+            Exception: 其余情况——与加入出口池之前的语义、文案完全一致。
+        """
+        use_chat_transport = getattr(self.engine, "_request_json", None) is not None
+        # 只有 `_request_json` 认识 proxy_url；旧 `api_call` 传输层不支持指定代理。
+        effective_proxy = proxy_url if use_chat_transport else None
+
+        if use_chat_transport:
+            request_kwargs: dict = {
+                "timeout": settings.QWEN_UPSTREAM_REQUEST_TIMEOUT_SECONDS,
+                "account": account,
+                "chat_transport": True,
+                "referer": f"{BASE_URL}/c/new-chat",
                 # 建 chat 前刷新 acw_tc；撞 aliyun_waf/x5sec 挑战页时再刷新一次并重试
-                retry_waf=True,
-            )
+                "retry_waf": True,
+            }
+            if effective_proxy:
+                # 只在真的要走出口时才带这个 kwarg：直连路径的调用约定保持原样，
+                # 避免旧传输替身 / 自定义引擎因多一个参数而 TypeError。
+                request_kwargs["proxy_url"] = effective_proxy
+            r = await request_fn("POST", "/api/v2/chats/new", token, body, **request_kwargs)
         else:
             r = await request_fn("POST", "/api/v2/chats/new", token, body)
         body_text = r.get("body", "")
         if r["status"] != 200:
             body_lower = body_text.lower()
             if _is_waf_blocked_body(body_text):
-                raise Exception(f"waf_blocked: create_chat HTTP {r['status']}: {body_text[:200]}")
+                raise self._chat_exit_error(
+                    "waf", f"waf_blocked: create_chat HTTP {r['status']}: {body_text[:200]}", effective_proxy
+                )
+            if r["status"] == 0 or r["status"] in (502, 503, 504):
+                # 连不上 / 代理网关错误：只有「经出口」时才可能是出口的锅。
+                reason = "connect_failed" if r["status"] == 0 else f"http_{r['status']}"
+                if effective_proxy:
+                    raise self._chat_exit_error(
+                        reason, f"create_chat HTTP {r['status']}: {body_text[:100]}", effective_proxy
+                    )
+                raise Exception(f"create_chat HTTP {r['status']}: {body_text[:100]}")
             if (
                 r["status"] in (401, 403)
                 or "unauthorized" in body_lower
@@ -225,7 +397,11 @@ class QwenExecutor:
         except Exception as e:
             body_lower = body_text.lower()
             if _is_waf_blocked_body(body_text):
-                raise Exception(f"waf_blocked: create_chat returned WAF page: {body_text[:200]}")
+                raise self._chat_exit_error(
+                    "waf",
+                    f"waf_blocked: create_chat returned WAF page: {body_text[:200]}",
+                    effective_proxy,
+                )
             if any(
                 kw in body_lower
                 for kw in (
@@ -243,13 +419,28 @@ class QwenExecutor:
                 raise Exception(f"unauthorized: account issue: {body_text[:200]}")
             raise Exception(f"create_chat parse error: {e}, body={body_text[:200]}")
 
+    @staticmethod
+    def _chat_exit_error(reason: str, message: str, proxy_url: str | None) -> Exception:
+        """按「是否经出口」把异常包成可轮转错误；直连时保持原样。"""
+        error = Exception(message)
+        if not proxy_url:
+            return error
+        return _ChatExitRotatable(reason, error)
+
     async def get_chat_id(self, acc, model: str, chat_type: str = "t2t") -> tuple[str, bool]:
         chat_pool = getattr(self.engine, "chat_id_pool", None)
         if chat_pool is not None:
             await chat_pool.remember_model(model, chat_type)
             chat_id, reused = await chat_pool.take(acc.email, model, chat_type)
             if reused and chat_id:
-                return chat_id, True
+                if not self._chat_binding_missing(chat_id):
+                    return chat_id, True
+                # 绑定过期 / 被淘汰 / 从未绑定：这条预热的会话不能用（出口对不上），
+                # 丢掉它重新走 create_chat（会挑出口并写入新绑定）。
+                log.info(
+                    "[ChatExit] chat_id=%s binding missing (expired/evicted) → recreate",
+                    chat_id,
+                )
         if chat_type == "t2t":
             return await self.create_chat(acc, model), False
         return await self.create_chat(acc, model, chat_type=chat_type), False

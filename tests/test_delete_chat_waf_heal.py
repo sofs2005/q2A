@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from backend.core.account_pool import Account
+from backend.services.chat_exit_binding import ChatExitBindings
 from backend.services.qwen_client import QwenClient
 
 
@@ -18,8 +19,13 @@ class _FakeResp:
 
 
 def _client() -> QwenClient:
-    # 跳过 __init__（避免构造 executor 等副作用）；被测方法只用无状态请求逻辑
-    return QwenClient.__new__(QwenClient)
+    # 跳过 __init__（避免构造 executor 等副作用）；被测方法只用无状态请求逻辑。
+    # 建会话出口池相关状态仍需就位：delete_chat 会顺手清掉 chat_id → 出口绑定，
+    # 这里给一个「未启用出口池」的空客户端状态。
+    client = QwenClient.__new__(QwenClient)
+    client.chat_bindings = ChatExitBindings()
+    client.chat_exit_pool = None
+    return client
 
 
 def _account() -> Account:

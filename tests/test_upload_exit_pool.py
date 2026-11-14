@@ -660,7 +660,8 @@ class ProbePayloadTests(unittest.TestCase):
         from backend.api.probes import _exit_pool_probe
 
         request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
-        self.assertEqual(_exit_pool_probe(request), {"enabled": False, "exits": []})
+        # `chat_bindings`：chat_id → 出口绑定表条目数（未启用出口池时为 0）。
+        self.assertEqual(_exit_pool_probe(request), {"enabled": False, "exits": [], "chat_bindings": 0})
 
 
 if __name__ == "__main__":

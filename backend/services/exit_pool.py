@@ -16,7 +16,9 @@
 
 1. `getstsToken` 挂在出口池里的某个出口上（只有这一步需要代理）；
 2. 拿到 STS 后 OSS PUT 直连（走代理反而更慢）；
-3. 后续 `chats/new` / `completions` 也直连（走代理会被 WAF 拦）。
+3. `chats/new` **也**挂出口池（2026-12 追加，见下）。因为「上游会话与出口 IP
+   绑定」，同一个 chat_id 后续的 `completions` 必须回到同一个出口 —— 该亲和性
+   由 `backend.services.chat_exit_binding` 记录、`qwen_client` 查表复用。
 
 出口本身不稳：有的 SOCKS5 connect 直接失败，有的 25s 超时，所以需要
 「健康探测 + 连续失败冷却 + 轮询挑下一个」。本模块只负责**选出口 / 记账 /
@@ -227,6 +229,36 @@ class ExitPool:
             return None
         if resolve_exit_mode(settings_obj) == "never":
             return None
+        return cls._from_exit_config(settings_obj)
+
+    @classmethod
+    def from_chat_settings(cls, settings_obj: Any) -> "ExitPool | None":
+        """按 `CHAT_VIA_EXIT_POOL` 构造「建会话用」出口池；关闭或池为空时返回 None。
+
+        与 :meth:`from_settings` 复用同一份 `UPLOAD_EXIT_POOL` 出口列表和同一套
+        冷却 / 失败阈值配置，但开关独立：运营可以用 `UPLOAD_VIA_EXIT=never` 关掉
+        上传代理，同时用 `CHAT_VIA_EXIT_POOL=always` 保住建会话链路（生产故障里
+        正是 `chats/new` 被出口级 WAF 打死，必须先救它）。
+
+        Args:
+            settings_obj: 配置对象。
+
+        Returns:
+            出口池；未配置出口列表或 `CHAT_VIA_EXIT_POOL=never` 时为 None。
+        """
+        # 延迟 import：chat_exit_binding 不依赖 exit_pool，这里反向引用只为避免
+        # 两个模块在 import 期互相拉扯（exit_pool 是底层模块，尽量少依赖）。
+        from backend.services.chat_exit_binding import resolve_chat_exit_mode
+
+        if settings_obj is None:
+            return None
+        if resolve_chat_exit_mode(settings_obj) == "never":
+            return None
+        return cls._from_exit_config(settings_obj)
+
+    @classmethod
+    def _from_exit_config(cls, settings_obj: Any) -> "ExitPool | None":
+        """用 `UPLOAD_EXIT_POOL` + 冷却/阈值配置构造池；出口列表为空时返回 None。"""
         exits = parse_exit_list(getattr(settings_obj, "UPLOAD_EXIT_POOL", ""))
         if not exits:
             return None

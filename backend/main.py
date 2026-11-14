@@ -124,6 +124,21 @@ async def lifespan(app: FastAPI):
         app.state.upstream_file_cache = UpstreamFileCache(app.state.context_cache_db)
         app.state.context_offloader = ContextOffloader(settings)
         app.state.upstream_file_uploader = UpstreamFileUploader(app.state.qwen_client, settings)
+        # 建会话出口池：`chats/new` 与后续同 chat 的 completions 共用同一个出口 IP
+        # （上游会话与出口绑定）。未配置 `UPLOAD_EXIT_POOL` / `CHAT_VIA_EXIT_POOL=never`
+        # 时为 None → 建会话走直连，行为与加这个功能之前完全一致。
+        chat_exit_pool = getattr(app.state.qwen_client, "chat_exit_pool", None)
+        if chat_exit_pool is not None:
+            log.info(
+                "[ChatExit] chats/new via exit pool exits=%s cooldown=%ss max_failures=%s ttl=%ss max_entries=%s",
+                len(chat_exit_pool.exit_ids),
+                int(chat_exit_pool.cooldown_seconds),
+                chat_exit_pool.max_failures,
+                int(app.state.qwen_client.chat_bindings.ttl_seconds),
+                app.state.qwen_client.chat_bindings.max_entries,
+            )
+        else:
+            log.info("[ChatExit] chats/new 直连（出口池未启用或 CHAT_VIA_EXIT_POOL=never）")
         # 上传出口池：`getstsToken` 挂到不同出口 IP 上绕开出口级 WAF 惩罚。
         # `UPLOAD_EXIT_POOL` 为空 / `UPLOAD_VIA_EXIT=never` 时是 None（不碰代理）。
         app.state.upload_exit_pool = app.state.upstream_file_uploader.exit_pool

@@ -93,17 +93,37 @@ async def probe_browser_upload(request: Request):
     return {"browser": result, "exit_pool": exit_pool}
 
 
+def _chat_binding_count(request: Request) -> int:
+    """`chat_id → 出口` 绑定表的当前条目数（未启用 / 不可读时 0）。"""
+    client = getattr(request.app.state, "qwen_client", None)
+    bindings = getattr(client, "chat_bindings", None)
+    if bindings is None:
+        return 0
+    try:
+        return int(getattr(bindings, "count", 0) or 0)
+    except Exception:  # pragma: no cover - count 只读内存，异常极罕见
+        logger.warning("chat exit binding count failed", exc_info=True)
+        return 0
+
+
 def _exit_pool_probe(request: Request) -> dict:
     """出口池快照（不含凭据）；未启用时 `{enabled: false, exits: []}`。
 
     探针失败不影响浏览器部分：任何异常都折叠成 `enabled=false` + `error`。
+    `chat_bindings` 是「chat_id → 出口」绑定表的条目数：稳定增长说明建会话在
+    走出口池；长期为 0 而 `enabled=true` 则说明建会话仍然在直连。
     """
+    chat_bindings = _chat_binding_count(request)
     pool = getattr(request.app.state, "upload_exit_pool", None)
     if pool is None:
-        return {"enabled": False, "exits": []}
+        return {"enabled": False, "exits": [], "chat_bindings": chat_bindings}
     try:
         snapshot = pool.snapshot()
     except Exception as exc:  # pragma: no cover - snapshot 只读内存，异常极罕见
         logger.warning("upload exit pool snapshot failed: %s", exc)
-        return {"enabled": False, "exits": [], "error": str(exc)}
-    return {"enabled": bool(getattr(pool, "enabled", bool(snapshot))), "exits": snapshot}
+        return {"enabled": False, "exits": [], "chat_bindings": chat_bindings, "error": str(exc)}
+    return {
+        "enabled": bool(getattr(pool, "enabled", bool(snapshot))),
+        "exits": snapshot,
+        "chat_bindings": chat_bindings,
+    }
