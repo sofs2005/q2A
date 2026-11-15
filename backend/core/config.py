@@ -146,6 +146,13 @@ class Settings(BaseSettings):
     GENERATED_VIDEO_MAX_BYTES: int = int(os.getenv("GENERATED_VIDEO_MAX_BYTES", 268435456))
     # /v1/images/generations 默认上游模型；升级时只改 env，无需改代码
     IMAGE_GENERATION_MODEL: str = os.getenv("IMAGE_GENERATION_MODEL", DEFAULT_QWEN_MAX_MODEL).strip() or DEFAULT_QWEN_MAX_MODEL
+    # 对外暴露的生图模型 ID，只用于 `/v1/models` —— OpenAI 兼容客户端靠这个列表
+    # 决定界面上显示哪些能力，不上报就看不到生图入口。
+    # 注意上游**没有**「生图模型」这个独立概念：chat 级仍用
+    # `IMAGE_GENERATION_MODEL` 触发 t2i 通道，真正出图的引擎由
+    # `IMAGE_GENERATION_META_MODEL` 决定。所以这些名字只是**能力别名**，
+    # 请求时统一解析回默认模型（见 `backend/api/images.py::_resolve_image_model`）。
+    IMAGE_MODEL_IDS: tuple[str, ...] = ("qwen-image", "qwen-image-3.0-pro")
     # t2i 请求 messages[].extra.meta.model 的取值，即真正出图的模型。
     # 默认 qwen-image-3.0-pro（官网抓包值）：留空会让上游按 chat 级 model 自行
     # 路由，出图模型不可控，故给一个明确的默认值。

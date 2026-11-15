@@ -130,12 +130,19 @@ def _resolve_image_model(requested: str | None) -> str:
     """解析生图上游模型。
 
     - 未传 / 空串 → settings.IMAGE_GENERATION_MODEL
+    - `settings.IMAGE_MODEL_IDS` 里的能力别名（`qwen-image` /
+      `qwen-image-3.0-pro`）→ 回退到 env 默认。这些名字只是给 `/v1/models`
+      用的**能力别名**，上游没有独立生图模型；必须排在下面的 `qwen*` 透传
+      之前，否则 `qwen-image` 会被当成 chat 级模型直接发给上游。
     - 以 qwen 开头的名称 → 原样使用（便于临时指定其它 Qwen 型号）
     - 其它（含旧 dall-e 别名）→ 回退到 env 默认
     """
     default = _default_image_model()
     name = str(requested or "").strip()
     if not name:
+        return default
+    aliases = {str(item).lower() for item in getattr(settings, "IMAGE_MODEL_IDS", ())}
+    if name.lower() in aliases:
         return default
     resolved = resolve_model(name)
     if resolved != name:
