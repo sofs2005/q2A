@@ -10,17 +10,25 @@
 设计约束
 --------
 1. **不阻塞 startup**：`main.py` 只 `create_task`，探测在事件循环让出之后跑；
-2. **轻量端点**：GET `/api/v2/users/status` 这类不会触发 WAF、不烧额度的接口，
+2. **轻量端点**：GET `/api/v2/models/`（无需鉴权，实测 200 / 4902B，不触发 WAF），
    **绝不**用 `chat/completions`（烧额度 + 招风控）；
-3. **并发**：`asyncio.gather`，总耗时受 `EXIT_PROBE_TOTAL_TIMEOUT_SECONDS`（默认
-   15s）约束，超预算的出口按不可用处理；
-4. **失败即冷却**：探测失败 → `mark_failure` → 达到阈值立刻进冷却，`pick()` 跳过。
+3. **限并发 + 宽预算**：并发度 `EXIT_PROBE_CONCURRENCY`（默认 2），单出口
+   `EXIT_PROBE_TIMEOUT_SECONDS`（默认 20s），总预算
+   `EXIT_PROBE_TOTAL_TIMEOUT_SECONDS`（默认 45s）。socks5h 冷启动握手 + TLS 在
+   生产上要 3~4s，挤在 5s 预算里会全超时（2026-12 事故根因）；
+4. **判定只看连通性**：拿到任何 HTTP 响应（200/401/403/429）就算活；只有
+   `ProxyError` / 握手失败 / DNS 失败 / 超时才判死；
+5. **探测是猜测，不重罚**：判死走 `mark_probe_failure` —— 短冷却
+   `EXIT_PROBE_COOLDOWN_SECONDS`（默认 120s）、**不增加** `failures`；
+6. **全灭兜底**：所有出口都探测失败时按「网络抖动」处理，全部视为 available
+   并打 WARNING，避免探测自身抖动把整个池子打死 → 回落直连 → 被 WAF 打死。
 
 日志口径（排障时直接 grep）：
 
-    [ExitProbe] ok exit=Default.g 1.2s
-    [ExitProbe] dead exit=Default.c reason=connect_failed → cooldown 600s
-    [ExitProbe] done pool=chat exits=12 ready=8 dead=4 elapsed=3.4s
+    [ExitProbe] ok exit=Default.g 3.7s reason=http_200
+    [ExitProbe] dead exit=Default.c reason=connect_failed → cooldown 120s
+    [ExitProbe] all exits failed probe — assuming network blip, keeping pool available
+    [ExitProbe] done pool=chat exits=6 ready=5 dead=1 elapsed=12.4s
 """
 
 from __future__ import annotations
@@ -106,6 +114,7 @@ async def run_startup_exit_probe(app: Any, settings_obj: Any = None) -> dict[str
         "total": 0,
         "ok": 0,
         "dead": 0,
+        "assumed_alive": 0,
         "elapsed_seconds": 0.0,
         "skipped": "",
     }
@@ -126,11 +135,13 @@ async def run_startup_exit_probe(app: Any, settings_obj: Any = None) -> dict[str
         results = await pool.probe_all(token=token, account=account, limit_seconds=budget)
         elapsed = time.monotonic() - started
         ok = sum(1 for item in results if item.get("ok"))
+        assumed = sum(1 for item in results if item.get("assumed_alive"))
         summary.update(
             {
                 "total": len(results),
                 "ok": ok,
                 "dead": len(results) - ok,
+                "assumed_alive": assumed,
                 "elapsed_seconds": round(elapsed, 2),
             }
         )

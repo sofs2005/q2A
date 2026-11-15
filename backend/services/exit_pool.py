@@ -47,13 +47,27 @@ log = logging.getLogger("qwen2api.exit_pool")
 DEFAULT_MAX_FAILURES = 2
 #: 冷却时长（秒，可被 `UPLOAD_EXIT_COOLDOWN_SECONDS` 覆盖）
 DEFAULT_COOLDOWN_SECONDS = 600.0
-#: 单次健康探测超时（秒，可被 `UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS` 覆盖）
+#: 单次健康探测超时（秒，可被 `UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS` 覆盖）。
+#: **只用于 `/admin/upload/probe` 的手工单次探测**；启动探测另有
+#: `DEFAULT_STARTUP_PROBE_TIMEOUT_SECONDS`（两者语义不同，别混用）。
 DEFAULT_PROBE_TIMEOUT_SECONDS = 10.0
 #: 出口请求的**建连阶段**超时（秒，可被 `EXIT_CONNECT_TIMEOUT_SECONDS` 覆盖）。
 #: 只压建连、不压读取：大模型生成可能很慢，读超时压到 5s 会误杀正常请求。
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
-#: 启动探测的总耗时上限（秒，可被 `EXIT_PROBE_TOTAL_TIMEOUT_SECONDS` 覆盖）
-DEFAULT_PROBE_TOTAL_TIMEOUT_SECONDS = 15.0
+#: **启动探测**的单出口超时（秒，可被 `EXIT_PROBE_TIMEOUT_SECONDS` 覆盖）。
+#: 2026-12 事故：socks5h 冷启动握手 + TLS 在生产上要 3~4s，6 个出口挤在 5s 总预算
+#: 里全部超时 → 全判死 → 冷却 600s → 出口池整体不可用 → `chats/new` 回落直连被
+#: WAF 打死。这里放宽到 20s，并且与 `UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS` 分开配置。
+DEFAULT_STARTUP_PROBE_TIMEOUT_SECONDS = 20.0
+#: 启动探测的**总**耗时上限（秒，可被 `EXIT_PROBE_TOTAL_TIMEOUT_SECONDS` 覆盖）。
+#: 6 个出口 × 20s 单超时 ÷ 并发 2 ≈ 60s 上界，45s 覆盖绝大多数正常批次。
+DEFAULT_PROBE_TOTAL_TIMEOUT_SECONDS = 45.0
+#: 启动探测的并发度（可被 `EXIT_PROBE_CONCURRENCY` 覆盖）。
+#: socks5 握手排队做：6 条隧道同时握手会互相拖慢，串成 2 条反而整体更快更稳。
+DEFAULT_PROBE_CONCURRENCY = 2
+#: **探测**判死后的冷却时长（秒，可被 `EXIT_PROBE_COOLDOWN_SECONDS` 覆盖）。
+#: 探测只是「猜测」，不套用真实请求的 600s 重罚：猜错了 120s 就能自己恢复。
+DEFAULT_PROBE_COOLDOWN_SECONDS = 120.0
 
 #: 出口状态
 STATE_READY = "ready"
@@ -72,8 +86,85 @@ _WAF_MARKERS = (
     "sceneid=",
 )
 
-#: 探测出口用的上游状态接口（无需业务参数，200 即视为出口可用）。
-_PROBE_PATH = "/api/v2/users/status"
+#: 探测出口用的上游轻量接口：**不需要鉴权**，实测 200 / 4902B，不触发 WAF。
+#: 绝不用 `chat/completions`（烧额度 + 招风控），也不再用 `/api/v2/users/status`
+#: （需要 token，且 401 会被旧逻辑误判成「出口死」）。
+_PROBE_PATH = "/api/v2/models/"
+
+#: 探测判死的原因集合（**只有连不上才算死**）：DNS / 代理握手 / 超时。
+CONNECT_FAILURE_REASONS = frozenset(
+    {
+        "connect_failed",
+        "connect_timeout",
+        "proxy_error",
+        "dns_failed",
+        "probe_timeout",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ProbeOutcome:
+    """一次出口探测的结论。
+
+    判定口径（2026-12 事故后收紧）：**只要拿到任何 HTTP 响应就算活**。
+    上游的 401 / 403 / 429 / 5xx 是「鉴权 / 限流 / 上游」的事，与出口 IP 能否
+    连通无关；只有 `ProxyError` / 握手失败 / DNS 失败 / 超时才说明出口真的死了。
+
+    Attributes:
+        ok: 出口是否可用。
+        reason: 观测用的原因串（`http_200` / `http_403` / `connect_failed` ...）。
+        responded: 是否拿到了 HTTP 响应（`ok` 的主要判据）。
+        status: HTTP 状态码；没拿到响应时为 0。
+    """
+
+    ok: bool
+    reason: str = ""
+    responded: bool = False
+    status: int = 0
+
+
+def _classify_connect_error(exc: BaseException) -> str:
+    """把「连不上」的异常归类成观测用的原因串（永远属于 `CONNECT_FAILURE_REASONS`）。"""
+    name = type(exc).__name__.lower()
+    text = f"{name} {str(exc)}".lower()
+    if isinstance(exc, asyncio.TimeoutError) or "timeout" in text or "timed out" in text:
+        reason = "connect_timeout"
+    elif "proxy" in text:
+        reason = "proxy_error"
+    elif "dns" in text or "resolve" in text or "name or service" in text or "getaddrinfo" in text:
+        reason = "dns_failed"
+    else:
+        reason = "connect_failed"
+    # 兜底：返回值必须落在「连不上」这个集合里，否则调用方会把上游错误误判成出口死。
+    return reason if reason in CONNECT_FAILURE_REASONS else "connect_failed"
+
+
+def _coerce_probe_outcome(raw: Any) -> ProbeOutcome:
+    """把注入的假探测结果（bool / `(ok, reason)` / `ProbeOutcome`）归一成结论。
+
+    单测与外部调用方历史上只返回 `bool`，这里保持向后兼容：`True` 视为「有响应」，
+    `False` 视为「连不上」（`connect_failed`）。
+
+    Args:
+        raw: `probe_fetch` 的返回值。
+
+    Returns:
+        归一后的 :class:`ProbeOutcome`。
+    """
+    if isinstance(raw, ProbeOutcome):
+        return raw
+    if isinstance(raw, tuple):
+        items = list(raw)
+        ok = bool(items[0]) if items else False
+        reason = str(items[1] or "") if len(items) > 1 else ""
+        responded = bool(items[2]) if len(items) > 2 else ok
+        if not reason:
+            reason = "" if ok else "connect_failed"
+        return ProbeOutcome(ok=ok, reason=reason, responded=responded)
+    ok = bool(raw)
+    return ProbeOutcome(ok=ok, reason="" if ok else "connect_failed", responded=ok)
+
 
 
 def looks_like_waf(body: str) -> bool:
@@ -236,6 +327,9 @@ class ExitPool:
         max_failures: int = DEFAULT_MAX_FAILURES,
         probe_timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
         connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        startup_probe_timeout_seconds: float = DEFAULT_STARTUP_PROBE_TIMEOUT_SECONDS,
+        probe_cooldown_seconds: float = DEFAULT_PROBE_COOLDOWN_SECONDS,
+        probe_concurrency: int = DEFAULT_PROBE_CONCURRENCY,
         prefer_last_success: bool = True,
         clock: Callable[[], float] | None = None,
         wall_clock: Callable[[], float] | None = None,
@@ -247,8 +341,13 @@ class ExitPool:
             exits: 代理 URL 列表（`socks5h://Default.g@host:port`）。
             cooldown_seconds: 冷却时长；连续失败达阈值后该出口暂停这么久。
             max_failures: 连续失败多少次进入冷却。
-            probe_timeout_seconds: 单次探测的整体超时（读阶段）。
+            probe_timeout_seconds: 单次探测的整体超时（读阶段，`/admin/upload/probe`）。
             connect_timeout_seconds: 出口请求的**建连阶段**超时（只压 connect）。
+            startup_probe_timeout_seconds: **启动探测**的单出口超时
+                （`EXIT_PROBE_TIMEOUT_SECONDS`，默认 20s；与上面那个分开配置）。
+            probe_cooldown_seconds: 探测判死后的**短冷却**
+                （`EXIT_PROBE_COOLDOWN_SECONDS`，默认 120s）。
+            probe_concurrency: 启动探测的并发度（`EXIT_PROBE_CONCURRENCY`，默认 2）。
             prefer_last_success: `pick()` 是否优先返回最近成功的出口
                 （`EXIT_PICK_PREFER_LAST_SUCCESS`，默认开）。
             clock: 单调时钟函数（冷却计算用），默认 `time.monotonic`。
@@ -270,6 +369,11 @@ class ExitPool:
         self.max_failures = max(1, int(max_failures))
         self.probe_timeout_seconds = max(0.1, float(probe_timeout_seconds))
         self.connect_timeout_seconds = max(0.0, float(connect_timeout_seconds))
+        # 启动探测与手工探测的参数完全分开：socks5h 冷启动握手 + TLS 要 3~4s，
+        # 用 10s 那个值去并发 6 个出口必然全超时（2026-12 事故）。
+        self.startup_probe_timeout_seconds = max(0.1, float(startup_probe_timeout_seconds))
+        self.probe_cooldown_seconds = max(0.0, float(probe_cooldown_seconds))
+        self.probe_concurrency = max(1, int(probe_concurrency))
         self.prefer_last_success = bool(prefer_last_success)
         self._clock = clock or time.monotonic
         self._wall_clock = wall_clock or time.time
@@ -340,6 +444,25 @@ class ExitPool:
             connect_timeout_seconds=_as_float(
                 getattr(settings_obj, "EXIT_CONNECT_TIMEOUT_SECONDS", DEFAULT_CONNECT_TIMEOUT_SECONDS),
                 DEFAULT_CONNECT_TIMEOUT_SECONDS,
+            ),
+            # 启动探测：单出口 20s（与 UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS 分开）、
+            # 判死短冷却 120s（探测是猜测，不该套用真实请求的 600s 重罚）、
+            # 并发 2（socks5 握手排队做，避免互相拖慢）。
+            startup_probe_timeout_seconds=_as_float(
+                getattr(
+                    settings_obj,
+                    "EXIT_PROBE_TIMEOUT_SECONDS",
+                    DEFAULT_STARTUP_PROBE_TIMEOUT_SECONDS,
+                ),
+                DEFAULT_STARTUP_PROBE_TIMEOUT_SECONDS,
+            ),
+            probe_cooldown_seconds=_as_float(
+                getattr(settings_obj, "EXIT_PROBE_COOLDOWN_SECONDS", DEFAULT_PROBE_COOLDOWN_SECONDS),
+                DEFAULT_PROBE_COOLDOWN_SECONDS,
+            ),
+            probe_concurrency=_as_int(
+                getattr(settings_obj, "EXIT_PROBE_CONCURRENCY", DEFAULT_PROBE_CONCURRENCY),
+                DEFAULT_PROBE_CONCURRENCY,
             ),
             # 未显式配置时默认开启「优先最近成功的出口」。
             prefer_last_success=bool(
@@ -475,6 +598,48 @@ class ExitPool:
                 state.last_error,
             )
 
+    def mark_probe_failure(
+        self,
+        exit_id: str,
+        reason: str,
+        *,
+        connect_ms: float | None = None,
+    ) -> None:
+        """记一次**探测**失败：短冷却（`EXIT_PROBE_COOLDOWN_SECONDS`），不动失败计数。
+
+        探测只是「猜」出口死没死，猜错了要能很快自我纠正，所以：
+
+        1. **不增加** `failures`（主失败计数只由真实请求累加，避免探测与真实失败
+           叠加后触发 600s 重罚）；
+        2. 冷却时长用 `probe_cooldown_seconds`（默认 120s），而不是
+           `cooldown_seconds`（默认 600s）。
+
+        Args:
+            exit_id: 出口 id（`Default.g` 这种后缀，不含凭据）。
+            reason: 失败原因（`connect_failed` / `proxy_error` / `connect_timeout` ...）。
+            connect_ms: 失败前已经等掉的耗时（毫秒，可选），并进 `avg_connect_ms`。
+        """
+        state = self._states.get(str(exit_id or ""))
+        if state is None:
+            return
+        state.last_error = str(reason or "")[:200]
+        state.last_failure_at = float(self._wall_clock())
+        _accumulate_connect_ms(state, connect_ms)
+        # 注意：这里刻意 **不** 执行 `state.failures += 1`。
+        if self.probe_cooldown_seconds > 0:
+            state.cooldown_until = max(
+                state.cooldown_until,
+                self._clock() + self.probe_cooldown_seconds,
+            )
+
+    def mark_probe_alive(self, exit_id: str) -> None:
+        """把探测判死的出口「翻回可用」（全灭兜底用）：清冷却，不动失败计数。"""
+        state = self._states.get(str(exit_id or ""))
+        if state is None:
+            return
+        state.cooldown_until = 0.0
+        state.last_error = ""
+
     def snapshot(self) -> list[dict[str, Any]]:
         """给 `/admin/upload/probe` 用的只读快照（不含代理凭据）。"""
         now = self._clock()
@@ -502,14 +667,15 @@ class ExitPool:
     # 健康探测
     # ------------------------------------------------------------------
     async def probe(self, exit_id: str, *, token: str = "", account: Any = None) -> bool:
-        """经指定出口 GET 一次上游状态接口，判断出口是否可用。
+        """经指定出口 GET 一次上游轻量接口，判断出口是否可用。
 
-        成功记 `mark_success`，失败记 `mark_failure`（连续失败会进入冷却，从而
-        被 `pick` 跳过）。**永不抛异常**：探测本身失败就是「不可用」。
+        判定口径：**拿到任何 HTTP 响应就算活**（200/401/403/429 都算），只有连不上
+        （ProxyError / 握手失败 / DNS 失败 / 超时）才算死。判死走
+        :meth:`mark_probe_failure`（短冷却、不动失败计数）。**永不抛异常**。
 
         Args:
             exit_id: 出口 id。
-            token: 可选上游 token（`/api/v2/users/status` 需要鉴权）。
+            token: 可选上游 token（探测端点不需要，但带上更接近真实链路）。
             account: 可选账号对象，用它的浏览器指纹发请求（与真实链路一致）。
 
         Returns:
@@ -522,21 +688,31 @@ class ExitPool:
             self._lock = asyncio.Lock()
         async with self._lock:
             try:
-                ok = await self._do_probe(state.url, token=token, account=account)
+                outcome = await self._probe_outcome(
+                    state.url,
+                    token=token,
+                    account=account,
+                    timeout=self.probe_timeout_seconds,
+                )
             except Exception as exc:  # 探测不允许把异常抛给 /admin
                 log.warning(
                     "[UploadExit] probe error exit=%s error=%s",
                     state.exit_id,
                     f"{type(exc).__name__}: {str(exc)[:160]}",
                 )
-                ok = False
-            if ok:
+                outcome = ProbeOutcome(ok=False, reason="connect_failed")
+            if outcome.ok:
                 self.mark_success(state.exit_id)
-                log.info("[UploadExit] probe ok exit=%s", state.exit_id)
+                log.info("[UploadExit] probe ok exit=%s reason=%s", state.exit_id, outcome.reason)
             else:
-                self.mark_failure(state.exit_id, "probe_failed")
-                log.warning("[UploadExit] probe failed exit=%s", state.exit_id)
-            return bool(ok)
+                self.mark_probe_failure(state.exit_id, outcome.reason)
+                log.warning(
+                    "[UploadExit] probe failed exit=%s reason=%s cooldown=%.0fs",
+                    state.exit_id,
+                    outcome.reason,
+                    self.probe_cooldown_seconds,
+                )
+            return bool(outcome.ok)
 
     async def _do_probe(
         self,
@@ -545,13 +721,14 @@ class ExitPool:
         token: str,
         account: Any,
         timeout: float | None = None,
-    ) -> bool:
+    ) -> ProbeOutcome:
         """执行一次探测：优先用注入的假实现（单测），否则发真实请求。"""
         probe_timeout = (
             float(timeout) if timeout is not None and timeout > 0 else self.probe_timeout_seconds
         )
         if self._probe_fetch is not None:
-            return bool(await self._probe_fetch(proxy_url, probe_timeout))
+            # 单测的假探测层历史上只返回 bool，这里归一成结论（True → 有响应）。
+            return _coerce_probe_outcome(await self._probe_fetch(proxy_url, probe_timeout))
         return await self._http_probe(proxy_url, token=token, account=account, timeout=probe_timeout)
 
     async def _http_probe(
@@ -561,8 +738,22 @@ class ExitPool:
         token: str,
         account: Any,
         timeout: float | None = None,
-    ) -> bool:
-        """真实探测：curl_cffi + 该出口代理 GET `/api/v2/users/status`。"""
+    ) -> ProbeOutcome:
+        """真实探测：curl_cffi + 该出口代理 GET `/api/v2/models/`。
+
+        判定：**有任何 HTTP 响应就算出口活着**。`401/403/429/5xx` 是上游的事
+        （鉴权 / 限流 / 上游故障），与「出口 IP 能不能连通」无关；旧实现用
+        `status == 200` 判定，一次 401 就把健康出口打进 600s 冷却（2026-12 事故）。
+
+        Args:
+            proxy_url: 该出口的代理 URL。
+            token: 可选上游 token（探测端点不需要鉴权，带上更贴近真实链路）。
+            account: 可选账号（决定浏览器指纹）。
+            timeout: 单次探测超时（秒）。
+
+        Returns:
+            :class:`ProbeOutcome`；只有连不上时 `ok=False`。
+        """
         from curl_cffi.requests import AsyncSession
 
         from backend.core.browser_fingerprint import fingerprint_for_account
@@ -592,7 +783,22 @@ class ExitPool:
             )
             status = int(getattr(response, "status_code", 0) or 0)
             body = str(getattr(response, "text", "") or "")
-            return status == 200 and not looks_like_waf(body)
+            if status <= 0:
+                # 没有状态码 = 压根没拿到 HTTP 响应。
+                return ProbeOutcome(ok=False, reason="connect_failed", responded=False, status=0)
+            if looks_like_waf(body):
+                # WAF 页也是「网络通」的证据（出口能到上游），只是被记分了；
+                # 记进 last_error 供运维观测，但**不判死**。
+                return ProbeOutcome(
+                    ok=True,
+                    reason=f"waf_page_{status}",
+                    responded=True,
+                    status=status,
+                )
+            return ProbeOutcome(ok=True, reason=f"http_{status}", responded=True, status=status)
+        except Exception as exc:
+            # ProxyError / 握手失败 / DNS 失败 / 读超时 —— 只有这些算出口死。
+            return ProbeOutcome(ok=False, reason=_classify_connect_error(exc), responded=False)
         finally:
             try:
                 await session.close()
@@ -606,8 +812,8 @@ class ExitPool:
         token: str,
         account: Any,
         timeout: float | None = None,
-    ) -> tuple[bool, str]:
-        """探测一次并给出 `(是否可用, 失败原因)`；**永不抛异常**。
+    ) -> ProbeOutcome:
+        """探测一次并给出结论；**永不抛异常**。
 
         Args:
             proxy_url: 该出口的代理 URL。
@@ -616,26 +822,27 @@ class ExitPool:
             timeout: 单次探测超时（秒）。
 
         Returns:
-            `(True, "")` 或 `(False, reason)`；reason ∈
-            `connect_failed` / `probe_failed`。
+            :class:`ProbeOutcome`；连不上时 `ok=False`，reason ∈
+            `CONNECT_FAILURE_REASONS`。
         """
         probe_timeout = (
             float(timeout) if timeout is not None and timeout > 0 else self.probe_timeout_seconds
         )
         try:
-            ok = await asyncio.wait_for(
+            raw = await asyncio.wait_for(
                 self._do_probe(proxy_url, token=token, account=account, timeout=probe_timeout),
                 timeout=probe_timeout,
             )
         except asyncio.TimeoutError:
-            return False, "connect_failed"
+            # 整体超时 = 拿不到响应 = 出口连不上（唯一该判死的情形之一）。
+            return ProbeOutcome(ok=False, reason="probe_timeout")
         except Exception as exc:
             log.debug(
                 "[UploadExit] probe error error=%s",
                 f"{type(exc).__name__}: {str(exc)[:120]}",
             )
-            return False, "connect_failed"
-        return (True, "") if ok else (False, "probe_failed")
+            return ProbeOutcome(ok=False, reason=_classify_connect_error(exc))
+        return _coerce_probe_outcome(raw)
 
     async def probe_all(
         self,
@@ -645,15 +852,20 @@ class ExitPool:
         limit_seconds: float = DEFAULT_PROBE_TOTAL_TIMEOUT_SECONDS,
         only: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """**并发**探测所有出口，失败的立即 `mark_failure`（达阈值即进冷却）。
+        """**限并发**探测所有出口，只把「连不上」的踢进**短**冷却。
 
         启动时调一次：把「已经连不上」的出口提前踢出轮转，后续请求就不会再挨个
         试死出口（生产上 4 个死出口 × 10s ≈ 21s 的白等由此消失）。
 
-        - 并发：`asyncio.gather`，总耗时受 `limit_seconds` 约束（默认 15s）；
-        - 端点：轻量 GET（默认 `/api/v2/users/status`），**绝不打 chat/completions**
-          （会烧额度、招风控）；
-        - 失败即记 `connect_failed` → 连续失败达 `max_failures` 立刻冷却。
+        - 并发：`asyncio.Semaphore(probe_concurrency)`（默认 2）—— socks5h 冷启动
+          握手排队做，6 条隧道同时握手只会互相拖慢；总耗时受 `limit_seconds`
+          约束（默认 45s）；
+        - 端点：轻量 GET `/api/v2/models/`（无需鉴权，实测 200 / 4902B，不触发
+          WAF），**绝不打 chat/completions**（会烧额度、招风控）；
+        - 判定：**有任何 HTTP 响应就算活**；只有连不上才 `mark_probe_failure`
+          （短冷却 120s、不动 `failures`）；
+        - 兜底：**全部出口都探测失败**时按「网络抖动 / 预算不够」处理，全部视为
+          available 并打 WARNING —— 避免探测自身的抖动把整个池子打死。
 
         Args:
             token: 可选上游 token。
@@ -662,7 +874,8 @@ class ExitPool:
             only: 只探测这些出口 id（None 表示全部）。
 
         Returns:
-            每个出口一条结果：`{id, ok, reason, elapsed_seconds, state}`。
+            每个出口一条结果：`{id, ok, reason, elapsed_seconds, state}`；
+            全灭兜底时额外带 `assumed_alive=True`。
         """
         if not self._order:
             return []
@@ -674,8 +887,18 @@ class ExitPool:
         if not targets:
             return []
         budget = max(0.1, float(limit_seconds))
+        # socks5 握手排队做：并发度限制在 2，避免 6 条隧道同时握手互相拖慢。
+        semaphore = asyncio.Semaphore(self.probe_concurrency)
         tasks = [
-            asyncio.ensure_future(self._probe_one(exit_id, token=token, account=account, budget=budget))
+            asyncio.ensure_future(
+                self._probe_one(
+                    exit_id,
+                    token=token,
+                    account=account,
+                    budget=budget,
+                    semaphore=semaphore,
+                )
+            )
             for exit_id in targets
         ]
         try:
@@ -686,9 +909,10 @@ class ExitPool:
                 if not task.done():
                     task.cancel()
             log.warning(
-                "[ExitProbe] budget exhausted budget=%.0fs exits=%s",
+                "[ExitProbe] budget exhausted budget=%.0fs exits=%s concurrency=%s",
                 budget,
                 len(targets),
+                self.probe_concurrency,
             )
             gathered = [
                 {"id": exit_id, "ok": False, "reason": "probe_timeout", "elapsed_seconds": budget, "state": STATE_READY}
@@ -700,6 +924,16 @@ class ExitPool:
                 log.debug("[ExitProbe] probe crashed error=%s", type(item).__name__)
                 continue
             results.append(item)
+        if results and all(not row.get("ok") for row in results):
+            # 全灭兜底：所有出口同时探测失败，更可能是**探测自身**的问题
+            # （网络抖动 / 预算不够 / 代理网关短暂抽风），而不是 6 个出口一起死。
+            # 此时惩罚整个池子会把链路推到直连 → 被 WAF 打死（2026-12 事故）。
+            log.warning("[ExitProbe] all exits failed probe — assuming network blip, keeping pool available")
+            for row in results:
+                self.mark_probe_alive(str(row.get("id", "")))
+                row["ok"] = True
+                row["assumed_alive"] = True
+                row["state"] = STATE_READY
         return results
 
     async def _probe_one(
@@ -709,45 +943,60 @@ class ExitPool:
         token: str,
         account: Any,
         budget: float,
+        semaphore: asyncio.Semaphore | None = None,
     ) -> dict[str, Any]:
-        """探测单个出口并记账（`probe_all` 的 worker）。"""
+        """探测单个出口并记账（`probe_all` 的 worker）。
+
+        Args:
+            exit_id: 出口 id。
+            token: 可选上游 token。
+            account: 可选账号（决定浏览器指纹）。
+            budget: 整批探测的总预算（秒），单出口超时不会超过它。
+            semaphore: 限并发用的信号量（None 表示不限制，单测可省）。
+        """
         state = self._states.get(str(exit_id or ""))
         if state is None:
             return {"id": str(exit_id or ""), "ok": False, "reason": "unknown_exit", "elapsed_seconds": 0.0, "state": STATE_READY}
         started = time.monotonic()
-        ok, reason = await self._probe_outcome(
-            state.url,
-            token=token,
-            account=account,
-            timeout=min(self.probe_timeout_seconds, budget),
-        )
+        timeout = min(self.startup_probe_timeout_seconds, budget)
+        if semaphore is None:
+            outcome = await self._probe_outcome(
+                state.url, token=token, account=account, timeout=timeout
+            )
+        else:
+            # 只有真正发探测的这段被信号量卡住，记账不占并发名额。
+            async with semaphore:
+                outcome = await self._probe_outcome(
+                    state.url, token=token, account=account, timeout=timeout
+                )
         elapsed = max(0.0, time.monotonic() - started)
         connect_ms = elapsed * 1000.0
-        if ok:
+        if outcome.ok:
             self.mark_success(state.exit_id, connect_ms=connect_ms)
-            log.info("[ExitProbe] ok exit=%s %.1fs", state.exit_id, elapsed)
+            log.info("[ExitProbe] ok exit=%s %.1fs reason=%s", state.exit_id, elapsed, outcome.reason)
         else:
-            self.mark_failure(state.exit_id, reason, connect_ms=connect_ms)
+            # 探测判死：**短冷却**、**不动 failures**（探测只是猜测，不该重罚）。
+            self.mark_probe_failure(state.exit_id, outcome.reason, connect_ms=connect_ms)
             cooling = state.cooldown_until > self._clock()
             if cooling:
                 log.warning(
                     "[ExitProbe] dead exit=%s reason=%s → cooldown %.0fs",
                     state.exit_id,
-                    reason,
-                    self.cooldown_seconds,
+                    outcome.reason,
+                    self.probe_cooldown_seconds,
                 )
             else:
                 log.warning(
                     "[ExitProbe] dead exit=%s reason=%s failures=%s/%s",
                     state.exit_id,
-                    reason,
+                    outcome.reason,
                     state.failures,
                     self.max_failures,
                 )
         return {
             "id": state.exit_id,
-            "ok": bool(ok),
-            "reason": reason,
+            "ok": bool(outcome.ok),
+            "reason": outcome.reason,
             "elapsed_seconds": round(elapsed, 3),
             "state": STATE_COOLING if state.cooldown_until > self._clock() else STATE_READY,
         }

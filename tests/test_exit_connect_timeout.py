@@ -9,6 +9,9 @@
 4. `pick()` 优先返回 `last_success_at` 最新的出口；冷却期内跳过、到期恢复。
 5. `/admin/upload/probe` 快照新增 `last_success_at` / `last_failure_at` /
    `avg_connect_ms`。
+6. 探测判定口径（2026-12 事故修复）：宽预算（单出口 20s / 总 45s）、限并发 2、
+   **有 HTTP 响应就算活**（401/403/429/WAF 页都不判死）、判死用 120s 短冷却且
+   不动 `failures`、全灭时兜底为 available + WARNING。
 """
 
 from __future__ import annotations
@@ -328,7 +331,7 @@ class StartupProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(elapsed, 0.5)
 
     async def test_probe_budget_is_capped(self) -> None:
-        """总预算耗尽时按不可用处理，不会挂住整个探测。"""
+        """总预算耗尽时不会挂住整个探测（全灭兜底 → 视为网络抖动，池子保持可用）。"""
 
         async def stuck_fetch(_proxy_url: str, _timeout: float) -> bool:
             await asyncio.sleep(5.0)
@@ -339,7 +342,11 @@ class StartupProbeTests(unittest.IsolatedAsyncioTestCase):
         results = await pool.probe_all(limit_seconds=0.2)
         elapsed = time.monotonic() - started
         self.assertLess(elapsed, 2.0)
-        self.assertTrue(all(not row["ok"] for row in results))
+        self.assertEqual(len(results), 2)
+        # 全灭兜底：全部失败时按「探测自身抖动」处理，不惩罚池子（见需求 4）。
+        self.assertTrue(all(row["ok"] for row in results))
+        self.assertTrue(all(row.get("assumed_alive") for row in results))
+        self.assertTrue(all(row["state"] == STATE_READY for row in pool.snapshot()))
 
     async def test_startup_probe_does_not_block_startup(self) -> None:
         """探测任务不能被 await 在 startup 里：先让出事件循环，探测在后台跑。"""
@@ -477,6 +484,227 @@ class PickPreferenceTests(unittest.TestCase):
         row = pool.snapshot()[0]
         self.assertGreater(row["last_failure_at"], 0)
         self.assertEqual(row["last_success_at"], 0)
+
+
+# ----------------------------------------------------------------------
+# 5. 探测判定口径 + 短冷却 + 全灭兜底 + 限并发（2026-12 事故修复）
+# ----------------------------------------------------------------------
+#: 假指纹：`_http_probe` 只用 `impersonate` / `user_agent` 两个字段
+_STUB_FINGERPRINT = SimpleNamespace(impersonate="chrome", user_agent="UA-probe-test")
+
+#: 探测端点（无需鉴权、不触发 WAF）
+EXPECTED_PROBE_URL = "https://chat.qwen.ai/api/v2/models/"
+
+
+class _StubHttpResponse:
+    def __init__(self, status_code: int, text: str = "") -> None:
+        self.status_code = status_code
+        self.text = text
+
+
+class _StubCurlSession:
+    """替身 `curl_cffi.requests.AsyncSession`：固定返回一个状态码，记录请求。"""
+
+    status_code = 200
+    body = "{}"
+    calls: list[dict] = []
+
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.closed = False
+        _StubCurlSession.calls.append({"kwargs": kwargs})
+
+    async def get(self, url, headers=None, timeout=None):
+        _StubCurlSession.calls[-1].update({"url": url, "headers": headers or {}, "timeout": timeout})
+        return _StubHttpResponse(self.status_code, self.body)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class ProbeJudgementTests(unittest.IsolatedAsyncioTestCase):
+    """需求 1~4：宽预算 + 限并发 + 只看连通性 + 短冷却 + 全灭兜底。"""
+
+    def setUp(self) -> None:
+        _StubCurlSession.calls = []
+        _StubCurlSession.status_code = 200
+        _StubCurlSession.body = "{}"
+
+    async def test_only_connect_failure_exit_cools_and_for_120s(self) -> None:
+        """3 个出口，1 个 ProxyError → 只有它冷却，另 2 个 ready，冷却 120s 不是 600s。"""
+
+        async def fake_fetch(proxy_url: str, _timeout: float) -> bool:
+            if exit_id_from_url(proxy_url) == "Default.c":
+                raise OSError("ProxyError: socks5 connect failed")
+            return True
+
+        pool = ExitPool(
+            [G_EXIT, J_EXIT, C_EXIT],
+            max_failures=1,
+            cooldown_seconds=600,  # 真实请求的重罚：探测**不该**用它
+            probe_cooldown_seconds=120,  # 探测专用短冷却
+            probe_fetch=fake_fetch,
+        )
+        results = await pool.probe_all(limit_seconds=5.0)
+        by_id = {row["id"]: row for row in pool.snapshot()}
+        self.assertEqual(len(results), 3)
+        self.assertEqual(by_id["Default.g"]["state"], STATE_READY)
+        self.assertEqual(by_id["Default.j"]["state"], STATE_READY)
+        self.assertEqual(by_id["Default.c"]["state"], STATE_COOLING)
+        # 冷却时长必须是 120s 量级，绝不能是 600s
+        remaining = by_id["Default.c"]["cooldown_remaining"]
+        self.assertGreater(remaining, 100.0)
+        self.assertLessEqual(remaining, 120.0)
+        dead = [row for row in results if not row["ok"]]
+        self.assertEqual([row["id"] for row in dead], ["Default.c"])
+        self.assertEqual(dead[0]["reason"], "proxy_error")
+
+    async def test_probe_failure_does_not_touch_failure_counter(self) -> None:
+        """探测失败**不增加** `failures`（探测是猜测，不该和真实请求失败累加）。"""
+
+        async def fake_fetch(proxy_url: str, _timeout: float) -> bool:
+            return exit_id_from_url(proxy_url) != "Default.c"
+
+        pool = ExitPool(
+            [G_EXIT, J_EXIT, C_EXIT],
+            max_failures=2,
+            cooldown_seconds=600,
+            probe_fetch=fake_fetch,
+        )
+        await pool.probe_all(limit_seconds=5.0)
+        by_id = {row["id"]: row for row in pool.snapshot()}
+        self.assertEqual(by_id["Default.c"]["failures"], 0)
+        self.assertEqual(by_id["Default.c"]["state"], STATE_COOLING)
+        # 只探测一次也不会因为「达阈值」把计数推上去
+        self.assertEqual(by_id["Default.g"]["failures"], 0)
+
+    async def test_http_403_and_429_count_as_alive(self) -> None:
+        """出口返回 403 / 429 → 判**活**（网络通，是上游在拒绝，不是出口死）。"""
+        for status in (403, 429, 401, 200):
+            _StubCurlSession.calls = []
+            _StubCurlSession.status_code = status
+            pool = ExitPool([G_EXIT], max_failures=1, cooldown_seconds=600)
+            with patch("curl_cffi.requests.AsyncSession", _StubCurlSession), patch(
+                "backend.core.browser_fingerprint.fingerprint_for_account",
+                lambda _account: _STUB_FINGERPRINT,
+            ):
+                self.assertTrue(await pool.probe("Default.g"), f"status={status} 应判活")
+            row = pool.snapshot()[0]
+            self.assertEqual(row["state"], STATE_READY, f"status={status} 不该冷却")
+            self.assertEqual(row["failures"], 0)
+            self.assertEqual(row["last_error"], "")
+            self.assertGreater(row["last_success_at"], 0)
+            # 探测目标是无鉴权的轻量端点
+            self.assertEqual(_StubCurlSession.calls[-1]["url"], EXPECTED_PROBE_URL)
+
+    async def test_waf_page_still_counts_as_alive(self) -> None:
+        """WAF 拼图页也是 HTTP 响应 → 出口网络通，判活（只记 last_error 供观测）。"""
+        _StubCurlSession.status_code = 200
+        _StubCurlSession.body = "<!DOCTYPE html><script>window.__aliyun_waf_aa=1;</script>"
+        pool = ExitPool([G_EXIT], max_failures=1)
+        with patch("curl_cffi.requests.AsyncSession", _StubCurlSession), patch(
+            "backend.core.browser_fingerprint.fingerprint_for_account",
+            lambda _account: _STUB_FINGERPRINT,
+        ):
+            self.assertTrue(await pool.probe("Default.g"))
+        self.assertEqual(pool.snapshot()[0]["state"], STATE_READY)
+
+    async def test_connect_error_is_dead(self) -> None:
+        """真的连不上（ProxyError / DNS / 超时）→ 判死 + 短冷却。"""
+
+        class _ExplodingSession(_StubCurlSession):
+            async def get(self, url, headers=None, timeout=None):
+                del url, headers, timeout
+                raise OSError("Could not resolve host: chat.qwen.ai")
+
+        pool = ExitPool([G_EXIT], max_failures=1, cooldown_seconds=600, probe_cooldown_seconds=120)
+        with patch("curl_cffi.requests.AsyncSession", _ExplodingSession), patch(
+            "backend.core.browser_fingerprint.fingerprint_for_account",
+            lambda _account: _STUB_FINGERPRINT,
+        ):
+            self.assertFalse(await pool.probe("Default.g"))
+        row = pool.snapshot()[0]
+        self.assertEqual(row["state"], STATE_COOLING)
+        self.assertIn(row["last_error"], ("dns_failed", "connect_failed", "proxy_error"))
+        self.assertLessEqual(row["cooldown_remaining"], 120.0)
+        self.assertGreater(row["cooldown_remaining"], 100.0)
+        self.assertEqual(row["failures"], 0)
+
+    async def test_all_exits_failing_keeps_pool_available(self) -> None:
+        """全部探测失败 → 全部 available + WARNING（不惩罚整个池子）。"""
+
+        async def dead_fetch(_proxy_url: str, _timeout: float) -> bool:
+            raise OSError("socks5 connect failed")
+
+        pool = ExitPool(
+            [G_EXIT, J_EXIT, C_EXIT],
+            max_failures=1,
+            cooldown_seconds=600,
+            probe_cooldown_seconds=120,
+            probe_fetch=dead_fetch,
+        )
+        with self.assertLogs("qwen2api.exit_pool", level="WARNING") as captured:
+            results = await pool.probe_all(limit_seconds=5.0)
+        self.assertTrue(any(
+            "[ExitProbe] all exits failed probe" in line and "keeping pool available" in line
+            for line in captured.output
+        ))
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(row["ok"] for row in results))
+        self.assertTrue(all(row.get("assumed_alive") for row in results))
+        by_id = {row["id"]: row for row in pool.snapshot()}
+        for exit_id in ("Default.g", "Default.j", "Default.c"):
+            self.assertEqual(by_id[exit_id]["state"], STATE_READY)
+            self.assertEqual(by_id[exit_id]["failures"], 0)
+        # 池子整体可用：pick() 必须还能挑到出口
+        self.assertIsNotNone(pool.pick())
+
+    async def test_probe_concurrency_is_limited_to_two(self) -> None:
+        """并发度 = 2：fake 层记录同时在跑的探测数，断言 ≤ 2。"""
+        running = 0
+        peak = 0
+
+        async def counting_fetch(_proxy_url: str, _timeout: float) -> bool:
+            nonlocal running, peak
+            running += 1
+            peak = max(peak, running)
+            try:
+                await asyncio.sleep(0.05)
+                return True
+            finally:
+                running -= 1
+
+        exits = [
+            f"socks5h://Default.{suffix}@10.6.6.114:2260"
+            for suffix in ("g", "j", "c", "e", "l", "d")
+        ]
+        pool = ExitPool(exits, probe_fetch=counting_fetch)
+        self.assertEqual(pool.probe_concurrency, 2)
+        results = await pool.probe_all(limit_seconds=10.0)
+        self.assertEqual(len(results), 6)
+        self.assertLessEqual(peak, 2)
+        self.assertGreaterEqual(peak, 1)
+
+    def test_startup_probe_defaults_are_relaxed(self) -> None:
+        """默认预算：单出口 20s / 总 45s / 并发 2 / 探测冷却 120s。"""
+        from backend.services.exit_pool import (
+            DEFAULT_PROBE_COOLDOWN_SECONDS,
+            DEFAULT_PROBE_CONCURRENCY,
+            DEFAULT_PROBE_TOTAL_TIMEOUT_SECONDS,
+            DEFAULT_STARTUP_PROBE_TIMEOUT_SECONDS,
+        )
+
+        self.assertEqual(DEFAULT_STARTUP_PROBE_TIMEOUT_SECONDS, 20.0)
+        self.assertEqual(DEFAULT_PROBE_TOTAL_TIMEOUT_SECONDS, 45.0)
+        self.assertEqual(DEFAULT_PROBE_CONCURRENCY, 2)
+        self.assertEqual(DEFAULT_PROBE_COOLDOWN_SECONDS, 120.0)
+        pool = ExitPool.from_settings(_settings())
+        self.assertIsNotNone(pool)
+        self.assertEqual(pool.startup_probe_timeout_seconds, 20.0)
+        self.assertEqual(pool.probe_concurrency, 2)
+        self.assertEqual(pool.probe_cooldown_seconds, 120.0)
+        # 手工探测超时仍走 UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS（两者不混用）
+        self.assertEqual(pool.probe_timeout_seconds, 10.0)
 
 
 if __name__ == "__main__":

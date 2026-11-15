@@ -278,7 +278,7 @@ class Settings(BaseSettings):
     UPLOAD_EXIT_COOLDOWN_SECONDS: float = float(os.getenv("UPLOAD_EXIT_COOLDOWN_SECONDS", 600))
     # 连续失败多少次把出口投入冷却
     UPLOAD_EXIT_MAX_FAILURES: int = int(os.getenv("UPLOAD_EXIT_MAX_FAILURES", 2))
-    # 单次出口健康探测（GET /api/v2/users/status）超时（秒）
+    # 单次出口健康探测（`/admin/upload/probe` 手工探测）超时（秒）
     UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS: float = float(os.getenv("UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS", 10))
     # ---- 出口连接的「建连阶段」超时（2026-12 生产实测）----
     # 出口随时有若干连不上：旧实现一个死出口要等满整体超时（~10s），`chats/new`
@@ -302,8 +302,17 @@ class Settings(BaseSettings):
         "yes",
         "on",
     )
-    # 启动探测的总耗时上限（秒）：并发探测所有出口，超预算的按不可用处理
-    EXIT_PROBE_TOTAL_TIMEOUT_SECONDS: float = float(os.getenv("EXIT_PROBE_TOTAL_TIMEOUT_SECONDS", 15))
+    # 启动探测的**单出口**超时（秒）：与 UPLOAD_EXIT_PROBE_TIMEOUT_SECONDS 分开配置。
+    # 2026-12 事故：socks5h 冷启动握手 + TLS 要 3~4s，6 个出口挤在 5s 总预算里全部
+    # 超时 → 全判死 → 冷却 600s → 出口池整体不可用 → chats/new 回落直连被 WAF 打死。
+    EXIT_PROBE_TIMEOUT_SECONDS: float = float(os.getenv("EXIT_PROBE_TIMEOUT_SECONDS", 20))
+    # 启动探测的**总**耗时上限（秒）：限并发探测所有出口，超预算的按不可用处理
+    EXIT_PROBE_TOTAL_TIMEOUT_SECONDS: float = float(os.getenv("EXIT_PROBE_TOTAL_TIMEOUT_SECONDS", 45))
+    # 启动探测的并发度：socks5 握手排队做（默认 2），避免 6 条隧道同时握手互相拖慢
+    EXIT_PROBE_CONCURRENCY: int = int(os.getenv("EXIT_PROBE_CONCURRENCY", 2))
+    # **探测**判死后的冷却时长（秒）：探测只是猜测，不套用真实请求的 600s 重罚，
+    # 猜错了 120s 就能自己恢复；同时探测失败不增加主失败计数（failures 不动）。
+    EXIT_PROBE_COOLDOWN_SECONDS: float = float(os.getenv("EXIT_PROBE_COOLDOWN_SECONDS", 120))
     # ---- 建会话（chats/new）走出口池（复用上面的 UPLOAD_EXIT_POOL 出口列表）----
     # 生产故障（2026-12）：出口 IP 被 WAF 记分后 chats/new 返回拼图挑战页，整个网关
     # 变成「No available accounts in pool」。上游会话与出口 IP 绑定，所以建会话用哪个
