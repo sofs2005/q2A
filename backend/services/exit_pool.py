@@ -760,7 +760,11 @@ class ExitPool:
         from backend.services.auth_resolver import BASE_URL
 
         read_timeout = float(timeout) if timeout is not None and timeout > 0 else self.probe_timeout_seconds
-        timeouts = connect_read_timeout(read_timeout, self.connect_timeout_seconds)
+        # 探测走的是 socks5h **冷启动握手**（生产实测 8.2s 才拿到首字节），不能
+        # 套用正常请求的 5s 建连上限：套了就会把 6 个健康出口在启动时全判死
+        # （curl 28 Connection timed out @5.0s，vs 200 @8.2s，2026-12 事故）。
+        # 探测自己的预算（默认 20s）才是它的建连上限。
+        timeouts = connect_read_timeout(read_timeout, read_timeout)
         fingerprint = fingerprint_for_account(account)
         session = AsyncSession(
             impersonate=fingerprint.impersonate,

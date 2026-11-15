@@ -707,5 +707,94 @@ class ProbeJudgementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pool.probe_timeout_seconds, 10.0)
 
 
+# ----------------------------------------------------------------------
+# 7. 探测的建连超时必须用「探测预算」，不能套用正常请求的
+#    `EXIT_CONNECT_TIMEOUT_SECONDS`（2026-12 socks5h 冷启动握手事故）
+# ----------------------------------------------------------------------
+#: 生产实测：socks5h 冷启动握手 + TLS 拿到首字节要 8.2s（curl 28 Connection
+#: timed out @5.0s → 换 20s 预算后 200 @8.2s）。任何小于它秒数的建连上限都会
+#: 把健康出口判死。
+COLD_START_HANDSHAKE_SECONDS = 8.2
+
+
+class ProbeUsesItsOwnConnectBudgetTests(unittest.IsolatedAsyncioTestCase):
+    """探测建连预算 = 探测超时（20s），而不是正常请求的 5s。
+
+    旧实现 `connect_read_timeout(read_timeout, self.connect_timeout_seconds)` 下发
+    `(5, 20)`：出口在 5s 就被掐断 → 6 个健康出口全进冷却，池子形同废掉。
+    """
+
+    def setUp(self) -> None:
+        _StubCurlSession.calls = []
+        _StubCurlSession.status_code = 200
+        _StubCurlSession.body = "{}"
+        # 固定「curl_cffi 支持 timeout 元组」：全量跑测试时能力位可能被别的用例改过。
+        self._capability = patch.object(http_timeout, "_SUPPORTS_TIMEOUT_TUPLE", True)
+        self._capability.start()
+        self._fingerprint = patch(
+            "backend.core.browser_fingerprint.fingerprint_for_account",
+            lambda _account: _STUB_FINGERPRINT,
+        )
+        self._fingerprint.start()
+
+    def tearDown(self) -> None:
+        self._fingerprint.stop()
+        self._capability.stop()
+        http_timeout.reset_capability_cache()
+
+    async def test_probe_timeout_tuple_uses_probe_budget_for_both_parts(self) -> None:
+        """fake 层记录的 timeout 元组两个分量都等于探测超时：`(20, 20)` 而非 `(5, 20)`。"""
+        pool = ExitPool(
+            [G_EXIT],
+            max_failures=1,
+            cooldown_seconds=600,
+            connect_timeout_seconds=5.0,  # 正常请求的建连上限：探测**不许**用它
+            probe_timeout_seconds=20.0,  # 探测自己的预算
+        )
+        with patch("curl_cffi.requests.AsyncSession", _StubCurlSession):
+            self.assertTrue(await pool.probe("Default.g"))
+
+        call = _StubCurlSession.calls[-1]
+        # 会话构造时就下发同一份预算（不靠 get() 覆盖）
+        self.assertEqual(_split_timeout(call["kwargs"]["timeout"]), (20.0, 20.0))
+        # 请求级 timeout 也必须是 (20, 20)
+        self.assertEqual(_split_timeout(call["timeout"]), (20.0, 20.0))
+        self.assertEqual(pool.connect_timeout_seconds, 5.0)  # 没被探测改写
+
+    async def test_probe_survives_five_second_connect_cap(self) -> None:
+        """`EXIT_CONNECT_TIMEOUT_SECONDS=5` + 探测 20s：冷启动握手不被 5s 掐断。"""
+
+        class _ColdStartSession(_StubCurlSession):
+            """按 curl 的行为模拟冷启动：建连预算不足就超时，够就返回 200。"""
+
+            async def get(self, url, headers=None, timeout=None):
+                _StubCurlSession.calls[-1].update({"url": url, "timeout": timeout})
+                connect, _read = _split_timeout(timeout)
+                if connect < COLD_START_HANDSHAKE_SECONDS:
+                    # curl 28：连不上，且只等满建连预算就放弃。
+                    raise OSError("Failed to connect: Connection timed out")
+                return _StubHttpResponse(_StubCurlSession.status_code, _StubCurlSession.body)
+
+        pool = ExitPool(
+            [G_EXIT],
+            max_failures=1,
+            cooldown_seconds=600,
+            connect_timeout_seconds=5.0,
+            probe_timeout_seconds=20.0,
+        )
+        with patch("curl_cffi.requests.AsyncSession", _ColdStartSession):
+            ok = await pool.probe("Default.g")
+
+        self.assertTrue(ok, "探测预算 20s 时冷启动握手必须活下来（旧实现 5s 掐死）")
+        connect_budget, read_budget = _split_timeout(_StubCurlSession.calls[-1]["timeout"])
+        # 只有两个分量都放大到探测预算，8.2s 的握手才可能完成。
+        self.assertGreaterEqual(connect_budget, COLD_START_HANDSHAKE_SECONDS)
+        self.assertGreaterEqual(read_budget, COLD_START_HANDSHAKE_SECONDS)
+        row = pool.snapshot()[0]
+        self.assertEqual(row["state"], STATE_READY)
+        self.assertEqual(row["failures"], 0)
+        self.assertGreater(row["last_success_at"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
