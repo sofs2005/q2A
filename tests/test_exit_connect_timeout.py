@@ -427,13 +427,42 @@ class StartupProbeTests(unittest.IsolatedAsyncioTestCase):
 # 4. pick() 排序 + 冷却 + 观测字段
 # ----------------------------------------------------------------------
 class PickPreferenceTests(unittest.TestCase):
-    def test_pick_prefers_latest_success(self) -> None:
-        pool = ExitPool([G_EXIT, J_EXIT, C_EXIT])
+    def test_pick_spreads_across_proven_exits(self) -> None:
+        # 已证明可用的出口之间要轮转摊开，不能死盯最近成功的那个：
+        # 旧实现取 last_success_at 最大者，生产实测 3 并发全走 Default.r。
+        now = [1000.0]
+        pool = ExitPool([G_EXIT, J_EXIT, C_EXIT], clock=lambda: now[0])
         pool.mark_success("Default.g")
+        now[0] += 1
         pool.mark_success("Default.j")  # 更晚成功
-        self.assertEqual(pool.pick(), J_EXIT)
-        self.assertEqual(pool.pick(), J_EXIT)  # 一直命中同一个，不再从零试错
-        self.assertEqual(pool.pick(), J_EXIT)
+        picks = []
+        for _ in range(4):
+            now[0] += 1
+            picks.append(pool.pick())
+        # c 没成功过 → 不参与；g / j 交替
+        self.assertEqual(picks, [J_EXIT, G_EXIT, J_EXIT, G_EXIT])
+
+    def test_pick_never_tries_unproven_while_proven_available(self) -> None:
+        # 摊开不能以「从零试错死出口」为代价：只要还有 proven 的就不碰未证明的。
+        pool = ExitPool([G_EXIT, J_EXIT, C_EXIT])
+        pool.mark_success("Default.c")
+        for _ in range(5):
+            self.assertEqual(pool.pick(), C_EXIT)
+
+    def test_pick_covers_all_exits_in_one_round(self) -> None:
+        # 生产场景：8 个出口探测全通 → 一轮内应当全部轮到。
+        names = "0r13f8k9"
+        exits = [f"socks5h://Default.{n}@10.6.6.114:2260" for n in names]
+        now = [1000.0]
+        pool = ExitPool(exits, clock=lambda: now[0])
+        for name in names:
+            now[0] += 1
+            pool.mark_success(f"Default.{name}")
+        picked = set()
+        for _ in range(len(names)):
+            now[0] += 1
+            picked.add(pool.pick())
+        self.assertEqual(len(picked), len(names))
 
     def test_pick_rotates_while_nothing_succeeded(self) -> None:
         # 探测还没跑 / 全都没成功过：保持旧轮询语义

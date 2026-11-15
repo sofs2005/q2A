@@ -497,9 +497,11 @@ class ExitPool:
         排序（`prefer_last_success=True`，默认）：
 
         1. 先排除 `exclude`（本轮已试过的）与冷却中的出口（冷却到期的顺手复位）；
-        2. 在剩下的出口里，**优先返回 `last_success_at` 最新的那个** —— 出口一旦
-           证明可用就直接命中它，不再从零试错（生产上 4 个死出口各等 10s 的浪费
-           就出在这里）。同样「最近成功」时退化为轮询，保证负载不会死盯一个出口；
+        2. 在剩下的出口里，先只在**已证明可用**的（`last_success_at > 0`）中间挑，
+           这样不会从零去试错死出口（生产上 4 个死出口各等 10s 的浪费就出在这里）；
+           但内部**按「最久没被挑中」（LRU）轮转**，让并发摊到多个出口上 ——
+           早期实现取 `last_success_at` 最大的那个，结果是死盯单点：生产实测
+           3 个并发请求全走 `Default.r`，峰值吞吐被单个节点卡住；
         3. 从来没过成功的出口（`last_success_at=0`）排在已证明可用的之后，按轮询
            顺序取第一个 —— 探测还没跑完 / 全部不可用时行为与旧版一致。
 
@@ -535,10 +537,16 @@ class ExitPool:
         if self.prefer_last_success:
             proven = [item for item in candidates if item[1].last_success_at > 0.0]
             if proven:
-                # key：最近成功时间最大 → 优先；同时间再按「连续失败更少」→ 轮询。
-                chosen_index, chosen_state = max(
+                # 摊开：proven 集合内按 `last_used_at` 最小（最久没被挑中）轮转。
+                # 平手（都还没被用过）时优先 `last_success_at` 更新的，再按原始
+                # 顺序兜底 —— 保证同样的输入选出同样的出口，测试可复现。
+                chosen_index, chosen_state = min(
                     proven,
-                    key=lambda item: (item[1].last_success_at, -item[1].failures),
+                    key=lambda item: (
+                        item[1].last_used_at,
+                        -item[1].last_success_at,
+                        item[0],
+                    ),
                 )
         self._cursor = (chosen_index + 1) % total
         chosen_state.last_used_at = now
