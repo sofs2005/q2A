@@ -59,8 +59,18 @@ async def token_refresh_loop(app: FastAPI):
 
     上游只认 900s 的 access_token，且该 token 只能由浏览器签发，签发一次要几秒。
     放在后台提前续，避免用户请求打到"token 刚好过期"的窗口上。
+
+    注意：**续签不看 `acc.valid`**。历史上这里写了 `if not acc.valid: continue`，
+    结果一次 401 把账号标成 invalid 之后，自动续签就永久跳过它，只能靠人在
+    管理界面点「验证账号」救回来。判定依据改成「token 是否可用」——token 失效
+    就续，续不上再说；续上了顺便把账号恢复成 valid。
     """
     from backend.services.token_provider import ensure_fresh_token, is_token_usable
+
+    # 每个账号的重试冷却：签发一次要几秒，25 个账号全失败时会把这个循环拖爆，
+    # 失败后按指数退避（最长 30 分钟），成功即清零。
+    retry_at: dict[str, float] = {}
+    retry_delay: dict[str, float] = {}
 
     interval = max(15.0, float(getattr(settings, "QWEN_TOKEN_REFRESH_INTERVAL_SECONDS", 60)))
     while True:
@@ -69,15 +79,41 @@ async def token_refresh_loop(app: FastAPI):
                 pool = getattr(app.state, "account_pool", None)
                 accounts = list(getattr(pool, "accounts", []) or [])
                 changed = False
+                now = asyncio.get_event_loop().time()
                 for acc in accounts:
-                    if not getattr(acc, "valid", False) or not getattr(acc, "password", ""):
+                    email = str(getattr(acc, "email", "") or "")
+                    if not email or not getattr(acc, "password", ""):
                         continue
                     if is_token_usable(getattr(acc, "token", ""), margin=180):
+                        # token 还新鲜：清掉退避状态。注意这里**不**碰 valid，
+                        # 额度耗尽 / 风控封锁的账号 token 也可能是新的。
+                        retry_at.pop(email, None)
+                        retry_delay.pop(email, None)
+                        continue
+                    if now < retry_at.get(email, 0.0):
                         continue
                     token = await ensure_fresh_token(acc)
                     if token:
                         acc.token = token
                         changed = True
+                        retry_at.pop(email, None)
+                        retry_delay.pop(email, None)
+                        # 续签成功即说明账号本身是好的：解除 invalid，否则请求侧
+                        # 仍然会跳过它（与「验证账号」按钮的行为保持一致）。
+                        if not getattr(acc, "valid", False):
+                            acc.valid = True
+                            if str(getattr(acc, "status_code", "")) not in ("rate_limited",):
+                                acc.status_code = "valid"
+                            log.info("[TokenRefresh] %s 续签成功，已恢复为有效账号", email)
+                    else:
+                        delay = min(1800.0, max(interval, retry_delay.get(email, 60.0) * 2))
+                        retry_delay[email] = delay
+                        retry_at[email] = now + delay
+                        log.warning(
+                            "[TokenRefresh] %s 续签失败，%.0fs 后再试（账号未禁用）",
+                            email,
+                            delay,
+                        )
                 if changed and pool is not None:
                     await pool.save()
         except asyncio.CancelledError:
