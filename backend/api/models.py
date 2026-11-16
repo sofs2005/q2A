@@ -1,6 +1,8 @@
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+import time
+
 from backend.api.videos import VIDEO_ENGINE_IDS
 from backend.core.config import MODEL_MAP, resolve_model, settings
 from backend.core.request_logging import new_request_id, request_context
@@ -8,6 +10,47 @@ from backend.services.auth_quota import resolve_auth_context
 from backend.services.qwen_client import QwenClient
 
 router = APIRouter()
+
+# 上游模型列表缓存：`/v1/models` 会被客户端频繁拉取，而列表本身只随上游发版变。
+# 缓存同时避免每次都去占用一个账号的 inflight 名额。
+_UPSTREAM_MODELS_CACHE: dict[str, object] = {"ts": 0.0, "models": []}
+_UPSTREAM_MODELS_TTL = 300.0
+
+
+async def _fetch_upstream_models(client: QwenClient) -> list:
+    """用**账号池里的真实 access_token** 拉上游模型列表。
+
+    历史实现把调用方的 API Key 当作上游 bearer 传给 `list_models`，上游按匿名
+    处理，只回 2 个公开模型（qwen3.7-plus / qwen3.8-max），登录态才可见的
+    qwen4-max 之类永远拿不到——对外表现就是「官网上了新模型，代理列表不更新」。
+    """
+    now = time.time()
+    cached = _UPSTREAM_MODELS_CACHE.get("models") or []
+    if cached and now - float(_UPSTREAM_MODELS_CACHE.get("ts") or 0) < _UPSTREAM_MODELS_TTL:
+        return list(cached)
+
+    pool = getattr(client, "account_pool", None)
+    if pool is None:
+        return []
+
+    acc = None
+    try:
+        acc = await pool.acquire()
+        if acc is None:
+            return []
+        models = await client.list_models(acc.token, account=acc)
+        if models:
+            _UPSTREAM_MODELS_CACHE["ts"] = now
+            _UPSTREAM_MODELS_CACHE["models"] = list(models)
+        return models
+    except Exception:
+        return []
+    finally:
+        if acc is not None:
+            try:
+                pool.release(acc)
+            except Exception:
+                pass
 
 OWNER = "qwen2api"
 
@@ -89,14 +132,10 @@ async def list_models(request: Request):
         users_db = app.state.users_db
         client: QwenClient = app.state.qwen_client
 
-        auth = await resolve_auth_context(request, users_db)
-        token = auth.token
+        await resolve_auth_context(request, users_db)
         upstream_models = []
         if settings.MODELS_USE_UPSTREAM:
-            try:
-                upstream_models = await client.list_models(token)
-            except Exception:
-                upstream_models = []
+            upstream_models = await _fetch_upstream_models(client)
 
         if upstream_models:
             seen: set[str] = set()
