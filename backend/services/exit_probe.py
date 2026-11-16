@@ -162,10 +162,44 @@ async def run_startup_exit_probe(app: Any, settings_obj: Any = None) -> dict[str
 
 
 async def startup_exit_probe_task(app: Any) -> None:
-    """`main.py` 用的后台任务包装：探测异常一律吞掉，绝不打断服务启动。"""
+    """`main.py` 用的后台任务包装：探测异常一律吞掉，绝不打断服务启动。
+
+    语义保持「跑完一轮就结束」（启动路径只探一次，不能被周期性逻辑拖住）。
+    周期性复探用下面的 `exit_probe_loop`。
+    """
     try:
         await run_startup_exit_probe(app)
     except asyncio.CancelledError:
         raise
     except Exception:  # pragma: no cover - 双保险
         log.warning("[ExitProbe] background task crashed", exc_info=True)
+
+
+async def exit_probe_loop(app: Any) -> None:
+    """启动探一轮，之后**周期性复探**。
+
+    历史上出口探测只在启动时跑一次：坏出口冷却到期（默认 600s）会被 `pick()`
+    直接重新启用，但它可能还是坏的——于是每个请求又白等一轮连接超时
+    （生产实测 45 分钟 52 次 `connect_failed`）。周期复探让 `last_success_at`
+    保持新鲜：坏的继续留在冷却里，恢复的立刻可用。
+
+    间隔由 `EXIT_PROBE_INTERVAL_SECONDS` 控制（默认 300s）；设为 <=0 退化为
+    「只探一次」的老行为。
+    """
+    from backend.core.config import settings as settings_obj
+
+    await startup_exit_probe_task(app)
+
+    try:
+        interval = float(getattr(settings_obj, "EXIT_PROBE_INTERVAL_SECONDS", 300) or 0)
+    except (TypeError, ValueError):
+        interval = 300.0
+    if interval <= 0:
+        return
+
+    while True:
+        try:
+            await asyncio.sleep(max(60.0, interval))
+        except asyncio.CancelledError:
+            raise
+        await startup_exit_probe_task(app)

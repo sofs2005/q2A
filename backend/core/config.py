@@ -320,6 +320,10 @@ class Settings(BaseSettings):
     # **探测**判死后的冷却时长（秒）：探测只是猜测，不套用真实请求的 600s 重罚，
     # 猜错了 120s 就能自己恢复；同时探测失败不增加主失败计数（failures 不动）。
     EXIT_PROBE_COOLDOWN_SECONDS: float = float(os.getenv("EXIT_PROBE_COOLDOWN_SECONDS", 120))
+    # 周期性复探间隔（秒）。历史上只在一处启动时探一次，坏出口冷却 600s 到期后
+    # 会被 pick() 直接复用，但它可能还是坏的——每个请求因此白等一轮连接超时。
+    # 默认 300s 复探一次；设为 <=0 退化为「只在启动时探一次」。
+    EXIT_PROBE_INTERVAL_SECONDS: float = float(os.getenv("EXIT_PROBE_INTERVAL_SECONDS", 300))
     # ---- 建会话（chats/new）走出口池（复用上面的 UPLOAD_EXIT_POOL 出口列表）----
     # 生产故障（2026-12）：出口 IP 被 WAF 记分后 chats/new 返回拼图挑战页，整个网关
     # 变成「No available accounts in pool」。上游会话与出口 IP 绑定，所以建会话用哪个

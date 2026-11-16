@@ -92,8 +92,12 @@ class DeleteChatWafHealTests(unittest.IsolatedAsyncioTestCase):
         with patch("backend.services.qwen_client.get_session", AsyncMock(return_value=session)), \
              patch("backend.services.qwen_client.WafCookieManager") as waf_cls:
             waf_cls.get_instance.return_value = manager
-            with self.assertRaises(RuntimeError):
-                await client.delete_chat("tok", "chat123", account=account)
+            # 行为变更：清理动作失败不再抛异常。调用方全是 fire-and-forget，
+            # 抛出只会产生 "Task exception was never retrieved" 堆栈噪音，
+            # 而出口抖动时每个请求收尾都要白等一轮超时。返回 False 让调用方
+            # 可以忽略，也不影响 cleanup 流程。
+            result = await client.delete_chat("tok", "chat123", account=account)
+            self.assertFalse(result)
 
         self.assertEqual(session.request.call_count, 2)
 

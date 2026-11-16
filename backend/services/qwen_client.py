@@ -686,9 +686,14 @@ class QwenClient:
         if res["status"] in (200, 204) and not self._looks_like_waf_challenge(res["status"], res["body"]):
             # 会话已删：绑定随之失效，避免表里留下永远用不到的表项。
             self.forget_chat_exit(chat_id)
-            return
+            return True
+        # 清理失败不该冒泡：调用方是 fire-and-forget（asyncio.create_task），
+        # 抛出只会产生 "Task exception was never retrieved" 堆栈噪音——而出口
+        # 抖动时每个请求收尾都要在坏出口上白等一轮超时。记一条 warning、
+        # 丢弃该 chat 的出口绑定（下次重新选出口），然后正常返回。
         log.warning("[delete_chat] failed email=%s chat_id=%s status=%s body=%s", getattr(account, "email", ""), chat_id, res["status"], res["body"][:120])
-        raise RuntimeError(f"HTTP {res['status']}: {res['body'][:120]}")
+        self.forget_chat_exit(chat_id)
+        return False
 
     async def list_chats(self, token: str, limit: int = 50, account: Account | None = None) -> list[dict]:
         res = await self._request_json("GET", f"/api/v2/chats?limit={int(limit)}", token, timeout=20.0, account=account, retry_waf=True)
