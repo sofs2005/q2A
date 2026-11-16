@@ -158,29 +158,27 @@ class ContextOffloader:
         return "\n".join([TOOLS_CONTEXT_TITLE, TOOLS_CONTEXT_SUMMARY, "", "\n\n".join(tool_blocks), ""])
 
     def _calculate_dynamic_inline_threshold(self, total_chars: int) -> int:
-        """Calculate a dynamic inline threshold that scales with conversation size.
+        """内联阈值：只要总量没超过内联硬上限，就直接内联。
 
-        Uses deterministic hash-based jitter instead of random jitter to ensure
-        identical inputs always produce identical offload decisions.
+        历史实现在 `[10000, 50000]` 区间做线性插值到 `CONTEXT_INLINE_MAX_CHARS`，
+        插值太慢：15K 的历史只把阈值抬到 ~9K，于是「明明在 16K 预算之内」也被
+        判成需要走文件上传。而上传通道一旦不可用（被 WAF 挡），就会退化成硬
+        截断——上下文白丢，用户体感是「模型忘了前面说过什么」。
+
+        offload（把历史/工具描述写成文件再上传）只在总量超过内联硬上限时才有
+        意义，所以这里改成：`total_chars <= max_threshold` 时阈值就等于总量。
         """
-        base_threshold = 8000
-        max_threshold = self.settings.CONTEXT_INLINE_MAX_CHARS
-
-        if total_chars <= 10000:
-            base = base_threshold
-        elif total_chars >= 50000:
-            base = max_threshold
-        else:
-            scale = (total_chars - 10000) / (50000 - 10000)
-            base = int(base_threshold + scale * (max_threshold - base_threshold))
-
-        # Deterministic jitter based on content size hash (+/- 15%)
-        jitter_hash = int(hashlib.md5(str(total_chars).encode()).hexdigest()[:8], 16)
-        jitter_range = max(1, int(base * 0.15))
-        jitter = (jitter_hash % (2 * jitter_range + 1)) - jitter_range
-        result = base + jitter
-
-        return max(base_threshold, min(max_threshold, result))
+        try:
+            max_threshold = int(getattr(self.settings, "CONTEXT_INLINE_MAX_CHARS", 0) or 0)
+        except (TypeError, ValueError):
+            max_threshold = 0
+        # 配置缺失（0/负数）时退回历史默认值；配置显式给出的值一律尊重——
+        # 单测会用 80 这种小值来覆盖 offload 分支。
+        if max_threshold <= 0:
+            max_threshold = 8000
+        if total_chars <= max_threshold:
+            return max(int(total_chars), 1)
+        return max_threshold
 
     def plan(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, client_profile: str = "") -> ContextOffloadPlan:
         estimated = self.estimate_prompt_len(messages, tools=tools, client_profile=client_profile)
