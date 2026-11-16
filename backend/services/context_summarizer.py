@@ -115,7 +115,10 @@ _DEFAULTS: dict[str, Any] = {
     "CONTEXT_SUMMARY_THRESHOLD_CHARS": 8000,
     "CONTEXT_SUMMARY_MAX_SOURCE_CHARS": 24000,
     "CONTEXT_SUMMARY_TARGET_CHARS": 2000,
-    "CONTEXT_SUMMARY_TIMEOUT_SECONDS": 60.0,
+    "CONTEXT_SUMMARY_TIMEOUT_SECONDS": 20.0,
+    # 同一份历史摘要失败后的冷却秒数：失败必然是回退截断，等 60s 再重试
+    # 只是让每个请求都白等一轮（生产实测 1 小时 10 次 × 60s = 10 分钟纯等待）。
+    "CONTEXT_SUMMARY_FAIL_COOLDOWN_SECONDS": 300.0,
     "CONTEXT_SUMMARY_CACHE_TTL_SECONDS": 1800.0,
     "CONTEXT_SUMMARY_CACHE_MAX_ENTRIES": 256,
 }
@@ -385,6 +388,8 @@ class ContextSummarizer:
         self.settings = settings_obj if settings_obj is not None else default_settings
         # key -> (summary, created_at_monotonic)；OrderedDict 用作 LRU。
         self._cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
+        # key -> 失败时刻；冷却期内同一份历史不再尝试摘要，直接回退截断。
+        self._fail_cache: dict[str, float] = {}
         self.stats: dict[str, int] = {"hits": 0, "misses": 0, "sets": 0, "failures": 0}
 
     # ------------------------------------------------------------------
@@ -464,9 +469,37 @@ class ContextSummarizer:
             self._cache.popitem(last=False)
         self.stats["sets"] += 1
 
+    def fail_cooldown_seconds(self) -> float:
+        """摘要失败后的冷却时长（秒）；`<= 0` 表示每次都重试。"""
+        return _as_float(
+            self._cfg("CONTEXT_SUMMARY_FAIL_COOLDOWN_SECONDS"),
+            float(_DEFAULTS["CONTEXT_SUMMARY_FAIL_COOLDOWN_SECONDS"]),
+        )
+
+    def _fail_blocked(self, key: str) -> bool:
+        """该 key 是否还在失败冷却期内。"""
+        ts = self._fail_cache.get(key)
+        if ts is None:
+            return False
+        if (time.monotonic() - ts) > self.fail_cooldown_seconds():
+            self._fail_cache.pop(key, None)
+            return False
+        return True
+
+    def _fail_set(self, key: str) -> None:
+        """标记一次失败，冷却期内不再重试（有界，按缓存上限裁剪）。"""
+        if self.fail_cooldown_seconds() <= 0:
+            return
+        self._fail_cache[key] = time.monotonic()
+        limit = max(8, self.cache_max_entries())
+        while len(self._fail_cache) > limit:
+            oldest = min(self._fail_cache.items(), key=lambda kv: kv[1])[0]
+            self._fail_cache.pop(oldest, None)
+
     def clear_cache(self) -> None:
         """清空缓存（管理接口 / 单测用）。"""
         self._cache.clear()
+        self._fail_cache.clear()
 
     def cache_size(self) -> int:
         """当前缓存条目数。"""
@@ -520,6 +553,13 @@ class ContextSummarizer:
         source, omitted = clip_history_source(source_text, limit)
         key = self._cache_key(source, model_name, target)
         cached = self._cache_get(key)
+        if cached is None and self._fail_blocked(key):
+            # 同一份历史刚失败过：冷却期内直接回退截断，别再白等一轮超时。
+            log.info(
+                "[ContextSummary] skipped reason=recent_failure original=%d",
+                len(source_text),
+            )
+            return None
         if cached is not None:
             log.info(
                 "[ContextSummary] ok original=%d summary=%d model=%s cached=true elapsed=%.1fs summary_preview=%s",
@@ -548,6 +588,7 @@ class ContextSummarizer:
             raise
         except asyncio.TimeoutError:
             self.stats["failures"] += 1
+            self._fail_set(key)
             log.warning(
                 "[ContextSummary] failed reason=timeout(%.0fs) → fallback truncate original=%d",
                 timeout,
@@ -556,6 +597,7 @@ class ContextSummarizer:
             return None
         except Exception as exc:  # noqa: BLE001 - 摘要失败一律降级，绝不冒泡
             self.stats["failures"] += 1
+            self._fail_set(key)
             log.warning(
                 "[ContextSummary] failed reason=%s → fallback truncate original=%d",
                 f"{type(exc).__name__}: {str(exc)[:160]}",
@@ -566,6 +608,7 @@ class ContextSummarizer:
         summary = trim_summary(raw, target)
         if not summary:
             self.stats["failures"] += 1
+            self._fail_set(key)
             log.warning(
                 "[ContextSummary] failed reason=empty_response → fallback truncate original=%d",
                 len(source_text),
@@ -576,6 +619,7 @@ class ContextSummarizer:
             # 源文本上千字符却只摘要出十几个字符：这是上游噪声，不是摘要。
             # 塞进 prompt 等于把上下文清空 —— 宁可用硬截断的原文。
             self.stats["failures"] += 1
+            self._fail_set(key)
             log.warning(
                 "[ContextSummary] failed reason=summary too short summary=%d min=%d original=%d summary_preview=%s → fallback truncate",
                 len(summary),
