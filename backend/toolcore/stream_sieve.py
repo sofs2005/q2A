@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import functools
 import re
 from typing import Any
@@ -13,6 +14,186 @@ TOOL_START_MARKERS = ('{"name":', '<tool_call>', '##tool_call##', 'tool_call##',
 LEGACY_HOLD_CHARS = max(len(marker) for marker in TOOL_START_MARKERS) - 1
 MAX_CAPTURE_CHARS = 64 * 1024
 FENCE_PASSTHROUGH_HOLD_CHARS = 32
+
+# --- Capture-phase throttling -------------------------------------------------
+# Re-parsing the whole capture buffer on every delta is O(n^2) in the length of
+# the tool-call payload (16 KB of arguments arrives as ~2000 deltas). The sieve
+# therefore only runs the expensive ``_consume_capture`` when the buffer *may*
+# have become parseable:
+#   * it is still small (cheap to parse, keeps small calls bit-for-bit identical)
+#   * a closing marker showed up in the not-yet-scanned part of the buffer
+#   * the buffer grew a lot since the last attempt (safety net / progress)
+CAPTURE_ALWAYS_PARSE_CHARS = 512
+CAPTURE_REPARSE_GROWTH = 512
+CAPTURE_PROBE_OVERLAP = 32
+
+# Below this many buffered characters the sieve always runs inline: a
+# ``asyncio.to_thread`` hop costs more than the parse itself.
+SIEVE_OFFLOAD_MIN_CHARS = 2048
+
+# Closing markers that can make a capture parseable.  The DSML entries are a
+# superset of ``_has_tool_calls_close_hint`` (they also cover the ``toolcall`` /
+# ``tool-calls`` spellings accepted by ``markup_scan._canonicalize_tag_name``).
+DSML_PROBE_HINTS = (
+    "</|dsml|tool_calls",
+    "<|/dsml|tool_calls",
+    "<|/dsml|/tool_calls",
+    "</tool_calls",
+    "</|dsml|toolcall",
+    "</|dsml|tool-calls",
+    "<|/dsml|toolcall",
+)
+DSML_LIKE_MARKERS = ("<|dsml|", "</|dsml|", "<|/dsml|")
+KV_LIKE_MARKERS = ("function.name:", "function.arguments:")
+
+
+def _compact_for_probe(text: str) -> str:
+    """Normalise *text* exactly the way ``_has_tool_calls_close_hint`` does.
+
+    ``fold``, ``lower`` and whitespace removal are all per-character
+    operations, so ``_compact_for_probe(a + b) == _compact_for_probe(a) +
+    _compact_for_probe(b)`` — which lets the sieve maintain it incrementally.
+    """
+    folded = text.translate(DSML_CLOSE_HINT_TRANSLATION).replace("\x02", "|").lower()
+    if not folded:
+        return ""
+    return "".join(ch for ch in folded if not ch.isspace())
+
+
+class _CaptureProbe:
+    """Incremental, O(delta)-per-chunk "is the capture parseable yet?" probe.
+
+    Tracks the derived views of ``ToolStreamSieve.capture`` that closing-marker
+    detection needs, plus how far those views have already been scanned, so a
+    delta is never re-examined by the next probe.
+    """
+
+    __slots__ = (
+        "_compact",
+        "_lower",
+        "_length",
+        "_scan_pos",
+        "_compact_scan_pos",
+        "_last_parse_len",
+        "_dsml_like",
+        "_json_like",
+        "_kv_like",
+        "_markup_like",
+        "_force",
+    )
+
+    def __init__(self) -> None:
+        self._compact = ""
+        self._lower = ""
+        self._length = 0
+        self._scan_pos = 0
+        self._compact_scan_pos = 0
+        self._last_parse_len = 0
+        self._dsml_like = False
+        self._json_like = False
+        self._kv_like = False
+        self._markup_like = False
+        self._force = True
+
+    def reset(self, capture: str = "") -> None:
+        """Forget all state; the next probe attempt always parses once."""
+        self._compact = ""
+        self._lower = ""
+        self._length = 0
+        self._scan_pos = 0
+        self._compact_scan_pos = 0
+        self._last_parse_len = 0
+        self._dsml_like = False
+        self._json_like = False
+        self._kv_like = False
+        self._markup_like = False
+        self._force = True
+        if capture:
+            self.append(capture)
+
+    def append(self, delta: str) -> None:
+        """Absorb *delta* (the newest slice of the capture buffer)."""
+        if not delta:
+            return
+
+        if self._length == 0:
+            head = delta.lstrip()
+            if head:
+                first = head[0]
+                folded_first = first.translate(DSML_CLOSE_HINT_TRANSLATION)
+                if folded_first == "<":
+                    self._markup_like = True
+                elif first == "{":
+                    self._json_like = True
+
+        self._length += len(delta)
+        self._compact += _compact_for_probe(delta)
+        self._lower += delta.lower()
+
+        if not self._dsml_like:
+            window = self._compact[max(0, len(self._compact) - len(delta) - CAPTURE_PROBE_OVERLAP):]
+            if any(marker in window for marker in DSML_LIKE_MARKERS):
+                self._dsml_like = True
+                self._markup_like = True
+        if not self._kv_like:
+            window = self._lower[max(0, len(self._lower) - len(delta) - CAPTURE_PROBE_OVERLAP):]
+            if any(marker in window for marker in KV_LIKE_MARKERS):
+                self._kv_like = True
+
+    def should_parse(self, capture: str) -> bool:
+        """Return True when ``_consume_capture`` is worth running for *capture*.
+
+        Consumes the pending "must parse" flag, so call it exactly once per
+        delta.
+        """
+        forced = self._force
+        self._force = False
+        return forced or self.would_parse(capture)
+
+    def would_parse(self, capture: str, pending_delta: str = "") -> bool:
+        """Pure predicate: would :meth:`should_parse` run for this capture?
+
+        *pending_delta* is treated as if it had already been appended, which
+        lets callers decide whether to offload the work before mutating state.
+        """
+        if self._force:
+            return True
+
+        length = len(capture) + len(pending_delta)
+        if length > MAX_CAPTURE_CHARS:
+            return True
+        if length <= CAPTURE_ALWAYS_PARSE_CHARS:
+            return True
+        if length - self._last_parse_len >= CAPTURE_REPARSE_GROWTH:
+            return True
+
+        delta_lower = pending_delta.lower() if pending_delta else ""
+        lower_window = max(0, self._scan_pos - CAPTURE_PROBE_OVERLAP)
+        lower_tail = self._lower[lower_window:] + delta_lower
+        if "</tool_call" in lower_tail or "##end_call##" in lower_tail:
+            return True
+
+        compact_window = max(0, self._compact_scan_pos - CAPTURE_PROBE_OVERLAP)
+        compact_tail = self._compact[compact_window:]
+        if pending_delta:
+            compact_tail += _compact_for_probe(pending_delta)
+        if any(hint in compact_tail for hint in DSML_PROBE_HINTS):
+            return True
+
+        if self._json_like and ("}" in lower_tail or "]" in lower_tail):
+            return True
+        if self._kv_like and "\n" in lower_tail:
+            return True
+        if self._markup_like and ">" in lower_tail:
+            return True
+        return False
+
+    def mark_parsed(self, capture: str) -> None:
+        """Record that *capture* was just parsed (advance the scan cursors)."""
+        self._last_parse_len = len(capture)
+        self._scan_pos = len(capture)
+        self._compact_scan_pos = len(self._compact)
+
 FENCE_OPEN_RE = re.compile(r"(?m)^[ \t]*(```+|~~~+)[^\n]*(?:\n|$)")
 DSML_CONTROL_START_RE = re.compile(
     r"[<＜﹤〈]\s*/?\s*[|！、␂]\s*/?\s*DSML\s*[|！、␂]",
@@ -74,7 +255,12 @@ def _markdown_code_spans(text: str) -> list[tuple[int, int]]:
 
     fence_spans = list(spans)
     pos = 0
-    while pos < len(text):
+    length = len(text)
+    while pos < length:
+        # Jump straight to the next backtick instead of probing every char.
+        pos = text.find("`", pos)
+        if pos < 0:
+            break
         skipped = False
         for start, end in fence_spans:
             if start <= pos < end:
@@ -86,20 +272,17 @@ def _markdown_code_spans(text: str) -> list[tuple[int, int]]:
         if text.startswith("``", pos):
             end = text.find("``", pos + 2)
             if end == -1 or "\n" in text[pos:end + 2]:
-                spans.append((pos, len(text)))
+                spans.append((pos, length))
                 break
             spans.append((pos, end + 2))
             pos = end + 2
             continue
-        elif text[pos] == "`":
-            end = text.find("`", pos + 1)
-            if end == -1 or "\n" in text[pos:end + 1]:
-                spans.append((pos, len(text)))
-                break
-            spans.append((pos, end + 1))
-            pos = end + 1
-            continue
-        pos += 1
+        end = text.find("`", pos + 1)
+        if end == -1 or "\n" in text[pos:end + 1]:
+            spans.append((pos, length))
+            break
+        spans.append((pos, end + 1))
+        pos = end + 1
     return spans
 
 
@@ -143,9 +326,10 @@ def _unclosed_markdown_code_start(text: str) -> int:
     return -1
 
 
-def _find_legacy_tool_start(text: str) -> int:
+def _find_legacy_tool_start(text: str, ignored: list[tuple[int, int]] | None = None) -> int:
     lowered = text.lower()
-    ignored = _markdown_code_spans(text)
+    if ignored is None:
+        ignored = _markdown_code_spans(text)
     positions: list[int] = []
     for marker in TOOL_START_MARKERS:
         pos = lowered.find(marker)
@@ -173,6 +357,20 @@ class ToolStreamSieve:
         self.capturing = False
         self.dropping_dsml_remainder = False
         self.fenced_passthrough_fence: str | None = None
+        self._probe = _CaptureProbe()
+
+    def _drop_overlong_capture(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Apply the ``MAX_CAPTURE_CHARS`` overflow policy to the capture buffer."""
+        if len(self.capture) <= MAX_CAPTURE_CHARS:
+            return events
+        if self._is_dsml_capture(self.capture):
+            self.dropping_dsml_remainder = True
+        else:
+            events.append({"type": "content", "text": self.capture})
+        self.capture = ""
+        self.capturing = False
+        self._probe.reset()
+        return events
 
     def process_chunk(self, chunk: str) -> list[dict[str, Any]]:
         if not chunk:
@@ -182,6 +380,32 @@ class ToolStreamSieve:
 
         self.pending += chunk
         return self._drain_pending()
+
+    def _offload_needed(self, chunk: str) -> bool:
+        """Whether *chunk* will trigger work heavy enough to leave the loop."""
+        buffered = len(self.pending) + len(chunk)
+        if not self.capturing:
+            # Outside a capture the cost is bounded by the buffered text.
+            return buffered >= SIEVE_OFFLOAD_MIN_CHARS
+        if len(self.capture) + buffered < SIEVE_OFFLOAD_MIN_CHARS:
+            return False
+        return self._probe.would_parse(self.capture, self.pending + chunk)
+
+    async def process_chunk_async(self, chunk: str) -> list[dict[str, Any]]:
+        """Awaitable :meth:`process_chunk` that keeps heavy parses off the loop.
+
+        A sieve instance is stateful, so callers must await one call at a time
+        (the streaming loop in ``runtime.execution`` does exactly that).
+        """
+        if self._offload_needed(chunk):
+            return await asyncio.to_thread(self.process_chunk, chunk)
+        return self.process_chunk(chunk)
+
+    async def flush_async(self) -> list[dict[str, Any]]:
+        """Awaitable :meth:`flush`; offloads only when the tail is big."""
+        if len(self.capture) + len(self.pending) >= SIEVE_OFFLOAD_MIN_CHARS:
+            return await asyncio.to_thread(self.flush)
+        return self.flush()
 
     def _drain_pending(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -194,18 +418,19 @@ class ToolStreamSieve:
                 continue
 
             if self.capturing:
-                self.capture += self.pending
+                delta = self.pending
+                self.capture += delta
                 self.pending = ""
+                if delta:
+                    self._probe.append(delta)
+                if not self._probe.should_parse(self.capture):
+                    # Throttled: nothing can have become parseable yet, so the
+                    # whole-capture re-parse is skipped for this delta.
+                    return self._drop_overlong_capture(events)
                 prefix, calls, suffix, ready = self._consume_capture()
                 if not ready:
-                    if len(self.capture) > MAX_CAPTURE_CHARS:
-                        if self._is_dsml_capture(self.capture):
-                            self.dropping_dsml_remainder = True
-                        else:
-                            events.append({"type": "content", "text": self.capture})
-                        self.capture = ""
-                        self.capturing = False
-                    return events
+                    self._probe.mark_parsed(self.capture)
+                    return self._drop_overlong_capture(events)
                 if prefix:
                     events.append({"type": "content", "text": prefix})
                 if calls:
@@ -213,6 +438,7 @@ class ToolStreamSieve:
                 self.pending = suffix
                 self.capture = ""
                 self.capturing = False
+                self._probe.reset()
                 if not self.pending:
                     return events
                 continue
@@ -225,6 +451,7 @@ class ToolStreamSieve:
                 self.capture = self.pending[start:]
                 self.pending = ""
                 self.capturing = True
+                self._probe.reset(self.capture)
                 continue
 
             fenced = _unclosed_fenced_code(self.pending)
@@ -306,6 +533,7 @@ class ToolStreamSieve:
             self.pending = ""
         self.fenced_passthrough_fence = None
         self.dropping_dsml_remainder = False
+        self._probe.reset()
         return events
 
     def _is_dsml_capture(self, text: str) -> bool:
@@ -332,7 +560,7 @@ class ToolStreamSieve:
                 break
             dsml_start = DSML_CONTROL_START_RE.search(scan_text, dsml_start.end())
 
-        legacy_start = _find_legacy_tool_start(scan_text)
+        legacy_start = _find_legacy_tool_start(scan_text, ignored)
         if legacy_start >= 0:
             positions.append(legacy_start)
         return min(positions) if positions else -1

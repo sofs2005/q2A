@@ -569,7 +569,7 @@ async def collect_completion_run(
     upstream_error_details = ""
     upstream_usage: dict[str, Any] | None = None
 
-    def _finalize_result(*, reason: str | None = None) -> RuntimeExecutionResult:
+    async def _finalize_result(*, reason: str | None = None) -> RuntimeExecutionResult:
         nonlocal final_tool_sieve_events
         answer_text = "".join(answer_fragments)
         reasoning_text = "".join(reasoning_fragments)
@@ -584,7 +584,11 @@ async def collect_completion_run(
         if tool_sieve and not native_tool_calls:
             update_request_context(stream_stage="final_tool_sieve_flush")
             flush_started = time.perf_counter()
-            flush_events = final_tool_sieve_events if final_tool_sieve_events is not None else tool_sieve.flush()
+            flush_events = (
+                final_tool_sieve_events
+                if final_tool_sieve_events is not None
+                else await tool_sieve.flush_async()
+            )
             flush_elapsed = time.perf_counter() - flush_started
             if flush_elapsed > settings.DIAGNOSTIC_SLOW_STEP_SECONDS:
                 log.warning(
@@ -799,7 +803,7 @@ async def collect_completion_run(
                     upstream_error_code,
                     upstream_error_details,
                 )
-                return _finalize_result(reason=f"upstream_error:{upstream_error_code}")
+                return await _finalize_result(reason=f"upstream_error:{upstream_error_code}")
             if evt_type != "delta":
                 continue
 
@@ -836,7 +840,9 @@ async def collect_completion_run(
                 if tool_sieve:
                     update_request_context(stream_stage="tool_sieve")
                     sieve_started = time.perf_counter()
-                    sieve_events = tool_sieve.process_chunk(content)
+                    # 大 capture 的解析放到线程里跑，避免卡住事件循环
+                    # （sieve 有状态，这里逐个 await，天然串行）。
+                    sieve_events = await tool_sieve.process_chunk_async(content)
                     sieve_elapsed = time.perf_counter() - sieve_started
                     if sieve_elapsed > settings.DIAGNOSTIC_SLOW_STEP_SECONDS:
                         warning_count = slow_step_warning_counts.get("tool_sieve", 0)
@@ -870,7 +876,7 @@ async def collect_completion_run(
                                 } for call in calls]
                                 native_tool_calls.extend(detected_calls)
                                 if on_delta is not None:
-                                    for flush_evt in tool_sieve.flush():
+                                    for flush_evt in await tool_sieve.flush_async():
                                         if flush_evt.get("type") == "content":
                                             safe_text = str(flush_evt.get("text") or "")
                                             if safe_text:
@@ -879,7 +885,7 @@ async def collect_completion_run(
                                     "[Collect] ✓ Tool Sieve 实时检测到工具调用: tools=%s",
                                     [c.get("name") for c in detected_calls],
                                 )
-                                return _finalize_result(reason="tool_sieve_detected")
+                                return await _finalize_result(reason="tool_sieve_detected")
                 else:
                     await _emit_delta(evt, content, None, stage="answer_passthrough")
 
@@ -904,7 +910,7 @@ async def collect_completion_run(
                                 answer_chunk_count,
                             )
                         if blocked_tool_names:
-                            return _finalize_result(reason=f"blocked_tool_name:{blocked_tool_names[0]}")
+                            return await _finalize_result(reason=f"blocked_tool_name:{blocked_tool_names[0]}")
                     if "##TOOL_CALL##" in content or "<tool_call>" in content:
                         if answer_text is None:
                             answer_text = "".join(answer_fragments)
@@ -924,7 +930,7 @@ async def collect_completion_run(
                                 answer_chunk_count,
                             )
                         if directive.stop_reason == "tool_use":
-                            return _finalize_result(reason="textual_tool_use")
+                            return await _finalize_result(reason="textual_tool_use")
                 continue
 
             if phase == "tool_call":
@@ -937,11 +943,11 @@ async def collect_completion_run(
                     completed_calls = normalize_streamed_tool_calls(completed_calls, request.tool_names)
                     native_tool_calls.extend(completed_calls)
                     await _emit_delta(evt, None, completed_calls, stage="native_tool_call")
-                    return _finalize_result(reason="native_tool_use")
+                    return await _finalize_result(reason="native_tool_use")
 
         if tool_sieve:
             update_request_context(stream_stage="tool_sieve_flush")
-            final_tool_sieve_events = tool_sieve.flush()
+            final_tool_sieve_events = await tool_sieve.flush_async()
             has_flushed_tool_call = any(
                 evt.get("type") == "tool_calls" and evt.get("calls")
                 for evt in final_tool_sieve_events
@@ -953,7 +959,7 @@ async def collect_completion_run(
                         if safe_text:
                             await _emit_delta({"phase": "answer"}, safe_text, None, stage="tool_sieve_flush")
 
-        return _finalize_result(reason="stream_end")
+        return await _finalize_result(reason="stream_end")
     except Exception:
         if acc is not None:
             await cleanup_runtime_resources(client, acc, chat_id)

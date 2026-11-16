@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import bisect
 import re
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -46,15 +48,25 @@ _FULLWIDTH_TABLE = str.maketrans({
     '！': '|',   # ！ FULLWIDTH EXCLAMATION MARK
     '、': '|',   # 、 IDEOGRAPHIC COMMA
     '␂': '|',   # ␂ SYMBOL FOR START OF TEXT
+    # STX (0x02) is also a DSML separator — map it to pipe (fused into the
+    # single-pass table so no second scan over the whole string is needed).
+    '\x02': '|',
 })
 
 
 def _fold(text: str) -> str:
-    """Fold fullwidth/CJK characters to their ASCII equivalents."""
-    folded = text.translate(_FULLWIDTH_TABLE)
-    # STX (0x02) is also a DSML separator — map it to pipe.
-    folded = folded.replace('\x02', '|')
-    return folded
+    """Fold fullwidth/CJK characters to their ASCII equivalents.
+
+    Every mapping is one code point to one code point, so the folded string
+    always has the same length as the input and positions map 1:1. Callers
+    rely on that to index both strings with the same offsets.
+    """
+    return text.translate(_FULLWIDTH_TABLE)
+
+
+# Characters that terminate tag-name scanning inside ``_parse_tag``: a quote
+# opens/closes an attribute value, ``>`` ends the tag.
+_QUOTE_OR_GT_RE = re.compile(r"[\"'>]")
 
 
 # ---------------------------------------------------------------------------
@@ -236,12 +248,19 @@ def _find_fenced_code_spans(text: str) -> list[tuple[int, int]]:
 
 
 def _find_inline_code_spans(text: str) -> list[tuple[int, int]]:
-    """Return single-line inline code spans for one or two backticks."""
+    """Return single-line inline code spans for one or two backticks.
+
+    Candidate positions are located with ``str.find`` (C speed) instead of
+    walking the string one character at a time.
+    """
     spans: list[tuple[int, int]] = []
     pos = 0
     length = len(text)
 
     while pos < length:
+        pos = text.find('`', pos)
+        if pos < 0:
+            break
         if text.startswith('``', pos):
             end = text.find('``', pos + 2)
             if end != -1 and '\n' not in text[pos:end + 2]:
@@ -291,52 +310,133 @@ def _skip_ignored(pos: int, ignored: list[tuple[int, int]]) -> int:
     return pos
 
 
+class _SpanIndex:
+    """Binary-searchable view over a sorted, merged ignored-span list.
+
+    ``_skip_ignored`` used to be a linear scan over every span; during a full
+    parse of a large DSML block that turns into quadratic behaviour because the
+    span list grows with the number of fences/CDATA/comment sections.
+    """
+
+    __slots__ = ('spans', 'starts')
+
+    def __init__(self, spans: list[tuple[int, int]]) -> None:
+        self.spans = spans
+        self.starts = [start for start, _end in spans]
+
+    def skip(self, pos: int) -> int:
+        """Return *pos* unchanged, or the end of the span containing it."""
+        starts = self.starts
+        if not starts:
+            return pos
+        index = bisect.bisect_right(starts, pos) - 1
+        if index < 0:
+            return pos
+        start, end = self.spans[index]
+        if start <= pos < end:
+            return end
+        return pos
+
+
+# ---------------------------------------------------------------------------
+# Per-text scan cache
+# ---------------------------------------------------------------------------
+# A single ``parse_tool_calls_*`` call chain walks the *same* text object many
+# times (once per block, once per nested tag search).  Recomputing the ignored
+# spans and the folded copy on every hop is what made big DSML payloads
+# quadratic.  We keep the last few (text, ignored, folded) triples per thread.
+#
+# Identity (``is``) is a safe cache key here because ``str`` is immutable *and*
+# the cache holds a strong reference to the key, so the id cannot be recycled
+# by the garbage collector while the entry is alive.
+
+_SCAN_CACHE_LIMIT = 3
+_scan_cache_local = threading.local()
+
+
+def _scan_cache() -> dict[int, tuple[str, _SpanIndex, str]]:
+    cache = getattr(_scan_cache_local, 'cache', None)
+    if cache is None:
+        cache = {}
+        _scan_cache_local.cache = cache
+    return cache
+
+
+def _scan_artifacts(text: str) -> tuple[_SpanIndex, str]:
+    """Return ``(span_index, folded_text)`` for *text*, memoised per thread."""
+    cache = _scan_cache()
+    key = id(text)
+    entry = cache.get(key)
+    if entry is not None and entry[0] is text:
+        # Refresh LRU position (dicts keep insertion order).
+        cache.pop(key)
+        cache[key] = entry
+        return entry[1], entry[2]
+
+    artifacts = (_SpanIndex(_find_ignored_spans(text)), _fold(text))
+    cache[key] = (text, artifacts[0], artifacts[1])
+    while len(cache) > _SCAN_CACHE_LIMIT:
+        cache.pop(next(iter(cache)))
+    return artifacts
+
+
 # ---------------------------------------------------------------------------
 # Tag parsing
 # ---------------------------------------------------------------------------
 
-def _parse_tag(text: str, pos: int) -> Optional[ToolMarkupTag]:
+def _parse_tag(text: str, pos: int, folded: Optional[str] = None) -> Optional[ToolMarkupTag]:
     """Try to parse a DSML/XML tool tag starting at *pos* in the original text.
+
+    *folded* is the pre-folded copy of *text* (same length, 1:1 positions).
+    Passing it in avoids folding single characters inside the hot scan loop.
 
     Returns a ``ToolMarkupTag`` on success, or ``None`` if no valid tag
     starts at that position.
     """
-    if pos >= len(text) or _fold(text[pos]) != '<':
+    if pos >= len(text):
+        return None
+    if folded is None:
+        folded = _fold(text)
+    if folded[pos] != '<':
         return None
 
     idx = pos + 1
     is_closing = False
-    if idx < len(text) and _fold(text[idx]) == '/':
+    if idx < len(text) and folded[idx] == '/':
         is_closing = True
         idx += 1
 
     name_start = idx
-    if _fold(text[idx:idx + len(_DSML_CLOSE_NAME_PREFIX)]) == _DSML_CLOSE_NAME_PREFIX:
+    if folded[idx:idx + len(_DSML_CLOSE_NAME_PREFIX)] == _DSML_CLOSE_NAME_PREFIX:
         is_closing = True
         name_start += len(_DSML_CLOSE_NAME_PREFIX)
-    elif _fold(text[idx:idx + len(_DSML_NAME_PREFIX)]) == _DSML_NAME_PREFIX:
+    elif folded[idx:idx + len(_DSML_NAME_PREFIX)] == _DSML_NAME_PREFIX:
         name_start += len(_DSML_NAME_PREFIX)
-    elif idx < len(text) and _fold(text[idx]) == '|':
+    elif idx < len(text) and folded[idx] == '|':
         return None
 
     # Find the closing ``>`` in the original text, skipping over quoted
     # attribute values so that ``>`` inside a value is not mistaken for
-    # the tag terminator.
+    # the tag terminator.  Only quote characters and ``>`` matter, so jump
+    # between them with the regex engine instead of walking every character.
     scan = name_start
     in_quote = False
     quote_char = ''
 
     while scan < len(text):
-        ch = text[scan]
-        folded_ch = _fold(ch)
+        match = _QUOTE_OR_GT_RE.search(folded, scan)
+        if match is None:
+            break
+        scan = match.start()
+        folded_ch = folded[scan]
 
         if in_quote:
             if folded_ch == quote_char:
                 in_quote = False
-        elif folded_ch in ('"', "'"):
+        elif folded_ch == '"' or folded_ch == "'":
             in_quote = True
             quote_char = folded_ch
-        elif folded_ch == '>':
+        else:  # folded_ch == '>'
             inside = text[name_start:scan]
             raw_name, canonical = _extract_tag_name(inside)
             if raw_name is None or canonical is None:
@@ -362,21 +462,41 @@ def _parse_tag(text: str, pos: int) -> Optional[ToolMarkupTag]:
 def _find_tag_outside_ignored_with_spans(
     text: str,
     start: int,
-    ignored: list[tuple[int, int]],
+    ignored: list[tuple[int, int]] | _SpanIndex,
+    folded: Optional[str] = None,
 ) -> Optional[ToolMarkupTag]:
     """Same algorithm as ``find_tool_markup_tag_outside_ignored`` but
     accepts an externally-computed *ignored* span list so that callers
     can reuse it across multiple invocations.
+
+    Candidate tag starts are located by jumping between ``<`` characters
+    (``str.find`` on the folded text) instead of probing every position.
     """
+    if start >= len(text):
+        return None
+
+    index = ignored if isinstance(ignored, _SpanIndex) else _SpanIndex(ignored)
+    if folded is None:
+        folded = _fold(text)
+
+    length = len(text)
     pos = start
-    while pos < len(text):
-        pos = _skip_ignored(pos, ignored)
-        if pos >= len(text):
-            break
-        tag = _parse_tag(text, pos)
+    while pos < length:
+        candidate = folded.find('<', pos)
+        if candidate < 0:
+            return None
+        skipped = index.skip(candidate)
+        if skipped >= length:
+            return None
+        if skipped != candidate:
+            # Candidate sits inside an ignored region: resume at its end, which
+            # is itself a position worth probing.
+            pos = skipped
+            continue
+        tag = _parse_tag(text, candidate, folded)
         if tag is not None:
             return tag
-        pos += 1
+        pos = candidate + 1
     return None
 
 
@@ -393,8 +513,10 @@ def find_tool_markup_tag_outside_ignored(
 
     Returns ``None`` when no tag is found.
     """
-    ignored = _find_ignored_spans(text)
-    return _find_tag_outside_ignored_with_spans(text, start, ignored)
+    if not text:
+        return None
+    index, folded = _scan_artifacts(text)
+    return _find_tag_outside_ignored_with_spans(text, start, index, folded)
 
 
 def find_matching_tool_markup_close(
@@ -412,10 +534,10 @@ def find_matching_tool_markup_close(
     target = open_tag.name
     depth = 1
     pos = open_tag.end
-    ignored = _find_ignored_spans(text)  # computed once, reused in loop
+    index, folded = _scan_artifacts(text)  # computed once, reused in loop
 
     while pos < len(text):
-        tag = _find_tag_outside_ignored_with_spans(text, pos, ignored)
+        tag = _find_tag_outside_ignored_with_spans(text, pos, index, folded)
         if tag is None:
             break
 
@@ -440,9 +562,10 @@ def contains_tool_markup_syntax_outside_ignored(text: str) -> bool:
     return find_tool_markup_tag_outside_ignored(text, 0) is not None
 
 
-def _is_partial_tag_candidate(fragment: str) -> bool:
+def _is_partial_tag_candidate(fragment: str, folded: Optional[str] = None) -> bool:
     """Return True when *fragment* is a plausible partial tool tag start."""
-    folded = _fold(fragment)
+    if folded is None:
+        folded = _fold(fragment)
     if not folded.startswith('<'):
         return False
 
@@ -477,14 +600,20 @@ def find_partial_tool_markup_start(text: str) -> int:
     including plain XML forms (``<tool_ca``), DSML forms
     (``<|DSML|too``), and bare angle brackets at end-of-stream.
     """
-    ignored = _find_ignored_spans(text)
+    if not text:
+        return -1
 
-    for pos in range(len(text) - 1, -1, -1):
-        if _fold(text[pos]) != '<':
-            continue
-        if _skip_ignored(pos, ignored) != pos:
-            continue
-        if _is_partial_tag_candidate(text[pos:]):
+    index, folded = _scan_artifacts(text)
+
+    # Walk candidate ``<`` positions backwards instead of testing every index.
+    pos = len(text) - 1
+    while pos >= 0:
+        candidate = folded.rfind('<', 0, pos + 1)
+        if candidate < 0:
+            return -1
+        pos = candidate
+        if index.skip(pos) == pos and _is_partial_tag_candidate(text[pos:], folded[pos:]):
             return pos
+        pos -= 1
 
     return -1
