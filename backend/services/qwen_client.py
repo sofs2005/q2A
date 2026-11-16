@@ -297,10 +297,30 @@ class QwenClient:
             accept=accept,
         )
         headers.update(QwenClient._web_client_headers())
+        QwenClient._inject_bx_headers(headers, account)
         if token:
             headers["Authorization"] = f"Bearer {token}"
         if extra_headers:
             headers.update(extra_headers)
+        return headers
+
+    @staticmethod
+    def _inject_bx_headers(headers: dict[str, str], account: Account | None) -> dict[str, str]:
+        """把浏览器抓到的无痕验证设备指纹头补进请求。
+
+        `bx-ua` / `bx-umidtoken` 由页面里的阿里云 SDK 实时生成，抓包确认官网前端
+        每个业务请求都带；q2a 历史上完全不发（2026-09 抓包当时服务端不强校验）。
+        账号上有就带上——形态与前端一致，能少一分被判定为脚本的风险。
+        """
+        if account is None:
+            return headers
+        bx_ua = str(getattr(account, "bx_ua", "") or "").strip()
+        if not bx_ua:
+            return headers
+        headers["bx-ua"] = bx_ua
+        bx_umid = str(getattr(account, "bx_umidtoken", "") or "").strip()
+        if bx_umid:
+            headers["bx-umidtoken"] = bx_umid
         return headers
 
     @staticmethod
@@ -350,6 +370,7 @@ class QwenClient:
         headers["sec-fetch-mode"] = "cors"
         headers["sec-fetch-site"] = "same-origin"
         headers.update(QwenClient._web_client_headers())
+        QwenClient._inject_bx_headers(headers, account)
         if not token:
             headers.pop("Authorization", None)
         cookie_parts: list[str] = []

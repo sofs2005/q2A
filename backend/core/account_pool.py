@@ -50,6 +50,11 @@ class Account:
         self.fingerprint_id = str(kwargs.get("fingerprint_id", "") or "").strip()
         self.waf_cookies = str(kwargs.get("waf_cookies", "") or "").strip()
         self.waf_cookies_expires_at = float(kwargs.get("waf_cookies_expires_at", 0) or 0)
+        # 阿里云无痕验证 SDK 的设备指纹头（bx-ua / bx-umidtoken）：只能由浏览器
+        # 里的 JS 实时生成，脚本抄不到。由 token_provider 在浏览器会话里抓一次
+        # 存下来，业务请求复用它 —— 与官网前端完全一致，降低被判为脚本的概率。
+        self.bx_ua = str(kwargs.get("bx_ua", "") or "").strip()
+        self.bx_umidtoken = str(kwargs.get("bx_umidtoken", "") or "").strip()
         self.file_upload_blocked_until = float(kwargs.get("file_upload_blocked_until", 0) or 0)
         self.video_blocked_until = float(kwargs.get("video_blocked_until", 0) or 0)
 
@@ -115,6 +120,8 @@ class Account:
             "fingerprint_id": self.fingerprint_id,
             "waf_cookies": self.waf_cookies,
             "waf_cookies_expires_at": self.waf_cookies_expires_at,
+            "bx_ua": self.bx_ua,
+            "bx_umidtoken": self.bx_umidtoken,
             "file_upload_blocked_until": self.file_upload_blocked_until,
             "video_blocked_until": self.video_blocked_until,
         }

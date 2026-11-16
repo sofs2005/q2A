@@ -123,7 +123,7 @@ class QwenClientChatClearTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["error"].startswith("HTTP 500"))
         self.assertEqual(len(calls), 1)
 
-    async def test_delete_chat_raises_on_non_success_status(self) -> None:
+    async def test_delete_chat_returns_false_on_non_success_status(self) -> None:
         account = Account(email="user@example.com", token="token-1")
         client = QwenClient(SimpleNamespace())
         calls: list[dict] = []
@@ -131,10 +131,11 @@ class QwenClientChatClearTests(unittest.IsolatedAsyncioTestCase):
         get_session = AsyncMock(return_value=_FakeSession(responses, calls))
 
         with patch("backend.services.qwen_client.get_session", get_session):
-            with self.assertRaises(RuntimeError) as ctx:
-                await client.delete_chat("token-1", "chat-1", account=account)
+            # 行为变更：清理动作失败不再抛 RuntimeError。调用方全是 fire-and-forget，
+            # 抛出只会产生 "Task exception was never retrieved" 堆栈噪音。
+            result = await client.delete_chat("token-1", "chat-1", account=account)
 
-        self.assertIn("HTTP 500", str(ctx.exception))
+        self.assertFalse(result)
         self.assertEqual(calls[0]["method"], "DELETE")
         self.assertEqual(calls[0]["url"], "https://chat.qwen.ai/api/v2/chats/chat-1")
         self.assertEqual(calls[0]["headers"]["Authorization"], "Bearer token-1")

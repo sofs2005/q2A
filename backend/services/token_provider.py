@@ -235,6 +235,56 @@ class BrowserTokenProvider:
                 getattr(account, "email", ""), str(exc)[:120],
             )
 
+    async def _harvest_bx_headers(self, account, ctx: Any) -> None:
+        """在浏览器会话里抓一次 bx-ua / bx-umidtoken。
+
+        这两个头由页面里的阿里云无痕验证 SDK 实时生成（`bx-ua` 约 1.5KB，
+        随设备与输入行为变化），纯脚本抄不到。抓一次存到账号上，业务请求带着它，
+        请求形态就与官网前端一致了。抓不到就跳过，不影响主流程。
+
+        只在账号还没有 bx_ua 时执行，所以正常路径下每个账号一生只开一次页面。
+        """
+        if str(getattr(account, "bx_ua", "") or "").strip():
+            return
+        page = None
+        captured: dict[str, str] = {}
+        try:
+            page = await ctx.new_page()
+
+            def _grab(req) -> None:
+                try:
+                    for key, val in (req.headers or {}).items():
+                        low = str(key).lower()
+                        if low in ("bx-ua", "bx-umidtoken") and val:
+                            captured[low] = str(val)
+                except Exception:
+                    pass
+
+            page.on("request", _grab)
+            await page.goto(f"{BASE_URL}/", wait_until="commit", timeout=20000)
+            await page.wait_for_timeout(4000)
+        except Exception as exc:
+            log.info(
+                "[TokenProvider] %s bx-* 头抓取跳过: %s",
+                getattr(account, "email", ""),
+                str(exc)[:100],
+            )
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+        if captured.get("bx-ua"):
+            account.bx_ua = captured["bx-ua"]
+            account.bx_umidtoken = captured.get("bx-umidtoken", "")
+            log.info(
+                "[TokenProvider] %s 已抓取 bx 指纹头 ua_len=%d umid_len=%d",
+                getattr(account, "email", ""),
+                len(account.bx_ua),
+                len(account.bx_umidtoken),
+            )
+
     # ---- 静默续期（不登录、无滑块） -------------------------------------
 
     async def _refresh_once(self, account) -> str:
@@ -281,6 +331,8 @@ class BrowserTokenProvider:
         if not token or not is_token_usable(token):
             return ""
         await self._harvest_waf_cookies(account, ctx)
+        # 同一个浏览器上下文里顺手把无痕验证的设备指纹头抓下来（有则跳过）
+        await self._harvest_bx_headers(account, ctx)
         return token
 
     async def close(self) -> None:
