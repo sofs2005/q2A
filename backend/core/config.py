@@ -68,6 +68,11 @@ class Settings(BaseSettings):
     CAPTCHA_SOLVER_TIMEOUT_MS: int = int(os.getenv("CAPTCHA_SOLVER_TIMEOUT_MS", 15000))
     CAPTCHA_BROWSER_IDLE_TIMEOUT: float = float(os.getenv("CAPTCHA_BROWSER_IDLE_TIMEOUT", 30))
     WAF_PUNISH_COOLDOWN: int = int(os.getenv("WAF_PUNISH_COOLDOWN", 1800))
+    # 单次内联 prompt 的字符上限（0 = 不限制）。超过这个量，阿里云盾会把
+    # 出口 IP 判成机器人并下发 punish 页；实测代价不是「这次失败」，而是该
+    # 出口接下来 30 分钟全废（连 200 字符的请求都会被拦）。所以超过就在本地
+    # 直接报错，绝不发出去污染出口池。16000 是实测安全线（15K 多次通过）。
+    WAF_MAX_INLINE_PROMPT_CHARS: int = int(os.getenv("WAF_MAX_INLINE_PROMPT_CHARS", 16000))
 
     # 日志
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

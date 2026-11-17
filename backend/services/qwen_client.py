@@ -929,6 +929,9 @@ class QwenClient:
             return True
         if "<script>" in body_text[:500] and "x5sec" in body_lower:
             return True
+        # 挑战桩页的固定尾巴：`<!--rgv587_flag:sm-->`，出现即表示已被阿里云盾拦截
+        if "rgv587_flag" in body_lower:
+            return True
         if headers and headers.get("bxpunish") == "1":
             return True
         return False
@@ -1035,12 +1038,91 @@ class QwenClient:
                     account, cooldown=punish_cooldown,
                     error_message=f"x5sec punish interception, account cooled down {punish_cooldown}s",
                 )
+        # punish 绑的是**出口 IP**，只冷却账号不够：坏出口留在池子里会被继续
+        # 轮询，每个请求都要白撞一遍。这里立即摘掉该出口（不等失败计数累积），
+        # 上层拿到 503 后会换出口 + 换账号重试。
+        if proxy_url:
+            try:
+                from backend.services.exit_pool import exit_id_from_url
+
+                exit_id = exit_id_from_url(proxy_url)
+                pool = self.chat_exit_pool
+                if pool is not None and exit_id:
+                    pool.mark_blocked(exit_id, "waf_punish", cooldown_seconds=float(punish_cooldown))
+                self.note_chat_exit_failure(chat_id, "waf_punish")
+            except Exception as exit_err:
+                log.warning(
+                    "[stream_chat_once] mark exit blocked failed: %s",
+                    str(exit_err)[:120],
+                )
+        # 返回 OpenAI 形状的错误体 + 503：绝不能把挑战页 HTML 透传给客户端，
+        # 503 也让 executor / 客户端走「可重试 + 退避」而不是当正文渲染。
         yield {
-            "status": 403,
-            "body": f'{{"error":"x5sec punish interception, account cooled down {punish_cooldown}s"}}',
+            "status": 503,
+            "retry_after": punish_cooldown,
+            "body": json.dumps(
+                {
+                    "error": {
+                        "message": (
+                            "upstream waf challenge (captcha) on exit "
+                            f"{proxy_url or 'direct'}; account and exit cooled down {punish_cooldown}s"
+                        ),
+                        "type": "upstream_waf_challenge",
+                        "code": "waf_captcha",
+                    }
+                },
+                ensure_ascii=False,
+            ),
         }
 
+    @staticmethod
+    def _payload_prompt_chars(payload: dict) -> int:
+        """统计 payload 里所有消息正文的字符数（含多段 content）。"""
+        total = 0
+        for msg in (payload or {}).get("messages") or []:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                total += len(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        total += len(part["text"])
+        return total
+
     async def stream_chat_once(self, token: str, chat_id: str, payload: dict, account: Account | None = None) -> AsyncIterator[dict]:
+        # 大 prompt 前置拦截：超长内联 prompt 会触发阿里云盾 punish，代价不是
+        # 「这次失败」而是该出口 IP 接下来 30 分钟全废。宁可本地直接 413。
+        prompt_limit = int(getattr(settings, "WAF_MAX_INLINE_PROMPT_CHARS", 16000) or 0)
+        if prompt_limit > 0:
+            prompt_chars = self._payload_prompt_chars(payload)
+            if prompt_chars > prompt_limit:
+                log.warning(
+                    "[stream_chat_once] prompt too large, rejected locally chat_id=%s chars=%s limit=%s",
+                    chat_id,
+                    prompt_chars,
+                    prompt_limit,
+                )
+                yield {
+                    "status": 413,
+                    "body": json.dumps(
+                        {
+                            "error": {
+                                "message": (
+                                    f"inline prompt too large: {prompt_chars} chars > "
+                                    f"WAF_MAX_INLINE_PROMPT_CHARS={prompt_limit}; "
+                                    "sending it upstream would get the exit IP banned by WAF"
+                                ),
+                                "type": "inline_prompt_too_large",
+                                "code": "prompt_too_large",
+                            }
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+                return
+
         timeout = settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS
 
         # 构建 headers 前先刷新 WAF cookie（过期时自动 GET 首页获取 acw_tc）

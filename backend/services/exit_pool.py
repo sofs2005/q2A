@@ -606,6 +606,27 @@ class ExitPool:
                 state.last_error,
             )
 
+    def mark_blocked(self, exit_id: str, reason: str, *, cooldown_seconds: float | None = None) -> None:
+        """立即把出口投入冷却。
+
+        `mark_failure` 要连续失败到 `max_failures` 才冷却，适合连接抖动；
+        但 WAF punish 这种是**明确信号**——该出口 IP 已经被判定为机器人，
+        此时任何请求都会撞墙，必须立刻摘掉，不能让池子继续轮询它。
+        """
+        state = self._states.get(str(exit_id or ""))
+        if state is None:
+            return
+        cooldown = float(cooldown_seconds) if cooldown_seconds is not None else float(self.cooldown_seconds)
+        state.cooldown_until = self._clock() + max(1.0, cooldown)
+        state.last_error = str(reason or "")[:200]
+        state.last_failure_at = float(self._wall_clock())
+        log.warning(
+            "[ExitPool] exit=%s blocked reason=%s cooldown=%.0fs",
+            state.exit_id,
+            state.last_error,
+            cooldown,
+        )
+
     def mark_probe_failure(
         self,
         exit_id: str,
