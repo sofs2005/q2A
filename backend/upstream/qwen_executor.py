@@ -577,7 +577,17 @@ class QwenExecutor:
                     body = chunk_result.get("body", b"")
                     if isinstance(body, bytes):
                         body = body.decode("utf-8", errors="ignore")
-                    raise Exception(f"HTTP {chunk_result['status']}: {str(body)[:100]}")
+                    status = chunk_result["status"]
+                    # 413 = 本地前置拦截（prompt 超过 WAF 上限），400/422 = 请求本身
+                    # 不合法。这三类换账号/重试都不会变好，只会白等 3 轮退避；
+                    # 按确定性错误直接失败，把真实原因立刻交给调用方。
+                    if status in (400, 413, 422):
+                        raise DeterministicUpstreamError(
+                            code=f"http_{status}",
+                            details=str(body)[:200],
+                            status=status,
+                        )
+                    raise Exception(f"HTTP {status}: {str(body)[:100]}")
 
                 if "chunk" in chunk_result:
                     chunk = chunk_result["chunk"]
