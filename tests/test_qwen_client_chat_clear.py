@@ -48,8 +48,8 @@ class _FakeSession:
         self.responses = responses
         self.calls = calls
 
-    async def request(self, method, url, headers=None, json=None, **kwargs):
-        self.calls.append({"method": method, "url": url, "headers": headers or {}, "json": json, "kwargs": kwargs})
+    async def request(self, method, url, headers=None, json=None, data=None, **kwargs):
+        self.calls.append({"method": method, "url": url, "headers": headers or {}, "json": json, "data": data, "kwargs": kwargs})
         return self.responses.pop(0)
 
 

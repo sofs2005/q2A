@@ -142,8 +142,8 @@ class _RecordingSession:
         self.calls = calls
         self.closed = False
 
-    async def request(self, method, url, headers=None, json=None, timeout=None):
-        del method, url, headers, json
+    async def request(self, method, url, headers=None, json=None, data=None, timeout=None):
+        del method, url, headers, json, data
         connect, read = _split_timeout(timeout)
         self.calls.append({"proxy": self.proxy_url, "connect": connect, "read": read})
         if self.dead:

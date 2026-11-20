@@ -25,6 +25,31 @@ from backend.upstream.sse_consumer import parse_sse_chunk
 log = logging.getLogger("qwen2api.client")
 
 
+def encode_json_body(obj: Any) -> bytes | None:
+    """把请求体序列化成**原始 UTF-8** 的紧凑 JSON 字节。
+
+    curl_cffi / httpx 的 `json=` 走默认 `ensure_ascii=True`，中文会被转义成
+    `\\uXXXX`（6 字节/字），而浏览器发的是原始 UTF-8（3 字节/字）。请求体因此
+    膨胀近一倍，实测会被阿里云盾按体积拦截。所以统一自己序列化后用
+    `data=` / `content=` 发送。
+
+    Args:
+        obj: 待序列化对象；`None` 表示没有请求体（GET / DELETE）。
+
+    Returns:
+        UTF-8 字节；`obj` 为 `None` 时返回 `None`（调用方不得发出 `null` 请求体）。
+    """
+    if obj is None:
+        return None
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _json_body_kwargs(obj: Any) -> dict[str, bytes]:
+    """curl_cffi 请求的请求体关键字参数：有 body 才带 `data=`，没有就什么都不带。"""
+    encoded = encode_json_body(obj)
+    return {} if encoded is None else {"data": encoded}
+
+
 class QwenClient:
     def __init__(
         self,
@@ -425,8 +450,8 @@ class QwenClient:
                 method,
                 f"{BASE_URL}{path}",
                 headers=headers,
-                json=body,
                 timeout=request_timeout,
+                **_json_body_kwargs(body),
             )
             return {
                 "status": resp.status_code,
@@ -513,8 +538,8 @@ class QwenClient:
                     method,
                     f"{BASE_URL}{path}",
                     headers=headers,
-                    json=body,
                     timeout=send_timeout,
+                    **_json_body_kwargs(body),
                 )
                 return {
                     "status": resp.status_code,
@@ -993,7 +1018,7 @@ class QwenClient:
                     "POST",
                     f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
                     headers=retry_headers,
-                    json=payload,
+                    data=encode_json_body(payload),
                     timeout=retry_timeout,
                 ) as resp2:
                     if resp2.status_code != 200:
@@ -1092,36 +1117,50 @@ class QwenClient:
         return total
 
     async def stream_chat_once(self, token: str, chat_id: str, payload: dict, account: Account | None = None) -> AsyncIterator[dict]:
-        # 大 prompt 前置拦截：超长内联 prompt 会触发阿里云盾 punish，代价不是
-        # 「这次失败」而是该出口 IP 接下来 30 分钟全废。宁可本地直接 413。
-        prompt_limit = int(getattr(settings, "WAF_MAX_INLINE_PROMPT_CHARS", 16000) or 0)
+        # 大请求前置拦截：过大的请求体会触发阿里云盾 punish，代价不是「这次失败」
+        # 而是该出口 IP 接下来 30 分钟全废。宁可本地直接 413。
+        # 主判据是**实际发出的字节数**（WAF_MAX_INLINE_BODY_BYTES）；显式配置了
+        # 非 0 的 WAF_MAX_INLINE_PROMPT_CHARS 时，字符数判据仍然生效。
+        # 这里序列化一次，判断与后面的发送用同一份字节。
+        body_bytes = encode_json_body(payload) or b""
+        too_large = ""
+        prompt_limit = int(getattr(settings, "WAF_MAX_INLINE_PROMPT_CHARS", 0) or 0)
         if prompt_limit > 0:
             prompt_chars = self._payload_prompt_chars(payload)
             if prompt_chars > prompt_limit:
-                log.warning(
-                    "[stream_chat_once] prompt too large, rejected locally chat_id=%s chars=%s limit=%s",
-                    chat_id,
-                    prompt_chars,
-                    prompt_limit,
+                too_large = (
+                    f"inline prompt too large: {prompt_chars} chars > "
+                    f"WAF_MAX_INLINE_PROMPT_CHARS={prompt_limit}"
                 )
-                yield {
-                    "status": 413,
-                    "body": json.dumps(
-                        {
-                            "error": {
-                                "message": (
-                                    f"inline prompt too large: {prompt_chars} chars > "
-                                    f"WAF_MAX_INLINE_PROMPT_CHARS={prompt_limit}; "
-                                    "sending it upstream would get the exit IP banned by WAF"
-                                ),
-                                "type": "inline_prompt_too_large",
-                                "code": "prompt_too_large",
-                            }
-                        },
-                        ensure_ascii=False,
-                    ),
-                }
-                return
+        body_limit = int(getattr(settings, "WAF_MAX_INLINE_BODY_BYTES", 76000) or 0)
+        if not too_large and body_limit > 0 and len(body_bytes) > body_limit:
+            too_large = (
+                f"request body too large: {len(body_bytes)} bytes > "
+                f"WAF_MAX_INLINE_BODY_BYTES={body_limit}"
+            )
+        if too_large:
+            log.warning(
+                "[stream_chat_once] request rejected locally chat_id=%s reason=%s",
+                chat_id,
+                too_large,
+            )
+            yield {
+                "status": 413,
+                "body": json.dumps(
+                    {
+                        "error": {
+                            "message": (
+                                f"{too_large}; "
+                                "sending it upstream would get the exit IP banned by WAF"
+                            ),
+                            "type": "inline_prompt_too_large",
+                            "code": "prompt_too_large",
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+            return
 
         timeout = settings.QWEN_UPSTREAM_STREAM_TIMEOUT_SECONDS
 
@@ -1156,7 +1195,7 @@ class QwenClient:
                         "POST",
                         f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
                         headers=headers,
-                        json=payload,
+                        content=body_bytes,
                         timeout=timeout,
                     ) as resp:
                         if resp.status_code != 200:
@@ -1226,7 +1265,7 @@ class QwenClient:
                 "POST",
                 f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
                 headers=headers,
-                json=payload,
+                data=body_bytes,
                 timeout=stream_timeout,
             ) as resp:
                 if resp.status_code != 200:

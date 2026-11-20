@@ -490,7 +490,8 @@ class UpstreamFileUploader:
             response = await session.post(
                 f"{BASE_URL}/api/v2/files/getstsToken",
                 headers=headers,
-                json=body,
+                # 请求体带用户文件名（可能是中文）：发原始 UTF-8，不走 json= 的 \uXXXX 转义。
+                data=json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
                 timeout=timeouts,
             )
             return {

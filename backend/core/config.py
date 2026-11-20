@@ -68,11 +68,19 @@ class Settings(BaseSettings):
     CAPTCHA_SOLVER_TIMEOUT_MS: int = int(os.getenv("CAPTCHA_SOLVER_TIMEOUT_MS", 15000))
     CAPTCHA_BROWSER_IDLE_TIMEOUT: float = float(os.getenv("CAPTCHA_BROWSER_IDLE_TIMEOUT", 30))
     WAF_PUNISH_COOLDOWN: int = int(os.getenv("WAF_PUNISH_COOLDOWN", 1800))
-    # 单次内联 prompt 的字符上限（0 = 不限制）。超过这个量，阿里云盾会把
-    # 出口 IP 判成机器人并下发 punish 页；实测代价不是「这次失败」，而是该
-    # 出口接下来 30 分钟全废（连 200 字符的请求都会被拦）。所以超过就在本地
-    # 直接报错，绝不发出去污染出口池。16000 是实测安全线（15K 多次通过）。
-    WAF_MAX_INLINE_PROMPT_CHARS: int = int(os.getenv("WAF_MAX_INLINE_PROMPT_CHARS", 16000))
+    # 单次 completions 请求体的字节上限（0 = 不限制），按**实际发出的 UTF-8 字节**算。
+    # 请求体过大时阿里云盾会把出口 IP 判成机器人并下发 punish 页；代价不是
+    # 「这次失败」，而是该出口接下来 30 分钟全废。所以超过就在本地直接 413，
+    # 绝不发出去污染出口池。
+    # 实测依据（同一出口、同一账号、同一段 31377 字符正文、间隔约 10 秒）：
+    #   - 75.2 KB 的原始 UTF-8 请求体：正常返回；
+    #   - 140.9 KB 的 \uXXXX 转义请求体：被拦截弹滑块。
+    # 两者之间的真实上限**没有测过**。76000 取的是「已实测通过的大小」，
+    # 不是测出来的上限；真实上限可能更高，也不保证 76000 以内永远安全。
+    WAF_MAX_INLINE_BODY_BYTES: int = int(os.getenv("WAF_MAX_INLINE_BODY_BYTES", 76000))
+    # 旧的按字符数拦截（0 = 不启用，默认）。请求体改发原始 UTF-8 后默认由上面的
+    # 字节上限把关；显式配成非 0 时仍会按消息正文字符数拦截，两者任一命中即 413。
+    WAF_MAX_INLINE_PROMPT_CHARS: int = int(os.getenv("WAF_MAX_INLINE_PROMPT_CHARS", 0))
 
     # 日志
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

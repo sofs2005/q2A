@@ -73,8 +73,8 @@ class _FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    def stream(self, method, url, headers=None, json=None, timeout=None):
-        self.calls.append({"method": method, "url": url, "headers": headers or {}, "json": json, "timeout": timeout})
+    def stream(self, method, url, headers=None, json=None, content=None, timeout=None):
+        self.calls.append({"method": method, "url": url, "headers": headers or {}, "json": json, "content": content, "timeout": timeout})
         return _FakeStreamResponse()
 
 
@@ -96,8 +96,8 @@ class _FakeCurlStreamSession:
         self.calls = []
         self.closed = False
 
-    def stream(self, method, url, headers=None, json=None, timeout=None):
-        self.calls.append({"method": method, "url": url, "headers": headers or {}, "json": json, "timeout": timeout})
+    def stream(self, method, url, headers=None, json=None, data=None, timeout=None):
+        self.calls.append({"method": method, "url": url, "headers": headers or {}, "json": json, "data": data, "timeout": timeout})
         return _FakeCurlStreamResponse()
 
     async def close(self):
@@ -120,7 +120,11 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get_session.await_args.args[0], fingerprint)
         self.assertEqual(session.calls[0]["headers"]["User-Agent"], fingerprint.user_agent)
         self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer token-1")
-        self.assertEqual(session.calls[0]["json"], {"memory": {"enable_memory": True}})
+        # 请求体改为原始 UTF-8 字节走 data=，不再用 json=。
+        self.assertIsNone(session.calls[0]["json"])
+        self.assertIsInstance(session.calls[0]["data"], bytes)
+        self.assertEqual(json.loads(session.calls[0]["data"]), {"memory": {"enable_memory": True}})
+        self.assertEqual(session.calls[0]["headers"]["Content-Type"], "application/json")
 
     def test_build_headers_uses_account_cookies_without_dropping_authorization(self) -> None:
         account = Account(email="alice@example.com", token="token-1", cookies="waf=ok; session=browser")
@@ -235,6 +239,9 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chunks[-1], {"status": "streamed"})
         self.assertEqual(session.calls[0]["method"], "POST")
         self.assertIn("/api/v2/chat/completions?chat_id=chat-1", session.calls[0]["url"])
+        self.assertIsNone(session.calls[0]["json"])
+        self.assertEqual(json.loads(session.calls[0]["data"]), {"stream": True})
+        self.assertEqual(session.calls[0]["headers"]["Content-Type"], "application/json")
 
     async def test_stream_chat_once_uses_go_like_http_when_enabled(self) -> None:
         account = Account(email="alice@example.com", token="token-1", cookies="waf=ok; session=browser")
@@ -256,6 +263,9 @@ class QwenClientFingerprintTransportTests(unittest.IsolatedAsyncioTestCase):
         call = _FakeAsyncClient.instances[0].calls[0]
         self.assertEqual(call["method"], "POST")
         self.assertIn("/api/v2/chat/completions?chat_id=chat-1", call["url"])
+        self.assertIsNone(call["json"])
+        self.assertEqual(json.loads(call["content"]), {"stream": True})
+        self.assertEqual(call["headers"]["Content-Type"], "application/json")
         self.assertNotIn("Cookie", call["headers"])
 
     def test_build_chat_transport_headers_injects_valid_waf_cookie(self) -> None:

@@ -106,8 +106,8 @@ class _FakeSession:
         self.calls = calls
         self.closed = False
 
-    async def post(self, url, headers=None, json=None, timeout=None):
-        del url, headers, json, timeout
+    async def post(self, url, headers=None, json=None, data=None, timeout=None):
+        del url, headers, json, data, timeout
         self.calls.append(self.proxy_url)
         outcome = self.script(self.proxy_url)
         if isinstance(outcome, Exception):

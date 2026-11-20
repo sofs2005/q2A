@@ -42,8 +42,8 @@ class _FakeSession:
         self.responses = responses
         self.calls = calls
 
-    async def request(self, method, url, headers=None, json=None, **kwargs):
-        self.calls.append({"method": method, "url": url, "headers": headers or {}, "json": json, "kwargs": kwargs})
+    async def request(self, method, url, headers=None, json=None, data=None, **kwargs):
+        self.calls.append({"method": method, "url": url, "headers": headers or {}, "json": json, "data": data, "kwargs": kwargs})
         return self.responses.pop(0)
 
 
@@ -97,7 +97,9 @@ class QwenClientPersonalizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0]["method"], "POST")
         self.assertEqual(calls[0]["url"], "https://chat.qwen.ai/api/v2/users/user/settings/update")
         self.assertEqual(calls[0]["headers"]["Authorization"], "Bearer token-1")
-        self.assertEqual(calls[0]["json"], payload)
+        # 请求体改为原始 UTF-8 字节走 data=，不再用 json=。
+        self.assertIsNone(calls[0]["json"])
+        self.assertEqual(json.loads(calls[0]["data"]), payload)
         self.assertEqual(get_session.await_count, 1)
 
     async def test_get_personalization_settings_skips_without_credentials(self) -> None:
